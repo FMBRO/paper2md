@@ -50,7 +50,7 @@ def write_text_layer_report(pdf_path: Path | str, logs_dir: Path | str) -> Path:
     logs_dir = Path(logs_dir)
     logs_dir.mkdir(parents=True, exist_ok=True)
     out_path = logs_dir / "text_layer_check.json"
-    out_path.write_text(json.dumps(inspect_pdf(pdf_path), indent=2))
+    out_path.write_text(json.dumps(inspect_pdf(pdf_path), indent=2), encoding="utf-8")
     return out_path
 
 

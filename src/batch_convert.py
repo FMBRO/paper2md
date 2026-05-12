@@ -12,7 +12,7 @@ from src.convert_one import convert_one
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="paper2md — batch convert academic PDFs to Markdown")
+    p = argparse.ArgumentParser(description="paper2md - batch convert academic PDFs to Markdown")
     p.add_argument("--input_dir", required=True)
     p.add_argument("--output_dir", required=True)
     p.add_argument("--config", default="configs/config.yaml")
