@@ -16,7 +16,7 @@ def collect_marker_figures(markdown_path: Path | str, figures_dir: Path | str) -
     """
     markdown_path = Path(markdown_path)
     figures_dir = Path(figures_dir)
-    text = markdown_path.read_text()
+    text = markdown_path.read_text(encoding="utf-8")
 
     matches = list(_IMG_LINK.finditer(text))
     relevant = [m for m in matches
@@ -39,5 +39,5 @@ def collect_marker_figures(markdown_path: Path | str, figures_dir: Path | str) -
         alt, ref = m.group(1), m.group(2)
         return f"![{alt}]({mapping.get(ref, ref)})"
 
-    markdown_path.write_text(_IMG_LINK.sub(_rewrite, text))
+    markdown_path.write_text(_IMG_LINK.sub(_rewrite, text), encoding="utf-8")
     return markdown_path

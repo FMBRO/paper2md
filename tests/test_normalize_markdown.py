@@ -56,3 +56,16 @@ def test_normalize_markdown_writes_normalized_file(tmp_path: Path) -> None:
     assert "$$\ny=x\n$$" in text
     assert "**Figure 1.** Overview." in text
     assert "## References" in text
+
+
+def test_normalize_markdown_preserves_unicode(tmp_path: Path) -> None:
+    src = tmp_path / "raw.md"
+    src.write_text(
+        "# Title\n\n## Abstract\n\nGreek: α β γ. Math: Σ ∫ ∇. Arrow: → ⇒.",
+        encoding="utf-8",
+    )
+    out = tmp_path / "paper.md"
+    normalize_markdown(src, out)
+    body = out.read_text(encoding="utf-8")
+    assert "α β γ" in body
+    assert "Σ ∫ ∇" in body

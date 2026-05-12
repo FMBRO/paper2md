@@ -49,12 +49,12 @@ def normalize_captions(markdown: str) -> str:
 
 def normalize_markdown(input_path: Path | str, output_path: Path | str) -> Path:
     """Apply every §5.9 rule and write the result to ``output_path``."""
-    text = Path(input_path).read_text()
+    text = Path(input_path).read_text(encoding="utf-8")
     text = normalize_abstract_heading(text)
     text = normalize_references_heading(text)
     text = normalize_equations(text)
     text = normalize_captions(text)
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(text)
+    output_path.write_text(text, encoding="utf-8")
     return output_path
