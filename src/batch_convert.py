@@ -56,11 +56,13 @@ def run_batch(settings: Settings) -> dict:
     settings.output_dir.mkdir(parents=True, exist_ok=True)
     summary = {"total": len(pdfs), "success": 0, "failed": 0, "failed_files": []}
 
-    for pdf in pdfs:
+    for idx, pdf in enumerate(pdfs, start=1):
         paper_md = settings.output_dir / pdf.stem / "paper.md"
         if settings.skip_existing and paper_md.exists():
+            print(f"[paper2md] ({idx}/{len(pdfs)}) {pdf.name}: skipped (paper.md exists)")
             summary["success"] += 1
             continue
+        print(f"[paper2md] ({idx}/{len(pdfs)}) {pdf.name}: processing...", flush=True)
         try:
             convert_one(pdf, settings)
             summary["success"] += 1

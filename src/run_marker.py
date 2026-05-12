@@ -21,11 +21,10 @@ def run_marker(input_pdf: Path | str, output_dir: Path | str) -> Path:
 
     result = subprocess.run(
         ["marker_single", str(input_pdf), "--output_dir", str(output_dir)],
-        capture_output=True,
     )
     if result.returncode != 0:
         raise MarkerError(
-            f"marker_single failed (exit {result.returncode}): {result.stderr.decode(errors='replace')}"
+            f"marker_single failed (exit {result.returncode}) — see output above"
         )
 
     candidates = sorted(output_dir.rglob("*.md"))

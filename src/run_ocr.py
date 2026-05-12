@@ -25,9 +25,9 @@ def run_ocrmypdf(
         cmd.append("--clean")
     cmd.extend([str(input_pdf), str(output_pdf)])
 
-    result = subprocess.run(cmd, capture_output=True)
+    result = subprocess.run(cmd)
     if result.returncode != 0:
         raise OCRError(
-            f"ocrmypdf failed (exit {result.returncode}): {result.stderr.decode(errors='replace')}"
+            f"ocrmypdf failed (exit {result.returncode}) — see output above"
         )
     return Path(output_pdf)
