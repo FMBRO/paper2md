@@ -88,3 +88,26 @@ def test_arg_parser_supports_all_flags() -> None:
     assert args.workers == 2
     assert args.skip_existing is True
     assert args.overwrite is True
+
+
+def test_arg_parser_save_logs_flag() -> None:
+    parser = build_arg_parser()
+    args = parser.parse_args(["--input_dir", "in", "--output_dir", "out", "--save_logs"])
+    assert args.save_logs is True
+
+
+def test_settings_from_args_without_yaml(tmp_path: Path) -> None:
+    # When --config points to a missing file, Settings is built from CLI alone.
+    from src.batch_convert import _settings_from_args
+    args = build_arg_parser().parse_args([
+        "--input_dir", str(tmp_path / "in"),
+        "--output_dir", str(tmp_path / "out"),
+        "--config", str(tmp_path / "missing.yaml"),
+        "--engine", "marker",
+        "--workers", "3",
+    ])
+    settings = _settings_from_args(args)
+    assert settings.input_dir == tmp_path / "in"
+    assert settings.output_dir == tmp_path / "out"
+    assert settings.engine == "marker"
+    assert settings.workers == 3

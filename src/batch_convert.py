@@ -38,13 +38,14 @@ def _settings_from_args(args: argparse.Namespace) -> Settings:
         "workers": args.workers,
         "skip_existing": args.skip_existing or None,
         "overwrite": args.overwrite or None,
+        "save_logs": args.save_logs or None,
     }
     cleaned = {k: v for k, v in overrides.items() if v is not None}
     config_path = Path(args.config)
     if config_path.exists():
         return load_settings(config_path, overrides=cleaned)
     # No YAML — build Settings directly from CLI defaults.
-    return Settings(**{k: cleaned[k] for k in cleaned if hasattr(Settings, k)})
+    return Settings(**cleaned)
 
 
 def run_batch(settings: Settings) -> dict:
