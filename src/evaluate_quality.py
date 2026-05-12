@@ -53,9 +53,9 @@ def write_quality_report(
         "No `##` sections detected",
     )
     eq_v, eq_note = _verdict(
-        metrics["block_equation_count"] >= 0,
+        metrics["block_equation_count"] >= 1,
         f"{metrics['block_equation_count']} block equations",
-        "Equation parse issue",
+        "No block equations detected",
     )
     fig_v, fig_note = _verdict(
         metrics["figure_count"] == metrics["figure_caption_count"]

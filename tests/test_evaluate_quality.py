@@ -67,3 +67,41 @@ def test_write_quality_report_creates_markdown(tmp_path: Path) -> None:
     assert body.startswith("# Conversion Quality Report")
     assert "Engine: marker" in body
     assert "Pages: 12" in body
+
+
+def test_write_quality_report_warns_when_no_equations(tmp_path: Path) -> None:
+    md = tmp_path / "paper.md"
+    md.write_text(
+        "# Title\n\n## Abstract\n\nNo equations here.\n\n## References\n\n[1] foo.\n",
+        encoding="utf-8",
+    )
+    report = write_quality_report(
+        markdown_path=md,
+        source_pdf=tmp_path / "paper.pdf",
+        logs_dir=tmp_path / "logs",
+        engine="marker",
+        has_text_layer=True,
+        ocr_used=False,
+        page_count=1,
+    )
+    body = report.read_text(encoding="utf-8")
+    assert "| Equations | Warning | No block equations detected |" in body
+
+
+def test_write_quality_report_ok_when_equations_present(tmp_path: Path) -> None:
+    md = tmp_path / "paper.md"
+    md.write_text(
+        "# Title\n\n## Method\n\n$$\ny = Ax\n$$\n\n## References\n\n[1] foo.\n",
+        encoding="utf-8",
+    )
+    report = write_quality_report(
+        markdown_path=md,
+        source_pdf=tmp_path / "paper.pdf",
+        logs_dir=tmp_path / "logs",
+        engine="marker",
+        has_text_layer=True,
+        ocr_used=False,
+        page_count=1,
+    )
+    body = report.read_text(encoding="utf-8")
+    assert "| Equations | OK | 1 block equations |" in body
