@@ -1,0 +1,5 @@
+pymupdf>=1.24
+pillow>=10.0
+pyyaml>=6.0
+marker-pdf>=1.0
+ocrmypdf>=16.0

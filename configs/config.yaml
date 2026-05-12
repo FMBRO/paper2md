@@ -1,0 +1,42 @@
+input_dir: input
+output_dir: output
+
+language: eng
+
+ocr:
+  enabled: auto
+  force: false
+  tool: ocrmypdf
+  options:
+    deskew: true
+    clean: true
+
+converter:
+  engine: marker
+  fallback_engines:
+    - mineru
+    - docling
+
+figures:
+  extract: true
+  output_dir: figures
+  naming_rule: figure_{index:03d}.png
+
+markdown:
+  normalize_headings: true
+  normalize_equations: true
+  normalize_captions: true
+  normalize_references: true
+
+batch:
+  workers: 1
+  skip_existing: false
+  overwrite: false
+  continue_on_error: true
+
+quality:
+  enabled: true
+  check_equations: true
+  check_figures: true
+  check_captions: true
+  check_reading_order: true

@@ -1,0 +1,4 @@
+-r requirements.txt
+pytest>=8.0
+pytest-mock>=3.12
+reportlab>=4.0
