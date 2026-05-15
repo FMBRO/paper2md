@@ -29,6 +29,32 @@ def test_load_settings_from_yaml(tmp_path: Path) -> None:
     assert settings.workers == 1
 
 
+def test_load_settings_loads_ocr_options(tmp_path: Path) -> None:
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "input_dir: in\n"
+        "output_dir: out\n"
+        "ocr:\n"
+        "  enabled: auto\n"
+        "  force: false\n"
+        "  options:\n"
+        "    deskew: false\n"
+        "    clean: false\n",
+        encoding="utf-8",
+    )
+    settings = load_settings(cfg)
+    assert settings.ocr_deskew is False
+    assert settings.ocr_clean is False
+
+
+def test_load_settings_ocr_options_default_to_true(tmp_path: Path) -> None:
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("input_dir: in\noutput_dir: out\n", encoding="utf-8")
+    settings = load_settings(cfg)
+    assert settings.ocr_deskew is True
+    assert settings.ocr_clean is True
+
+
 def test_load_settings_applies_cli_overrides(tmp_path: Path) -> None:
     cfg = tmp_path / "config.yaml"
     cfg.write_text(

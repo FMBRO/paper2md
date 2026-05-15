@@ -16,6 +16,8 @@ class Settings:
     language: str = "eng"
     enable_ocr: bool = True
     force_ocr: bool = False
+    ocr_deskew: bool = True
+    ocr_clean: bool = True
     workers: int = 1
     skip_existing: bool = False
     overwrite: bool = False
@@ -28,6 +30,7 @@ def load_settings(config_path: Path | str, overrides: dict[str, Any] | None = No
     overrides = overrides or {}
 
     ocr = raw.get("ocr") or {}
+    ocr_options = ocr.get("options") or {}
     converter = raw.get("converter") or {}
     batch = raw.get("batch") or {}
 
@@ -38,6 +41,8 @@ def load_settings(config_path: Path | str, overrides: dict[str, Any] | None = No
         language=raw.get("language", "eng"),
         enable_ocr=ocr.get("enabled", True) is not False,
         force_ocr=bool(ocr.get("force", False)),
+        ocr_deskew=bool(ocr_options.get("deskew", True)),
+        ocr_clean=bool(ocr_options.get("clean", True)),
         workers=int(batch.get("workers", 1)),
         skip_existing=bool(batch.get("skip_existing", False)),
         overwrite=bool(batch.get("overwrite", False)),

@@ -11,14 +11,17 @@ class MarkerError(RuntimeError):
     """Raised when Marker fails to produce a markdown file."""
 
 
+_SHORT_STEM = "p"
+
+
 def run_marker(input_pdf: Path | str, output_dir: Path | str) -> Path:
     """Run ``marker_single`` and return the produced ``.md`` path.
 
-    Marker writes ``{output_dir}/{stem}/{stem}.md``, which can blow past
-    Windows MAX_PATH (260) when the PDF filename is long because the stem
-    appears twice. To avoid that, run Marker into a short system tempdir
-    and move the produced files into ``output_dir`` (flattening the extra
-    ``{stem}/`` wrapper).
+    Marker writes ``{output_dir}/{stem}/{stem}.md``, duplicating the stem in
+    the path. On Windows that easily exceeds MAX_PATH (260) for long paper
+    filenames — even when ``output_dir`` is a short tempdir. To keep the
+    duplicated tail small, copy the input to a one-letter name inside the
+    tempdir and let Marker derive its stem from that.
     """
     input_pdf = Path(input_pdf)
     output_dir = Path(output_dir)
@@ -26,8 +29,11 @@ def run_marker(input_pdf: Path | str, output_dir: Path | str) -> Path:
 
     with tempfile.TemporaryDirectory() as tmpdir_str:
         tmpdir = Path(tmpdir_str)
+        short_input = tmpdir / f"{_SHORT_STEM}{input_pdf.suffix or '.pdf'}"
+        shutil.copy2(input_pdf, short_input)
+
         result = subprocess.run(
-            ["marker_single", str(input_pdf), "--output_dir", str(tmpdir)],
+            ["marker_single", str(short_input), "--output_dir", str(tmpdir)],
         )
         if result.returncode != 0:
             raise MarkerError(

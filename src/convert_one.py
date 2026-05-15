@@ -30,8 +30,13 @@ def convert_one(input_pdf: Path | str, settings: Settings) -> dict:
     target_pdf = input_pdf
     needs_ocr = settings.force_ocr or (settings.enable_ocr and not inspection["has_text_layer"])
     if needs_ocr:
-        ocr_pdf = paper_dir / f"{paper_name}_ocr.pdf"
-        run_ocrmypdf(input_pdf, ocr_pdf, lang=settings.language)
+        ocr_pdf = paper_dir / "paper_ocr.pdf"
+        run_ocrmypdf(
+            input_pdf, ocr_pdf,
+            lang=settings.language,
+            deskew=settings.ocr_deskew,
+            clean=settings.ocr_clean,
+        )
         target_pdf = ocr_pdf
         ocr_executed = True
 
