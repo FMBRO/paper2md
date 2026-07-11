@@ -1,6 +1,6 @@
 # paper2md
 
-Academic-paper PDF → Markdown batch pipeline. Built per [docs/spec.md](docs/spec.md).
+Academic-paper PDF → Markdown batch pipeline. 
 
 ## Install
 
@@ -64,12 +64,3 @@ The GUI provides the following checkboxes:
 | **Deskew** | Passes `--deskew` to OCRmyPDF to straighten tilted pages. | Has an effect only when OCR runs. |
 | **Clean** | Requests OCRmyPDF's `--clean` preprocessing to remove page noise. | Has an effect only when OCR runs. It requires `unpaper`; when `unpaper` is unavailable, paper2md logs a warning and continues without cleaning. |
 | **Skip existing** | Skips a PDF when its `output/{paper_name}/paper.md` already exists. | Useful when resuming a batch without converting completed PDFs again. |
-
-See `docs/spec.md` §7 for the full CLI surface and §8 for `configs/config.yaml`.
-
-## Develop
-
-```
-uv sync
-uv run pytest
-```
