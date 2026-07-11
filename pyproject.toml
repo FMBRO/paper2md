@@ -1,0 +1,29 @@
+[project]
+name = "paper2md"
+version = "0.1.0"
+description = "Academic-paper PDF to Markdown batch pipeline"
+readme = "README.md"
+license = "AGPL-3.0-only"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "marker-pdf>=1.0",
+    "ocrmypdf>=16.0",
+    "pillow>=10.0",
+    "pymupdf>=1.24",
+    "pyyaml>=6.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-mock>=3.12",
+    "reportlab>=4.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-ra --strict-markers"
+
+[tool.uv]
+package = false

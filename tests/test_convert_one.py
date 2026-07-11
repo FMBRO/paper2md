@@ -12,10 +12,12 @@ def test_convert_one_text_pdf_skips_ocr(mocker, text_pdf: Path, tmp_path: Path) 
     output_dir = tmp_path / "output"
     settings = _settings(text_pdf.parent, output_dir)
 
-    def fake_marker(_pdf, out_dir: Path):
+    def fake_marker(_pdf, out_dir: Path, *, on_output=None):
         out_dir.mkdir(parents=True, exist_ok=True)
         md = out_dir / "paper.md"
         md.write_text("# Title\n\nAbstract\n\nbody", encoding="utf-8")
+        if on_output:
+            on_output("marker progress")
         return md
 
     ocr_spy = mocker.patch("src.convert_one.run_ocrmypdf")
@@ -31,6 +33,9 @@ def test_convert_one_text_pdf_skips_ocr(mocker, text_pdf: Path, tmp_path: Path) 
     assert (paper_dir / "logs" / "text_layer_check.json").exists()
     assert (paper_dir / "logs" / "conversion_report.json").exists()
     assert (paper_dir / "logs" / "quality_report.md").exists()
+    assert "marker progress" in (paper_dir / "logs" / "pipeline.log").read_text(
+        encoding="utf-8"
+    )
     # Normalization ran
     assert "## Abstract" in (paper_dir / "paper.md").read_text(encoding="utf-8")
 
@@ -43,7 +48,7 @@ def test_convert_one_image_pdf_runs_ocr(mocker, image_pdf: Path, tmp_path: Path)
         Path(dst).write_bytes(b"%PDF-1.4-FAKE-OCR")
         return Path(dst)
 
-    def fake_marker(_pdf, out_dir: Path):
+    def fake_marker(_pdf, out_dir: Path, *, on_output=None):
         out_dir.mkdir(parents=True, exist_ok=True)
         md = out_dir / "paper.md"
         md.write_text("# Title\n\n## Abstract\n\nbody", encoding="utf-8")
@@ -72,7 +77,7 @@ def test_convert_one_passes_ocr_options_to_run_ocrmypdf(mocker, image_pdf: Path,
         Path(dst).write_bytes(b"%PDF-1.4-FAKE-OCR")
         return Path(dst)
 
-    def fake_marker(_pdf, out_dir: Path):
+    def fake_marker(_pdf, out_dir: Path, *, on_output=None):
         out_dir.mkdir(parents=True, exist_ok=True)
         md = out_dir / "paper.md"
         md.write_text("# Title\n\n## Abstract\n\nbody", encoding="utf-8")
@@ -86,3 +91,26 @@ def test_convert_one_passes_ocr_options_to_run_ocrmypdf(mocker, image_pdf: Path,
     kwargs = ocr_spy.call_args.kwargs
     assert kwargs["deskew"] is False
     assert kwargs["clean"] is False
+
+
+def test_convert_one_emits_stage_events(mocker, image_pdf: Path, tmp_path: Path) -> None:
+    output_dir = tmp_path / "output"
+    settings = _settings(image_pdf.parent, output_dir, enable_ocr=True)
+
+    def fake_ocr(_src, dst, **_kwargs):
+        Path(dst).write_bytes(b"%PDF-1.4-FAKE-OCR")
+        return Path(dst)
+
+    def fake_marker(_pdf, out_dir: Path, *, on_output=None):
+        out_dir.mkdir(parents=True, exist_ok=True)
+        md = out_dir / "paper.md"
+        md.write_text("# Title\n\n## Abstract\n\nbody", encoding="utf-8")
+        return md
+
+    mocker.patch("src.convert_one.run_ocrmypdf", side_effect=fake_ocr)
+    mocker.patch("src.convert_one.run_marker", side_effect=fake_marker)
+    events = []
+    convert_one(image_pdf, settings, on_event=events.append)
+
+    stages = [event.stage for event in events if event.kind == "stage_changed"]
+    assert stages == ["inspection", "ocr", "conversion", "post_processing"]

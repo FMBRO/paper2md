@@ -21,7 +21,10 @@ def test_run_batch_writes_summary_after_all_pdfs(mocker, tmp_path: Path) -> None
 
     mocker.patch(
         "src.batch_convert.convert_one",
-        side_effect=lambda pdf, _s: {"input_file": pdf.name, "status": "success"},
+        side_effect=lambda pdf, _s, on_event=None: {
+            "input_file": pdf.name,
+            "status": "success",
+        },
     )
 
     summary = run_batch(settings)
@@ -37,7 +40,7 @@ def test_run_batch_continues_on_failure(mocker, tmp_path: Path) -> None:
     _seed_pdfs(input_dir, ["good.pdf", "bad.pdf", "good2.pdf"])
     settings = Settings(input_dir=input_dir, output_dir=output_dir, continue_on_error=True)
 
-    def maybe_fail(pdf, _s):
+    def maybe_fail(pdf, _s, on_event=None):
         if pdf.name == "bad.pdf":
             raise RuntimeError("boom")
         return {"input_file": pdf.name, "status": "success"}
@@ -111,3 +114,48 @@ def test_settings_from_args_without_yaml(tmp_path: Path) -> None:
     assert settings.output_dir == tmp_path / "out"
     assert settings.engine == "marker"
     assert settings.workers == 3
+
+
+def test_run_batch_emits_progress_for_success_failure_and_skip(
+    mocker, tmp_path: Path
+) -> None:
+    input_dir = tmp_path / "in"
+    output_dir = tmp_path / "out"
+    _seed_pdfs(input_dir, ["a.pdf", "b.pdf", "c.pdf"])
+    existing = output_dir / "b" / "paper.md"
+    existing.parent.mkdir(parents=True)
+    existing.write_text("# existing", encoding="utf-8")
+    settings = Settings(
+        input_dir=input_dir,
+        output_dir=output_dir,
+        skip_existing=True,
+        continue_on_error=True,
+    )
+
+    def convert(pdf, _settings, on_event=None):
+        if on_event:
+            from src.pipeline_events import PipelineEvent
+            on_event(PipelineEvent(kind="stage_changed", stage="inspection"))
+        if pdf.name == "c.pdf":
+            raise RuntimeError("broken")
+        return {"status": "success"}
+
+    mocker.patch("src.batch_convert.convert_one", side_effect=convert)
+    events = []
+    summary = run_batch(settings, on_event=events.append)
+
+    assert summary["success"] == 2
+    assert summary["failed"] == 1
+    assert [event.kind for event in events] == [
+        "batch_started",
+        "pdf_started",
+        "stage_changed",
+        "pdf_succeeded",
+        "pdf_skipped",
+        "pdf_started",
+        "stage_changed",
+        "pdf_failed",
+        "batch_finished",
+    ]
+    forwarded = next(event for event in events if event.kind == "stage_changed")
+    assert (forwarded.pdf_name, forwarded.current, forwarded.total) == ("a.pdf", 1, 3)

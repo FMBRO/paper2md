@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import shutil
-import subprocess
 import tempfile
 from pathlib import Path
+
+from src.subprocess_utils import OutputCallback, run_streaming_command
 
 
 class MarkerError(RuntimeError):
@@ -14,7 +15,12 @@ class MarkerError(RuntimeError):
 _SHORT_STEM = "p"
 
 
-def run_marker(input_pdf: Path | str, output_dir: Path | str) -> Path:
+def run_marker(
+    input_pdf: Path | str,
+    output_dir: Path | str,
+    *,
+    on_output: OutputCallback | None = None,
+) -> Path:
     """Run ``marker_single`` and return the produced ``.md`` path.
 
     Marker writes ``{output_dir}/{stem}/{stem}.md``, duplicating the stem in
@@ -32,12 +38,13 @@ def run_marker(input_pdf: Path | str, output_dir: Path | str) -> Path:
         short_input = tmpdir / f"{_SHORT_STEM}{input_pdf.suffix or '.pdf'}"
         shutil.copy2(input_pdf, short_input)
 
-        result = subprocess.run(
+        returncode = run_streaming_command(
             ["marker_single", str(short_input), "--output_dir", str(tmpdir)],
+            on_output,
         )
-        if result.returncode != 0:
+        if returncode != 0:
             raise MarkerError(
-                f"marker_single failed (exit {result.returncode}) — see output above"
+                f"marker_single failed (exit {returncode}) — see output above"
             )
 
         candidates = sorted(tmpdir.rglob("*.md"))

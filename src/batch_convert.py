@@ -4,11 +4,13 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 from src.config import Settings, load_settings
 from src.convert_one import convert_one
+from src.pipeline_events import EventCallback, PipelineEvent
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -48,7 +50,10 @@ def _settings_from_args(args: argparse.Namespace) -> Settings:
     return Settings(**cleaned)
 
 
-def run_batch(settings: Settings) -> dict:
+def run_batch(
+    settings: Settings,
+    on_event: EventCallback | None = None,
+) -> dict:
     pdfs = sorted(Path(settings.input_dir).glob("*.pdf"))
     if not pdfs:
         raise FileNotFoundError(f"No PDF files found in {settings.input_dir}")
@@ -56,25 +61,81 @@ def run_batch(settings: Settings) -> dict:
     settings.output_dir.mkdir(parents=True, exist_ok=True)
     summary = {"total": len(pdfs), "success": 0, "failed": 0, "failed_files": []}
 
+    def emit(event: PipelineEvent) -> None:
+        if on_event is not None:
+            on_event(event)
+
+    emit(PipelineEvent(
+        kind="batch_started",
+        current=0,
+        total=len(pdfs),
+        message=f"Starting batch with {len(pdfs)} PDF(s)",
+    ))
+
     for idx, pdf in enumerate(pdfs, start=1):
+        def forward(event: PipelineEvent) -> None:
+            emit(replace(
+                event,
+                pdf_name=event.pdf_name or pdf.name,
+                current=idx,
+                total=len(pdfs),
+            ))
+
         paper_md = settings.output_dir / pdf.stem / "paper.md"
         if settings.skip_existing and paper_md.exists():
             print(f"[paper2md] ({idx}/{len(pdfs)}) {pdf.name}: skipped (paper.md exists)")
             summary["success"] += 1
+            emit(PipelineEvent(
+                kind="pdf_skipped",
+                pdf_name=pdf.name,
+                current=idx,
+                total=len(pdfs),
+                message="Skipped because paper.md already exists",
+            ))
             continue
         print(f"[paper2md] ({idx}/{len(pdfs)}) {pdf.name}: processing...", flush=True)
+        emit(PipelineEvent(
+            kind="pdf_started",
+            pdf_name=pdf.name,
+            current=idx,
+            total=len(pdfs),
+            message="Processing PDF",
+        ))
         try:
-            convert_one(pdf, settings)
+            convert_one(pdf, settings, on_event=forward)
             summary["success"] += 1
+            emit(PipelineEvent(
+                kind="pdf_succeeded",
+                pdf_name=pdf.name,
+                current=idx,
+                total=len(pdfs),
+                message="Conversion succeeded",
+            ))
         except Exception as err:
             summary["failed"] += 1
             summary["failed_files"].append(pdf.name)
+            emit(PipelineEvent(
+                kind="pdf_failed",
+                pdf_name=pdf.name,
+                current=idx,
+                total=len(pdfs),
+                message=str(err),
+            ))
             if not settings.continue_on_error:
                 _write_summary(settings.output_dir, summary)
                 raise
             print(f"[paper2md] {pdf.name} failed: {err}", file=sys.stderr)
 
     _write_summary(settings.output_dir, summary)
+    emit(PipelineEvent(
+        kind="batch_finished",
+        current=len(pdfs),
+        total=len(pdfs),
+        message=(
+            f"Batch complete: {summary['success']} succeeded, "
+            f"{summary['failed']} failed"
+        ),
+    ))
     return summary
 
 

@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+.uv-cache/
 .venv/
 venv/
 input/*.pdf

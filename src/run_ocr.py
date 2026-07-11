@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import shutil
-import subprocess
 import sys
 from pathlib import Path
+
+from src.subprocess_utils import OutputCallback, run_streaming_command
 
 
 class OCRError(RuntimeError):
@@ -18,6 +19,7 @@ def run_ocrmypdf(
     lang: str = "eng",
     deskew: bool = True,
     clean: bool = True,
+    on_output: OutputCallback | None = None,
 ) -> Path:
     """Run ``ocrmypdf`` and return the output path on success.
 
@@ -33,16 +35,19 @@ def run_ocrmypdf(
         if shutil.which("unpaper"):
             cmd.append("--clean")
         else:
-            print(
+            warning = (
                 "[paper2md] warning: 'unpaper' not found on PATH; "
-                "running ocrmypdf without --clean (install unpaper to enable noise removal).",
-                file=sys.stderr,
+                "running ocrmypdf without --clean (install unpaper to enable noise removal)."
             )
+            if on_output is None:
+                print(warning, file=sys.stderr)
+            else:
+                on_output(warning)
     cmd.extend([str(input_pdf), str(output_pdf)])
 
-    result = subprocess.run(cmd)
-    if result.returncode != 0:
+    returncode = run_streaming_command(cmd, on_output)
+    if returncode != 0:
         raise OCRError(
-            f"ocrmypdf failed (exit {result.returncode}) — see output above"
+            f"ocrmypdf failed (exit {returncode}) — see output above"
         )
     return Path(output_pdf)

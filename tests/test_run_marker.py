@@ -1,6 +1,4 @@
 from pathlib import Path
-from unittest.mock import MagicMock
-
 import pytest
 
 from src.run_marker import MarkerError, run_marker
@@ -11,7 +9,7 @@ def test_run_marker_invokes_cli_with_tempdir_and_flattens(mocker, tmp_path: Path
     src_pdf.write_bytes(b"%PDF-1.4")
     out_dir = tmp_path / "marker"
 
-    def fake_run(args, **_kw):
+    def fake_run(args, _on_output=None):
         # Wrapper copies the input to a short name inside tempdir and passes
         # that short path to marker_single. Marker derives the stem from the
         # input filename, so it writes {tmpdir}/{short_stem}/{short_stem}.md
@@ -25,9 +23,9 @@ def test_run_marker_invokes_cli_with_tempdir_and_flattens(mocker, tmp_path: Path
         images = produced / "images"
         images.mkdir()
         (images / "fig.png").write_bytes(b"PNG")
-        return MagicMock(returncode=0)
+        return 0
 
-    mocker.patch("src.run_marker.subprocess.run", side_effect=fake_run)
+    mocker.patch("src.run_marker.run_streaming_command", side_effect=fake_run)
     md_path = run_marker(src_pdf, out_dir)
     # The {stem}/ wrapper is flattened — the .md and images/ land directly
     # under out_dir. The .md filename matches the short stem the wrapper used.
@@ -49,7 +47,7 @@ def test_run_marker_renames_input_to_short_name_to_avoid_max_path(mocker, tmp_pa
 
     captured: dict[str, str] = {}
 
-    def fake_run(args, **_kw):
+    def fake_run(args, _on_output=None):
         input_path = Path(args[1])
         captured["input_arg"] = str(input_path)
         captured["input_stem"] = input_path.stem
@@ -57,9 +55,9 @@ def test_run_marker_renames_input_to_short_name_to_avoid_max_path(mocker, tmp_pa
         produced = tmpdir / input_path.stem
         produced.mkdir(parents=True)
         (produced / f"{input_path.stem}.md").write_text("# Paper\n")
-        return MagicMock(returncode=0)
+        return 0
 
-    mocker.patch("src.run_marker.subprocess.run", side_effect=fake_run)
+    mocker.patch("src.run_marker.run_streaming_command", side_effect=fake_run)
     md_path = run_marker(src_pdf, out_dir)
 
     # marker_single must NOT have been called with the original long stem.
@@ -73,8 +71,7 @@ def test_run_marker_renames_input_to_short_name_to_avoid_max_path(mocker, tmp_pa
 def test_run_marker_raises_when_no_markdown_produced(mocker, tmp_path: Path) -> None:
     src_pdf = tmp_path / "paper.pdf"
     src_pdf.write_bytes(b"%PDF-1.4")
-    mocker.patch("src.run_marker.subprocess.run",
-                 return_value=MagicMock(returncode=0))
+    mocker.patch("src.run_marker.run_streaming_command", return_value=0)
     with pytest.raises(MarkerError):
         run_marker(src_pdf, tmp_path / "marker")
 
@@ -82,7 +79,24 @@ def test_run_marker_raises_when_no_markdown_produced(mocker, tmp_path: Path) -> 
 def test_run_marker_raises_on_nonzero_exit(mocker, tmp_path: Path) -> None:
     src_pdf = tmp_path / "paper.pdf"
     src_pdf.write_bytes(b"%PDF-1.4")
-    mocker.patch("src.run_marker.subprocess.run",
-                 return_value=MagicMock(returncode=1, stderr=b"boom"))
+    mocker.patch("src.run_marker.run_streaming_command", return_value=1)
     with pytest.raises(MarkerError):
         run_marker(src_pdf, tmp_path / "marker")
+
+
+def test_run_marker_forwards_streamed_output(mocker, tmp_path: Path) -> None:
+    src_pdf = tmp_path / "paper.pdf"
+    src_pdf.write_bytes(b"%PDF-1.4")
+    messages: list[str] = []
+
+    def fake_run(args, on_output):
+        on_output("marker progress")
+        tmpdir = Path(args[args.index("--output_dir") + 1])
+        produced = tmpdir / Path(args[1]).stem
+        produced.mkdir(parents=True)
+        (produced / "p.md").write_text("# Paper\n", encoding="utf-8")
+        return 0
+
+    mocker.patch("src.run_marker.run_streaming_command", side_effect=fake_run)
+    run_marker(src_pdf, tmp_path / "marker", on_output=messages.append)
+    assert messages == ["marker progress"]

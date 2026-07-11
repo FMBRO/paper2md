@@ -615,6 +615,9 @@ paper-md-converter/
 ├── src/
 │   ├── main.py
 │   ├── batch_convert.py
+│   ├── gui.py
+│   ├── pipeline_events.py
+│   ├── subprocess_utils.py
 │   ├── inspect_pdf.py
 │   ├── run_ocr.py
 │   ├── run_marker.py
@@ -625,7 +628,8 @@ paper-md-converter/
 │   └── evaluate_quality.py
 ├── configs/
 │   └── config.yaml
-├── requirements.txt
+├── pyproject.toml
+├── uv.lock
 └── README.md
 ```
 
@@ -636,7 +640,7 @@ paper-md-converter/
 ### 7.1 バッチ実行（基本）
 
 ```bash
-python src/batch_convert.py \
+uv run python -m src.batch_convert \
   --input_dir input \
   --output_dir output \
   --engine marker
@@ -645,7 +649,7 @@ python src/batch_convert.py \
 ### 7.2 OCRを有効化する場合
 
 ```bash
-python src/batch_convert.py \
+uv run python -m src.batch_convert \
   --input_dir input \
   --output_dir output \
   --engine marker \
@@ -655,7 +659,7 @@ python src/batch_convert.py \
 ### 7.3 OCRを強制する場合
 
 ```bash
-python src/batch_convert.py \
+uv run python -m src.batch_convert \
   --input_dir input \
   --output_dir output \
   --engine marker \
@@ -665,14 +669,14 @@ python src/batch_convert.py \
 ### 7.4 変換エンジンを切り替える場合
 
 ```bash
-python src/batch_convert.py --input_dir input --output_dir output --engine mineru
-python src/batch_convert.py --input_dir input --output_dir output --engine docling
+uv run python -m src.batch_convert --input_dir input --output_dir output --engine mineru
+uv run python -m src.batch_convert --input_dir input --output_dir output --engine docling
 ```
 
 ### 7.5 並列処理
 
 ```bash
-python src/batch_convert.py \
+uv run python -m src.batch_convert \
   --input_dir input \
   --output_dir output \
   --engine marker \
@@ -687,7 +691,7 @@ OCRやMarkerはメモリ・GPUを使うため、初期は `--workers 1` を推�
 すでに `paper.md` が存在する場合はスキップする。
 
 ```bash
-python src/batch_convert.py --input_dir input --output_dir output --skip_existing
+uv run python -m src.batch_convert --input_dir input --output_dir output --skip_existing
 ```
 
 これにより、失敗したPDFだけ再実行できる。
@@ -695,7 +699,7 @@ python src/batch_convert.py --input_dir input --output_dir output --skip_existin
 ### 7.7 単一PDFの品質評価のみ実行する場合
 
 ```bash
-python src/evaluate_quality.py \
+uv run python -m src.evaluate_quality \
   --markdown output/paper_a/paper.md \
   --source input/paper_a.pdf
 ```
@@ -714,6 +718,23 @@ python src/evaluate_quality.py \
 --overwrite        既存出力を上書き
 --save_logs        ログ保存
 ```
+
+### 7.9 デスクトップGUI
+
+Tkinter製のローカルGUIを次のコマンドで起動する。
+
+```bash
+uv run python -m src.gui
+```
+
+GUIは、入力・出力フォルダ、Auto OCR、Force OCR、OCR言語、Deskew、Clean、
+Skip existingを設定できる。初期GUIは実装済みのMarkerエンジンと
+`workers: 1` のみを使用し、未接続のエンジンや未実装の上書き操作は表示しない。
+
+変換はバックグラウンドスレッドで実行し、PDF単位の処理段階、成功、失敗、
+スキップ、全体進捗を画面に表示する。MarkerとOCRmyPDFの出力はGUIへ逐次表示し、
+同時にPDFごとの `logs/pipeline.log` へUTF-8で保存する。GUIから実行した場合も、
+出力ディレクトリ構造、失敗継続、`batch_summary.json` の形式はCLIと同一とする。
 
 ---
 
@@ -955,15 +976,14 @@ tesseract
 
 ### 12.3 インストール例
 
-```bash
-pip install pymupdf pillow pyyaml marker-pdf docling
-```
-
-OCRmyPDFを使う場合:
+Python依存関係は `pyproject.toml` と `uv.lock` で管理し、次のコマンドで
+プロジェクト仮想環境へ同期する。
 
 ```bash
-pip install ocrmypdf
+uv sync --no-dev
 ```
+
+開発・テスト用依存関係も含める場合は `uv sync` を使用する。
 
 Tesseractが必要な場合は、OSごとに別途インストールする。
 
@@ -1173,9 +1193,9 @@ where $y_p$ is the observed RGB value, $S$ is the camera spectral sensitivity, $
 同じ論文PDFに対して、次の3つを比較する。
 
 ```bash
-python src/batch_convert.py --input_dir input --output_dir output_marker --engine marker
-python src/batch_convert.py --input_dir input --output_dir output_mineru --engine mineru
-python src/batch_convert.py --input_dir input --output_dir output_docling --engine docling
+uv run python -m src.batch_convert --input_dir input --output_dir output_marker --engine marker
+uv run python -m src.batch_convert --input_dir input --output_dir output_mineru --engine mineru
+uv run python -m src.batch_convert --input_dir input --output_dir output_docling --engine docling
 ```
 
 比較観点:
