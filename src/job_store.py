@@ -49,11 +49,36 @@ class JobStore:
                 );
                 CREATE TABLE IF NOT EXISTS llm_calls (
                     id INTEGER PRIMARY KEY, job_id TEXT, request_hash TEXT NOT NULL UNIQUE,
-                    model TEXT NOT NULL, response_json TEXT NOT NULL, cost_usd REAL NOT NULL,
+                    cache_key TEXT, model TEXT NOT NULL, provider TEXT,
+                    response_json TEXT NOT NULL, usage_json TEXT NOT NULL DEFAULT '{}',
+                    cost_usd REAL NOT NULL, validated INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL, FOREIGN KEY(job_id) REFERENCES jobs(id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_jobs_paper_state ON jobs(paper_id, state);
             """)
+            self._migrate_llm_calls(connection)
+
+    @staticmethod
+    def _migrate_llm_calls(connection: sqlite3.Connection) -> None:
+        columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(llm_calls)")
+        }
+        additions = {
+            "cache_key": "TEXT",
+            "provider": "TEXT",
+            "usage_json": "TEXT NOT NULL DEFAULT '{}'",
+            "validated": "INTEGER NOT NULL DEFAULT 1",
+        }
+        for name, declaration in additions.items():
+            if name not in columns:
+                connection.execute(f"ALTER TABLE llm_calls ADD COLUMN {name} {declaration}")
+        connection.execute(
+            "UPDATE llm_calls SET cache_key = request_hash WHERE cache_key IS NULL"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_llm_calls_cache_validated "
+            "ON llm_calls(cache_key, validated, id)"
+        )
 
     @staticmethod
     def _now() -> str:
@@ -205,14 +230,70 @@ class JobStore:
 
     def cache_llm_call(self, job_id: str, request_hash: str, model: str,
                        response: Any, cost_usd: float) -> None:
+        self.record_llm_call(
+            job_id,
+            request_hash=request_hash,
+            cache_key=request_hash,
+            model=model,
+            provider=None,
+            response=response,
+            usage={},
+            cost_usd=cost_usd,
+            validated=True,
+        )
+
+    def record_llm_call(
+        self,
+        job_id: str,
+        *,
+        request_hash: str,
+        cache_key: str,
+        model: str,
+        provider: str | None,
+        response: Any,
+        usage: dict[str, Any],
+        cost_usd: float,
+        validated: bool,
+    ) -> None:
         with self._connect() as connection:
             inserted = connection.execute(
-                "INSERT OR IGNORE INTO llm_calls (job_id, request_hash, model, response_json, cost_usd, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (job_id, request_hash, model, json.dumps(response), cost_usd, self._now()),
+                """INSERT OR IGNORE INTO llm_calls
+                   (job_id, request_hash, cache_key, model, provider, response_json,
+                    usage_json, cost_usd, validated, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (job_id, request_hash, cache_key, model, provider,
+                 json.dumps(response, ensure_ascii=False),
+                 json.dumps(usage, ensure_ascii=False), cost_usd, int(validated), self._now()),
             )
             if inserted.rowcount:
                 connection.execute("UPDATE jobs SET total_cost_usd = total_cost_usd + ?, updated_at = ? WHERE id = ?",
                                    (cost_usd, self._now(), job_id))
+
+    def get_cached_llm_result(self, cache_key: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM llm_calls WHERE cache_key = ? AND validated = 1 "
+                "ORDER BY id DESC LIMIT 1",
+                (cache_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "request_hash": row["request_hash"],
+            "model": row["model"],
+            "provider": row["provider"],
+            "response": json.loads(row["response_json"]),
+            "usage": json.loads(row["usage_json"]),
+            "cost_usd": float(row["cost_usd"]),
+        }
+
+    def llm_attempt_count(self, cache_key: str) -> int:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS count FROM llm_calls WHERE cache_key = ?",
+                (cache_key,),
+            ).fetchone()
+        return int(row["count"])
 
     def get_cached_llm_call(self, request_hash: str) -> dict[str, Any] | None:
         with self._connect() as connection:

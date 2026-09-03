@@ -127,3 +127,27 @@ def test_load_settings_applies_cli_overrides(tmp_path: Path) -> None:
     assert settings.engine == "docling"
     assert settings.workers == 4
     assert settings.force_ocr is True
+
+
+@pytest.mark.parametrize(
+    "setting,value",
+    [
+        ("extraction_max_input_tokens", 0),
+        ("extraction_max_output_tokens", -1),
+        ("synthesis_max_input_tokens", 0),
+        ("synthesis_max_output_tokens", -1),
+        ("chunk_max_chars", 0),
+    ],
+)
+def test_openrouter_token_and_chunk_limits_must_be_positive(setting: str, value: int) -> None:
+    from src.config import OpenRouterSettings
+
+    with pytest.raises(ValueError, match=setting):
+        OpenRouterSettings(**{setting: value})
+
+
+def test_openrouter_validation_retry_count_cannot_be_negative() -> None:
+    from src.config import OpenRouterSettings
+
+    with pytest.raises(ValueError, match="max_validation_retries"):
+        OpenRouterSettings(max_validation_retries=-1)

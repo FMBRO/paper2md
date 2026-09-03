@@ -923,9 +923,11 @@ name = "paper2md"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "httpx" },
     { name = "marker-pdf" },
     { name = "ocrmypdf" },
     { name = "pillow" },
+    { name = "pydantic" },
     { name = "pymupdf" },
     { name = "pyyaml" },
 ]
@@ -939,9 +941,11 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "httpx", specifier = ">=0.28" },
     { name = "marker-pdf", specifier = ">=1.0" },
     { name = "ocrmypdf", specifier = ">=16.0" },
     { name = "pillow", specifier = ">=10.0" },
+    { name = "pydantic", specifier = ">=2.10" },
     { name = "pymupdf", specifier = ">=1.24" },
     { name = "pyyaml", specifier = ">=6.0" },
 ]

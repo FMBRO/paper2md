@@ -61,6 +61,25 @@ class OpenRouterSettings:
     zdr: bool = True
     data_collection: bool = False
     paper_budget_usd: float = 0.50
+    extraction_max_input_tokens: int = 8_000
+    extraction_max_output_tokens: int = 1_000
+    synthesis_max_input_tokens: int = 12_000
+    synthesis_max_output_tokens: int = 2_000
+    chunk_max_chars: int = 12_000
+    max_validation_retries: int = 1
+
+    def __post_init__(self) -> None:
+        for name in (
+            "extraction_max_input_tokens",
+            "extraction_max_output_tokens",
+            "synthesis_max_input_tokens",
+            "synthesis_max_output_tokens",
+            "chunk_max_chars",
+        ):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be positive")
+        if self.max_validation_retries < 0:
+            raise ValueError("max_validation_retries must not be negative")
 
 
 @dataclass
@@ -145,6 +164,12 @@ def load_settings(config_path: Path | str, overrides: dict[str, Any] | None = No
             zdr=bool(openrouter.get("zdr", True)),
             data_collection=bool(openrouter.get("data_collection", False)),
             paper_budget_usd=float(openrouter.get("paper_budget_usd", 0.50)),
+            extraction_max_input_tokens=int(openrouter.get("extraction_max_input_tokens", 8_000)),
+            extraction_max_output_tokens=int(openrouter.get("extraction_max_output_tokens", 1_000)),
+            synthesis_max_input_tokens=int(openrouter.get("synthesis_max_input_tokens", 12_000)),
+            synthesis_max_output_tokens=int(openrouter.get("synthesis_max_output_tokens", 2_000)),
+            chunk_max_chars=int(openrouter.get("chunk_max_chars", 12_000)),
+            max_validation_retries=int(openrouter.get("max_validation_retries", 1)),
         ),
         notion=NotionSettings(
             data_source_id=notion.get("data_source_id"),
