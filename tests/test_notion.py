@@ -43,24 +43,36 @@ def _metadata() -> object:
     )
 
 
-def _schema(*, omit: str | None = None, doi_type: str = "rich_text") -> dict[str, Any]:
+def _schema(
+    *, omit: str | None = None, doi_type: str = "rich_text",
+    processing_type: str = "status",
+) -> dict[str, Any]:
     from src.config import DEFAULT_NOTION_PROPERTIES
 
     types = {
         "title": "title", "authors": "rich_text", "published_date": "date",
         "doi": doi_type, "arxiv_id": "rich_text", "source_url": "url",
         "zotero_link": "url", "zotero_item_key": "rich_text",
-        "processing_status": "status", "relevance_score": "number",
+        "processing_status": processing_type, "relevance_score": "number",
         "score_rationale": "rich_text", "topics": "multi_select",
-        "ai_keywords": "multi_select", "imported_at": "date",
+        "ai_keywords": "rich_text", "imported_at": "date",
         "model_prompt_version": "rich_text",
     }
+    properties = {
+        name: {"id": key, "type": types[key]}
+        for key, name in DEFAULT_NOTION_PROPERTIES.items() if key != omit
+    }
+    if "processing_status" in types and omit != "processing_status":
+        properties["Processing Status"][processing_type] = {
+            "options": [{"id": "status-complete", "name": "Completed"}],
+        }
+    if omit != "topics":
+        properties["Topics"]["multi_select"] = {
+            "options": [{"id": "topic-ir", "name": "情報検索"}],
+        }
     return {
         "object": "data_source",
-        "properties": {
-            name: {"id": key, "type": types[key]}
-            for key, name in DEFAULT_NOTION_PROPERTIES.items() if key != omit
-        },
+        "properties": properties,
     }
 
 
@@ -127,10 +139,12 @@ def test_create_payload_maps_properties_and_sends_only_japanese_summary_markdown
     assert payload["properties"]["Published Date"] == {"date": {"start": "2026-01-02"}}
     assert payload["properties"]["DOI"]["rich_text"][0]["text"]["content"] == "10.1000/example"
     assert payload["properties"]["Zotero Link"] == {"url": "zotero://select/library/items/ABC123"}
-    assert payload["properties"]["Processing Status"] == {"status": {"name": "Completed"}}
+    assert payload["properties"]["Processing Status"] == {"status": {"id": "status-complete"}}
     assert payload["properties"]["Relevance Score"] == {"number": 4}
-    assert payload["properties"]["Topics"] == {"multi_select": [{"name": "情報検索"}]}
-    assert payload["properties"]["AI Keywords"] == {"multi_select": [{"name": "検索"}, {"name": "蒸留"}]}
+    assert payload["properties"]["Topics"] == {"multi_select": [{"id": "topic-ir"}]}
+    assert payload["properties"]["AI Keywords"] == {
+        "rich_text": [{"type": "text", "text": {"content": "検索, 蒸留"}}],
+    }
     assert payload["properties"]["Imported At"] == {"date": {"start": "2026-09-03T00:00:00+00:00"}}
     assert payload["properties"]["Model / Prompt Version"]["rich_text"][0]["text"]["content"] == "v1"
     assert payload["markdown"] == (
@@ -169,7 +183,10 @@ def test_stored_page_id_takes_precedence_and_updates_properties_and_markdown(
         "/v1/data_sources/source-1", "/v1/pages/stored-page",
         "/v1/pages/stored-page", "/v1/pages/stored-page/markdown",
     ]
-    assert json.loads(requests[-1].content)["markdown"].startswith("## 背景")
+    assert json.loads(requests[-1].content) == {
+        "type": "replace_content",
+        "replace_content": {"new_str": "## 背景\n既存手法には計算量の課題がある。\n\n## 研究課題\n軽量化で精度を維持できるかを調べる。\n\n## 新規性\n蒸留と検索を組み合わせた。\n\n## 手法\n二段階の学習を行う。\n\n## データセット\n- データセットA\n\n## 結果\n精度は三ポイント改善した。\n\n## 強み\n再現可能な評価である。\n\n## 限界\n小規模な検証に限られる。\n\n## 要点\n軽量化の候補として有望である。"},
+    }
 
 
 def test_identity_lookup_uses_doi_before_arxiv_and_updates_exact_match(
@@ -197,6 +214,8 @@ def test_identity_lookup_uses_doi_before_arxiv_and_updates_exact_match(
         "page_size": 2,
     }
     assert [request.method for request in requests] == ["GET", "POST", "PATCH", "PATCH"]
+    assert json.loads(requests[-1].content)["type"] == "replace_content"
+    assert json.loads(requests[-1].content)["replace_content"]["new_str"].startswith("## 背景")
 
 
 def test_select_processing_status_schema_uses_a_select_property_payload(
@@ -207,9 +226,7 @@ def test_select_processing_status_schema_uses_a_select_property_payload(
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
         if request.method == "GET":
-            schema = _schema()
-            schema["properties"]["Processing Status"]["type"] = "select"
-            return httpx.Response(200, json=schema)
+            return httpx.Response(200, json=_schema(processing_type="select"))
         if request.url.path.endswith("/query"):
             return httpx.Response(200, json={"results": []})
         return httpx.Response(200, json={"id": "created-page"})
@@ -217,7 +234,47 @@ def test_select_processing_status_schema_uses_a_select_property_payload(
     _upserter(handler, monkeypatch).upsert(_metadata(), _summary())
 
     payload = json.loads(requests[-1].content)
-    assert payload["properties"]["Processing Status"] == {"select": {"name": "Completed"}}
+    assert payload["properties"]["Processing Status"] == {"select": {"id": "status-complete"}}
+
+
+@pytest.mark.parametrize(
+    ("topics", "processing_status", "expected"),
+    [(["未登録トピック"], "Completed", "Topics"), ([], "Unrecognized", "Processing Status")],
+)
+def test_unknown_controlled_options_fail_before_any_page_write(
+    monkeypatch: pytest.MonkeyPatch,
+    topics: list[str],
+    processing_status: str,
+    expected: str,
+) -> None:
+    from src.notion import NotionSchemaError
+
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=_schema())
+
+    with pytest.raises(NotionSchemaError, match=expected):
+        _upserter(handler, monkeypatch).upsert(
+            _metadata(), _summary(), topics=topics, processing_status=processing_status,
+        )
+
+    assert [request.method for request in requests] == ["GET"]
+
+
+def test_schema_rejects_ai_keywords_that_are_not_rich_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.notion import NotionSchemaError
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        schema = _schema()
+        schema["properties"]["AI Keywords"]["type"] = "multi_select"
+        return httpx.Response(200, json=schema)
+
+    with pytest.raises(NotionSchemaError, match="AI Keywords.*rich_text"):
+        _upserter(handler, monkeypatch).validate_schema()
 
 
 def test_rate_limit_honors_retry_after_without_live_wait(

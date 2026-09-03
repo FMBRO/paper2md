@@ -30,7 +30,7 @@ _PROPERTY_TYPES = {
     "relevance_score": {"number"},
     "score_rationale": {"rich_text"},
     "topics": {"multi_select"},
-    "ai_keywords": {"multi_select"},
+    "ai_keywords": {"rich_text"},
     "imported_at": {"date"},
     "model_prompt_version": {"rich_text"},
 }
@@ -93,6 +93,7 @@ class NotionSummaryUpserter:
         self._max_attempts = max_attempts
         self._initial_backoff_seconds = initial_backoff_seconds
         self._schema_property_types: dict[str, str] = {}
+        self._schema_option_ids: dict[str, dict[str, str]] = {}
 
     @property
     def _headers(self) -> dict[str, str]:
@@ -165,6 +166,7 @@ class NotionSummaryUpserter:
             raise NotionSchemaError("Data source response has an invalid properties schema")
         diagnostics: list[str] = []
         schema_property_types: dict[str, str] = {}
+        schema_option_ids: dict[str, dict[str, str]] = {}
         for key, configured_name in self.settings.properties.items():
             property_schema = properties.get(configured_name)
             if not isinstance(property_schema, dict):
@@ -178,9 +180,30 @@ class NotionSummaryUpserter:
                 )
             else:
                 schema_property_types[key] = actual_type
+                if key in {"processing_status", "topics"}:
+                    option_config = property_schema.get(actual_type)
+                    options = option_config.get("options") if isinstance(option_config, dict) else None
+                    if not isinstance(options, list):
+                        diagnostics.append(f"{configured_name}: options missing")
+                        continue
+                    option_ids: dict[str, str] = {}
+                    for option in options:
+                        if not isinstance(option, dict):
+                            diagnostics.append(f"{configured_name}: invalid option")
+                            continue
+                        option_name, option_id = option.get("name"), option.get("id")
+                        if not isinstance(option_name, str) or not isinstance(option_id, str):
+                            diagnostics.append(f"{configured_name}: invalid option")
+                            continue
+                        if option_name in option_ids:
+                            diagnostics.append(f"{configured_name}: duplicate option {option_name}")
+                            continue
+                        option_ids[option_name] = option_id
+                    schema_option_ids[key] = option_ids
         if diagnostics:
             raise NotionSchemaError("Notion data source schema invalid: " + "; ".join(diagnostics))
         self._schema_property_types = schema_property_types
+        self._schema_option_ids = schema_option_ids
 
     @staticmethod
     def _rich_text(value: str | None) -> dict[str, list[dict[str, Any]]]:
@@ -198,9 +221,21 @@ class NotionSummaryUpserter:
             ],
         }
 
-    @staticmethod
-    def _multi_select(values: Iterable[str]) -> dict[str, list[dict[str, str]]]:
-        return {"multi_select": [{"name": value} for value in values if value]}
+    def _controlled_option_id(self, key: str, value: str) -> str:
+        try:
+            return self._schema_option_ids[key][value]
+        except KeyError as error:
+            raise NotionSchemaError(
+                f"{self.settings.properties[key]}: unknown controlled option {value}"
+            ) from error
+
+    def _multi_select(self, values: Iterable[str]) -> dict[str, list[dict[str, str]]]:
+        return {
+            "multi_select": [
+                {"id": self._controlled_option_id("topics", value)}
+                for value in values if value
+            ],
+        }
 
     @staticmethod
     def _zotero_link(metadata: PaperMetadata) -> str | None:
@@ -245,13 +280,13 @@ class NotionSummaryUpserter:
             names["zotero_item_key"]: self._rich_text(metadata.zotero_item_key),
             names["processing_status"]: {
                 self._schema_property_types.get("processing_status", "status"): {
-                    "name": processing_status,
+                    "id": self._controlled_option_id("processing_status", processing_status),
                 },
             },
             names["relevance_score"]: {"number": summary.relevance_score},
             names["score_rationale"]: self._rich_text(summary.score_rationale),
             names["topics"]: self._multi_select(topics),
-            names["ai_keywords"]: self._multi_select(summary.keywords),
+            names["ai_keywords"]: self._rich_text(", ".join(keyword for keyword in summary.keywords if keyword)),
             names["imported_at"]: {"date": {"start": imported_at}},
             names["model_prompt_version"]: self._rich_text(model_prompt_version),
         }
@@ -330,6 +365,12 @@ class NotionSummaryUpserter:
             return str(page_id), False
         raise NotionAPIError("Notion page creation failed")
 
+    def _replace_page_content(self, page_id: str, markdown: str) -> None:
+        self._request(
+            "PATCH", f"/pages/{page_id}/markdown",
+            json={"type": "replace_content", "replace_content": {"new_str": markdown}},
+        )
+
     def upsert(
         self,
         metadata: PaperMetadata,
@@ -350,14 +391,10 @@ class NotionSummaryUpserter:
         page_id = self._find_page(metadata, stored_page_id)
         if page_id:
             self._request("PATCH", f"/pages/{page_id}", json={"properties": properties})
-            self._request(
-                "PATCH", f"/pages/{page_id}/markdown", json={"markdown": markdown},
-            )
+            self._replace_page_content(page_id, markdown)
             return page_id
         page_id, recovered = self._create_or_recover(metadata, properties, markdown)
         if recovered:
             self._request("PATCH", f"/pages/{page_id}", json={"properties": properties})
-            self._request(
-                "PATCH", f"/pages/{page_id}/markdown", json={"markdown": markdown},
-            )
+            self._replace_page_content(page_id, markdown)
         return page_id

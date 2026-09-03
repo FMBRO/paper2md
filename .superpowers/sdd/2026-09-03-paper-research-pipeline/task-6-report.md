@@ -203,3 +203,81 @@ Task 6 imports OK
 
 - The existing Notion data source must already contain the mapped properties and a `Completed` option in its Processing Status property; schema type validation is diagnostic-only and intentionally never adds options or properties.
 - Task 7 must call `set_notion_page_id` after a successful upsert and pass `get_notion_page_id` into the next upsert to use the durable fast path.
+
+---
+
+## Critical review remediation (2026-09-03)
+
+### Findings resolved
+
+1. `PATCH /v1/pages/{page_id}/markdown` now sends the documented Enhanced Markdown replace operation exactly:
+
+   ```json
+   {"type":"replace_content","replace_content":{"new_str":"..."}}
+   ```
+
+   Contract tests assert this complete shape for both the stored-page-ID update path and the DOI identity-match update path.
+
+2. Schema validation now retains the configured Processing Status/select and Topics/multi-select option name-to-ID mappings. Property writes use only existing IDs, reject an unknown status or topic before any query/page write, and therefore cannot add arbitrary options to the schema. `AI Keywords` is now required and written as rich text (the comma-separated validated keyword list), never as a multi-select value.
+
+### Strict TDD evidence
+
+RED command:
+
+```text
+uv run pytest -q tests/test_notion.py -k "create_payload or stored_page_id or identity_lookup or select_processing or unknown_controlled or ai_keywords"
+```
+
+RED output:
+
+```text
+FFFFFFF                                                                  [100%]
+Notion data source schema invalid: AI Keywords: expected multi_select, got rich_text
+AssertionError: {'status': {'name': 'Completed'}} != {'status': {'id': 'status-complete'}}
+Failed: DID NOT RAISE NotionSchemaError
+7 failed, 6 deselected in 0.22s
+```
+
+The failures demonstrated the prior multi-select AI Keyword contract, arbitrary status/topic name writes, and invalid markdown update body. The tests were adjusted to the approved existing-data-source schema before implementation; the remaining production behavior failed for the stated safety contract.
+
+GREEN command:
+
+```text
+uv run pytest -q tests/test_notion.py
+```
+
+GREEN output:
+
+```text
+.............                                                            [100%]
+13 passed in 0.09s
+```
+
+### Remediation verification
+
+```text
+git diff --check
+uv run pytest -q
+uv run python -m compileall -q src tests
+uv run python -c "from src.notion import NotionSummaryUpserter, NotionSchemaError; print('Task 6 review imports OK')"
+```
+
+Output:
+
+```text
+........................................................................ [ 35%]
+........................................................................ [ 71%]
+..........................................................               [100%]
+202 passed in 4.78s
+Task 6 review imports OK
+```
+
+`git diff --check` and `compileall` exited 0. No live Notion requests were made.
+
+### Remediation self-review
+
+- Mutating `replace_content` back to a bare `markdown` key fails the stored-page and DOI-update payload assertions.
+- Mutating controlled writes from option IDs back to names fails the create payload contract.
+- Removing an option mapping or passing an unknown topic/status fails before any page-side request; only the read-only schema retrieval is observed.
+- Changing `AI Keywords` back to multi-select fails schema validation and the rich-text create-payload assertion.
+- No endpoint updates a data source or its properties; all schema option handling is read-only.
