@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import threading
 import time
 import unicodedata
 import uuid
@@ -341,6 +342,8 @@ def build_structured_payload(
 class OpenRouterSummarizer:
     """Run validated map/reduce summarization with durable paid-call caching."""
 
+    _claim_heartbeat_interval_seconds = 1.0
+
     def __init__(
         self,
         store: JobStore,
@@ -353,6 +356,26 @@ class OpenRouterSummarizer:
         self.settings = settings or OpenRouterSettings()
         self.client = client or httpx.Client(timeout=self.settings.request_timeout_seconds)
         self.catalog = catalog or OpenRouterModelCatalog(self.client)
+
+    def _start_lease_heartbeat(
+        self, renew: Callable[[], bool],
+    ) -> tuple[threading.Event, threading.Event, threading.Thread]:
+        stop = threading.Event()
+        ownership_lost = threading.Event()
+
+        def heartbeat_loop() -> None:
+            while not stop.wait(self._claim_heartbeat_interval_seconds):
+                try:
+                    if renew():
+                        continue
+                except Exception:
+                    pass
+                ownership_lost.set()
+                return
+
+        heartbeat = threading.Thread(target=heartbeat_loop, daemon=True)
+        heartbeat.start()
+        return stop, ownership_lost, heartbeat
 
     @staticmethod
     def _request_hash(payload: dict[str, Any]) -> str:
@@ -400,15 +423,19 @@ class OpenRouterSummarizer:
         stage: str,
         validate: Callable[[ResponseModel], None] | None = None,
         reservation_id: str | None = None,
+        reservation_owner_token: str | None = None,
     ) -> ResponseModel:
         owner_token = str(uuid.uuid4())
         deadline = time.monotonic() + 30.0
         attempts = self.settings.max_validation_retries + 1
+        claim_lease_seconds = self.settings.request_timeout_seconds * attempts + 30.0
         while True:
             cached = self._cached(cache_key, response_model, validate)
             if cached is not None:
-                if reservation_id is not None:
-                    self.store.release_llm_budget(reservation_id)
+                if reservation_id is not None and reservation_owner_token is not None:
+                    self.store.release_llm_budget(
+                        reservation_id, reservation_owner_token,
+                    )
                 return cached
             if self.store.has_unresolved_llm_call(cache_key):
                 raise UnresolvedUsageError(
@@ -422,15 +449,14 @@ class OpenRouterSummarizer:
                 cache_key,
                 owner_token,
                 now=time.time(),
-                lease_seconds=(
-                    self.settings.request_timeout_seconds * attempts + 30.0
-                ),
+                lease_seconds=claim_lease_seconds,
             ):
                 break
             if time.monotonic() >= deadline:
                 raise RequestInFlightError("Timed out waiting for an identical LLM request")
             time.sleep(0.01)
         active_reservation = reservation_id or str(uuid.uuid4())
+        active_reservation_owner = reservation_owner_token or owner_token
         preserve_reservation = False
         try:
             authorized_per_attempt = self._call_cost(
@@ -442,8 +468,11 @@ class OpenRouterSummarizer:
                 reserved = self.store.reserve_llm_budget(
                     job_id,
                     active_reservation,
+                    owner_token=active_reservation_owner,
                     amount_usd=required,
                     budget_usd=self.settings.paper_budget_usd,
+                    now=time.time(),
+                    lease_seconds=claim_lease_seconds,
                 )
                 if not reserved:
                     raise BudgetExceededError("OpenRouter request would exceed paper budget")
@@ -451,24 +480,49 @@ class OpenRouterSummarizer:
                 available = self.store.llm_budget_reservation(active_reservation)
                 if available is None or available + 1e-12 < required:
                     raise BudgetExceededError("Reserved synthesis budget is insufficient")
-            return self._claimed_structured_call(
-                payload=payload,
-                response_model=response_model,
-                job_id=job_id,
-                cache_key=cache_key,
-                pricing=pricing,
-                max_input_tokens=max_input_tokens,
-                stage=stage,
-                validate=validate,
-                reservation_id=active_reservation,
-                authorized_per_attempt=float(authorized_per_attempt),
+            def renew_leases() -> bool:
+                return self.store.renew_llm_leases(
+                    cache_key,
+                    owner_token,
+                    active_reservation,
+                    active_reservation_owner,
+                    now=time.time(),
+                    lease_seconds=claim_lease_seconds,
+                )
+
+            heartbeat_stop, ownership_lost, heartbeat = self._start_lease_heartbeat(
+                renew_leases,
             )
+            try:
+                result = self._claimed_structured_call(
+                    payload=payload,
+                    response_model=response_model,
+                    job_id=job_id,
+                    cache_key=cache_key,
+                    pricing=pricing,
+                    max_input_tokens=max_input_tokens,
+                    stage=stage,
+                    validate=validate,
+                    reservation_id=active_reservation,
+                    request_owner_token=owner_token,
+                    reservation_owner_token=active_reservation_owner,
+                    authorized_per_attempt=float(authorized_per_attempt),
+                    ownership_lost=ownership_lost,
+                )
+                if ownership_lost.is_set():
+                    raise RequestInFlightError("Lost ownership of LLM request lease")
+                return result
+            finally:
+                heartbeat_stop.set()
+                heartbeat.join()
         except UnresolvedUsageError:
             preserve_reservation = True
             raise
         finally:
             if not preserve_reservation:
-                self.store.release_llm_budget(active_reservation)
+                self.store.release_llm_budget(
+                    active_reservation, active_reservation_owner,
+                )
             self.store.release_llm_request(cache_key, owner_token)
 
     def _claimed_structured_call(
@@ -483,7 +537,10 @@ class OpenRouterSummarizer:
         stage: str,
         validate: Callable[[ResponseModel], None] | None = None,
         reservation_id: str,
+        request_owner_token: str,
+        reservation_owner_token: str,
         authorized_per_attempt: float,
+        ownership_lost: threading.Event,
     ) -> ResponseModel:
         cached = self._cached(cache_key, response_model, validate)
         if cached is not None:
@@ -502,6 +559,8 @@ class OpenRouterSummarizer:
                 f"Structured output retries already exhausted after {attempts} attempts"
             )
         for attempt in range(first_attempt, attempts):
+            if ownership_lost.is_set():
+                raise RequestInFlightError("Lost ownership of LLM request lease")
             attempt_payload = dict(payload)
             if attempt:
                 attempt_payload["messages"] = [
@@ -533,7 +592,7 @@ class OpenRouterSummarizer:
             try:
                 raw_response = response.json()
             except ValueError as error:
-                self.store.record_llm_call(
+                self.store.record_llm_call_and_settle_budget(
                     job_id,
                     request_hash=request_hash,
                     cache_key=cache_key,
@@ -546,9 +605,11 @@ class OpenRouterSummarizer:
                     cost_resolved=False,
                     validated=False,
                     pricing=pricing.as_record(),
-                )
-                self.store.retain_unresolved_llm_budget(
-                    reservation_id, authorized_per_attempt,
+                    reservation_id=reservation_id,
+                    request_owner_token=request_owner_token,
+                    reservation_owner_token=reservation_owner_token,
+                    authorized_amount_usd=authorized_per_attempt,
+                    now=time.time(),
                 )
                 raise UnresolvedUsageError(
                     "OpenRouter returned 2xx without parseable cost metadata"
@@ -570,7 +631,7 @@ class OpenRouterSummarizer:
             )
             if not resolved:
                 usage = audit.usage.model_dump(mode="json") if audit.usage else {}
-                self.store.record_llm_call(
+                self.store.record_llm_call_and_settle_budget(
                     job_id,
                     request_hash=request_hash,
                     cache_key=cache_key,
@@ -583,9 +644,11 @@ class OpenRouterSummarizer:
                     cost_resolved=False,
                     validated=False,
                     pricing=pricing.as_record(),
-                )
-                self.store.retain_unresolved_llm_budget(
-                    reservation_id, authorized_per_attempt,
+                    reservation_id=reservation_id,
+                    request_owner_token=request_owner_token,
+                    reservation_owner_token=reservation_owner_token,
+                    authorized_amount_usd=authorized_per_attempt,
+                    now=time.time(),
                 )
                 raise UnresolvedUsageError(
                     "OpenRouter returned 2xx but usage cost is unavailable"
@@ -593,7 +656,7 @@ class OpenRouterSummarizer:
             usage = audit.usage.model_dump(mode="json")
             cost_usd = float(audit.usage.cost)
             if audit.model != attempt_payload["model"]:
-                self.store.record_llm_call(
+                self.store.record_llm_call_and_settle_budget(
                     job_id,
                     request_hash=request_hash,
                     cache_key=cache_key,
@@ -605,13 +668,17 @@ class OpenRouterSummarizer:
                     cost_usd=cost_usd,
                     validated=False,
                     pricing=pricing.as_record(),
+                    reservation_id=reservation_id,
+                    request_owner_token=request_owner_token,
+                    reservation_owner_token=reservation_owner_token,
+                    authorized_amount_usd=authorized_per_attempt,
+                    now=time.time(),
                 )
-                self.store.consume_llm_budget(reservation_id, authorized_per_attempt)
                 raise OpenRouterAPIError("OpenRouter returned an unexpected model")
             try:
                 envelope = _CompletionResponse.model_validate(raw_response)
             except ValidationError as error:
-                self.store.record_llm_call(
+                self.store.record_llm_call_and_settle_budget(
                     job_id,
                     request_hash=request_hash,
                     cache_key=cache_key,
@@ -623,8 +690,12 @@ class OpenRouterSummarizer:
                     cost_usd=cost_usd,
                     validated=False,
                     pricing=pricing.as_record(),
+                    reservation_id=reservation_id,
+                    request_owner_token=request_owner_token,
+                    reservation_owner_token=reservation_owner_token,
+                    authorized_amount_usd=authorized_per_attempt,
+                    now=time.time(),
                 )
-                self.store.consume_llm_budget(reservation_id, authorized_per_attempt)
                 last_error = error
                 continue
             content = envelope.choices[0].message.content
@@ -634,7 +705,7 @@ class OpenRouterSummarizer:
                 if validate is not None:
                     validate(parsed)
             except (json.JSONDecodeError, ValidationError, ValueError) as error:
-                self.store.record_llm_call(
+                self.store.record_llm_call_and_settle_budget(
                     job_id,
                     request_hash=request_hash,
                     cache_key=cache_key,
@@ -646,11 +717,15 @@ class OpenRouterSummarizer:
                     cost_usd=cost_usd,
                     validated=False,
                     pricing=pricing.as_record(),
+                    reservation_id=reservation_id,
+                    request_owner_token=request_owner_token,
+                    reservation_owner_token=reservation_owner_token,
+                    authorized_amount_usd=authorized_per_attempt,
+                    now=time.time(),
                 )
-                self.store.consume_llm_budget(reservation_id, authorized_per_attempt)
                 last_error = error
                 continue
-            self.store.record_llm_call(
+            self.store.record_llm_call_and_settle_budget(
                 job_id,
                 request_hash=request_hash,
                 cache_key=cache_key,
@@ -662,8 +737,12 @@ class OpenRouterSummarizer:
                 cost_usd=cost_usd,
                 validated=True,
                 pricing=pricing.as_record(),
+                reservation_id=reservation_id,
+                request_owner_token=request_owner_token,
+                reservation_owner_token=reservation_owner_token,
+                authorized_amount_usd=authorized_per_attempt,
+                now=time.time(),
             )
-            self.store.consume_llm_budget(reservation_id, authorized_per_attempt)
             return parsed
         raise StructuredOutputError(
             f"Structured output remained invalid after {attempts} attempts"
@@ -895,6 +974,12 @@ class OpenRouterSummarizer:
             for key, chunk in zip(map_cache_keys, chunks, strict=True)
         ]
         synthesis_reservation_id = str(uuid.uuid4())
+        synthesis_reservation_owner = str(uuid.uuid4())
+        synthesis_reservation_lease = (
+            self.settings.request_timeout_seconds
+            * (self.settings.max_validation_retries + 1)
+            + 30.0
+        )
         synthesis_headroom = float(
             self._call_cost(
                 synthesis_pricing,
@@ -905,15 +990,32 @@ class OpenRouterSummarizer:
         if not self.store.reserve_llm_budget(
             job_id,
             synthesis_reservation_id,
+            owner_token=synthesis_reservation_owner,
             amount_usd=synthesis_headroom,
             budget_usd=self.settings.paper_budget_usd,
+            now=time.time(),
+            lease_seconds=synthesis_reservation_lease,
         ):
             raise BudgetExceededError("Final synthesis headroom is unavailable")
+
+        def renew_synthesis_reservation() -> bool:
+            return self.store.renew_llm_budget(
+                synthesis_reservation_id,
+                synthesis_reservation_owner,
+                now=time.time(),
+                lease_seconds=synthesis_reservation_lease,
+            )
+
+        synthesis_heartbeat_stop, synthesis_ownership_lost, synthesis_heartbeat = (
+            self._start_lease_heartbeat(renew_synthesis_reservation)
+        )
         try:
             extractions: list[ChunkExtractionResponse] = []
             for payload, cache_key, cached, chunk in zip(
                 map_payloads, map_cache_keys, cached_maps, chunks, strict=True,
             ):
+                if synthesis_ownership_lost.is_set():
+                    raise RequestInFlightError("Lost synthesis budget reservation")
                 result = cached or self._structured_call(
                     payload=payload,
                     response_model=ChunkExtractionResponse,
@@ -930,10 +1032,16 @@ class OpenRouterSummarizer:
                 extractions, research_interest, synthesis_pricing,
             )
         except BaseException:
-            self.store.release_llm_budget(synthesis_reservation_id)
+            synthesis_heartbeat_stop.set()
+            synthesis_heartbeat.join()
+            self.store.release_llm_budget(
+                synthesis_reservation_id, synthesis_reservation_owner,
+            )
             raise
         try:
             for level in range(self.settings.max_reduction_levels + 1):
+                if synthesis_ownership_lost.is_set():
+                    raise RequestInFlightError("Lost synthesis budget reservation")
                 if estimate_serialized_tokens(synthesis_payload) <= self.settings.synthesis_max_input_tokens:
                     break
                 if level == self.settings.max_reduction_levels:
@@ -967,6 +1075,8 @@ class OpenRouterSummarizer:
                 synthesis_cache_key, PaperSummaryResponse, evidence_validator,
             )
             if cached_summary is None:
+                if synthesis_ownership_lost.is_set():
+                    raise RequestInFlightError("Lost synthesis budget reservation")
                 response = self._structured_call(
                     payload=synthesis_payload,
                     response_model=PaperSummaryResponse,
@@ -977,11 +1087,16 @@ class OpenRouterSummarizer:
                     stage="synthesis",
                     validate=evidence_validator,
                     reservation_id=synthesis_reservation_id,
+                    reservation_owner_token=synthesis_reservation_owner,
                 )
             else:
                 response = cached_summary
         finally:
-            self.store.release_llm_budget(synthesis_reservation_id)
+            synthesis_heartbeat_stop.set()
+            synthesis_heartbeat.join()
+            self.store.release_llm_budget(
+                synthesis_reservation_id, synthesis_reservation_owner,
+            )
         validated = PaperSummaryResponse.model_validate(response)
         artifacts.create()
         artifacts.write_summary(validated.model_dump(mode="json"))

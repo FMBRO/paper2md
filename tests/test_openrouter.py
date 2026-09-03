@@ -1371,3 +1371,127 @@ def test_request_claim_outlives_former_fixed_lease_during_bounded_retry_window(
 
     assert not duplicate_before_completion
     assert extraction_calls == 1
+
+
+def test_request_claim_heartbeat_prevents_takeover_after_original_lease_expiry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.artifacts import ArtifactManager
+    from src.job_store import JobStore
+    from src.openrouter import OpenRouterSummarizer
+    from src.research_models import InputKind, InputSpec
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "secret")
+    fake_now = [1_000.0]
+    monkeypatch.setattr("src.openrouter.time.time", lambda: fake_now[0])
+    first_started = threading.Event()
+    release_first = threading.Event()
+    duplicate_dispatch = threading.Event()
+    lock = threading.Lock()
+    extraction_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal extraction_calls
+        payload = json.loads(request.content)
+        if payload["model"] == "google/gemini-3.8-flash":
+            with lock:
+                extraction_calls += 1
+                call_number = extraction_calls
+            if call_number == 1:
+                first_started.set()
+                assert release_first.wait(2)
+            else:
+                duplicate_dispatch.set()
+            content = _extraction()
+        else:
+            content = _summary()
+        return httpx.Response(
+            200, json=_completion(content, model=payload["model"], provider="p", cost=0.01),
+        )
+
+    store = JobStore(tmp_path / "state.sqlite3")
+    job = store.create_job(InputSpec(InputKind.ARXIV, "2401.00001"))
+    summarizer = OpenRouterSummarizer(
+        store,
+        settings=_settings(request_timeout_seconds=0.01, max_validation_retries=1),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        catalog=_pricing(),
+    )
+    summarizer._claim_heartbeat_interval_seconds = 0.01
+
+    def run(name: str):
+        return summarizer.summarize(
+            _document(), job_id=job.id,
+            artifacts=ArtifactManager(tmp_path / "out", name),
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(run, "first")
+        assert first_started.wait(1)
+        fake_now[0] += 20
+        time.sleep(0.05)
+        fake_now[0] += 20
+        time.sleep(0.05)
+        second = executor.submit(run, "second")
+        duplicate_before_completion = duplicate_dispatch.wait(0.25)
+        release_first.set()
+        assert first.result().relevance_score == 4
+        assert second.result().relevance_score == 4
+
+    assert not duplicate_before_completion
+    assert extraction_calls == 1
+
+
+def test_failed_budget_settlement_rolls_back_llm_charge_atomically(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.artifacts import ArtifactManager
+    from src.job_store import JobStore
+    from src.openrouter import OpenRouterSummarizer
+    from src.research_models import InputKind, InputSpec
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "secret")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json=_completion(
+                _extraction(), model=payload["model"], provider="p", cost=0.001,
+            ),
+        )
+
+    store = JobStore(tmp_path / "state.sqlite3")
+    job = store.create_job(InputSpec(InputKind.ARXIV, "2401.00001"))
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            """CREATE TRIGGER fail_small_reservation_settle
+               BEFORE DELETE ON llm_budget_reservations
+               WHEN OLD.amount_usd < 0.01
+               BEGIN SELECT RAISE(ABORT, 'simulated settlement crash'); END"""
+        )
+        connection.execute(
+            """CREATE TRIGGER fail_small_reservation_update
+               BEFORE UPDATE OF amount_usd ON llm_budget_reservations
+               WHEN OLD.amount_usd < 0.01
+               BEGIN SELECT RAISE(ABORT, 'simulated settlement crash'); END"""
+        )
+    summarizer = OpenRouterSummarizer(
+        store,
+        settings=_settings(max_validation_retries=0),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        catalog=_pricing(),
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="simulated settlement crash"):
+        summarizer.summarize(
+            _document(), job_id=job.id,
+            artifacts=ArtifactManager(tmp_path / "out", "paper"),
+        )
+
+    with sqlite3.connect(store.path) as connection:
+        recorded_attempts = connection.execute(
+            "SELECT COUNT(*) FROM llm_calls"
+        ).fetchone()[0]
+    assert recorded_attempts == 0
+    assert store.total_cost(job.id) == 0

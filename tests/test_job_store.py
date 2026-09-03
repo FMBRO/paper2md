@@ -192,3 +192,138 @@ def test_job_store_migrates_task_one_llm_cache_schema(tmp_path: Path) -> None:
     with sqlite3.connect(path) as connection:
         columns = {row[1] for row in connection.execute("PRAGMA table_info(llm_calls)")}
     assert {"cache_key", "provider", "usage_json", "validated"} <= columns
+
+
+def test_stale_budget_reservation_is_reclaimed_when_job_resumes(tmp_path: Path) -> None:
+    from src.job_store import JobStore
+    from src.research_models import InputKind, InputSpec
+
+    store = JobStore(tmp_path / "paper2md.sqlite3")
+    job = store.create_job(InputSpec(InputKind.ARXIV, "2401.00001"))
+    assert store.reserve_llm_budget(
+        job.id,
+        "abandoned",
+        owner_token="dead-worker",
+        amount_usd=0.4,
+        budget_usd=0.5,
+        now=100.0,
+        lease_seconds=10.0,
+    )
+    assert not store.reserve_llm_budget(
+        job.id,
+        "too-early",
+        owner_token="resume-worker",
+        amount_usd=0.2,
+        budget_usd=0.5,
+        now=109.0,
+        lease_seconds=10.0,
+    )
+
+    assert store.reserve_llm_budget(
+        job.id,
+        "reclaimed",
+        owner_token="resume-worker",
+        amount_usd=0.2,
+        budget_usd=0.5,
+        now=111.0,
+        lease_seconds=10.0,
+    )
+    assert store.llm_budget_reservation("abandoned") is None
+    assert store.llm_budget_reservation("reclaimed") == pytest.approx(0.2)
+
+
+def test_atomic_llm_settlement_requires_current_request_and_budget_owners(
+    tmp_path: Path,
+) -> None:
+    from src.job_store import JobStore, LeaseOwnershipError
+    from src.research_models import InputKind, InputSpec
+
+    store = JobStore(tmp_path / "paper2md.sqlite3")
+    job = store.create_job(InputSpec(InputKind.ARXIV, "2401.00001"))
+    assert store.claim_llm_request(
+        "logical", "request-owner", now=100.0, lease_seconds=10.0,
+    )
+    assert store.reserve_llm_budget(
+        job.id,
+        "reservation",
+        owner_token="budget-owner",
+        amount_usd=0.1,
+        budget_usd=0.5,
+        now=100.0,
+        lease_seconds=10.0,
+    )
+    settlement = {
+        "job_id": job.id,
+        "request_hash": "attempt",
+        "cache_key": "logical",
+        "model": "example/model",
+        "provider": "provider",
+        "response": {"ok": True},
+        "usage": {"cost": 0.03},
+        "cost_usd": 0.03,
+        "validated": True,
+        "reservation_id": "reservation",
+        "authorized_amount_usd": 0.05,
+        "now": 101.0,
+    }
+
+    with pytest.raises(LeaseOwnershipError):
+        store.record_llm_call_and_settle_budget(
+            **settlement,
+            request_owner_token="stale-request-owner",
+            reservation_owner_token="budget-owner",
+        )
+    with pytest.raises(LeaseOwnershipError):
+        store.record_llm_call_and_settle_budget(
+            **settlement,
+            request_owner_token="request-owner",
+            reservation_owner_token="stale-budget-owner",
+        )
+
+    assert store.total_cost(job.id) == 0
+    assert store.get_cached_llm_result("logical") is None
+    assert store.llm_budget_reservation("reservation") == pytest.approx(0.1)
+
+    store.record_llm_call_and_settle_budget(
+        **settlement,
+        request_owner_token="request-owner",
+        reservation_owner_token="budget-owner",
+    )
+    assert store.total_cost(job.id) == pytest.approx(0.03)
+    assert store.get_cached_llm_result("logical")["response"] == {"ok": True}
+    assert store.llm_budget_reservation("reservation") == pytest.approx(0.05)
+
+
+def test_budget_reservation_renewal_and_release_are_owner_fenced(tmp_path: Path) -> None:
+    from src.job_store import JobStore
+    from src.research_models import InputKind, InputSpec
+
+    store = JobStore(tmp_path / "paper2md.sqlite3")
+    job = store.create_job(InputSpec(InputKind.ARXIV, "2401.00001"))
+    assert store.reserve_llm_budget(
+        job.id,
+        "reservation",
+        owner_token="owner",
+        amount_usd=0.4,
+        budget_usd=0.5,
+        now=100.0,
+        lease_seconds=10.0,
+    )
+
+    assert not store.renew_llm_budget(
+        "reservation", "stale-owner", now=105.0, lease_seconds=10.0,
+    )
+    assert store.renew_llm_budget(
+        "reservation", "owner", now=105.0, lease_seconds=10.0,
+    )
+    assert not store.release_llm_budget("reservation", "stale-owner")
+    assert not store.reserve_llm_budget(
+        job.id,
+        "blocked",
+        owner_token="other",
+        amount_usd=0.2,
+        budget_usd=0.5,
+        now=111.0,
+        lease_seconds=10.0,
+    )
+    assert store.release_llm_budget("reservation", "owner")

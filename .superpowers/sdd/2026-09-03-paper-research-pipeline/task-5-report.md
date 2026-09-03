@@ -759,3 +759,213 @@ git diff --check
 - Confirmed all tests use injected transports/catalogs and no live OpenRouter request was made.
 - The conservative reservations use configured maximum input/output ceilings, so low budgets can reject work even when likely actual token use would cost less. This is intentional fail-closed authorization.
 - No deferred Minor finding was addressed in this round.
+
+## Review round 3
+
+Addressed the two remaining load-bearing lease and crash-consistency findings. Deferred Minor findings remain unchanged.
+
+### Round-3 TDD evidence
+
+#### Cycle 19: renewable request ownership across the original lease boundary
+
+RED:
+
+```text
+uv run pytest -q tests/test_openrouter.py -k "heartbeat_prevents_takeover"
+```
+
+```text
+F                                                                        [100%]
+assert not True
+1 failed, 35 deselected in 0.49s
+```
+
+The clock advanced in two steps to 40 seconds after acquisition, beyond the original approximately 30-second lease. While the first injected HTTP handler remained active, the second caller reclaimed the expired request claim and dispatched a duplicate.
+
+The first GREEN attempt revealed a separate one-attempt cache-observation race in the test fixture (`StructuredOutputError`, `1 failed, 35 deselected in 0.99s`). The fixture was corrected to retain the normal retry allowance so it continued to isolate lease takeover. Final GREEN:
+
+```text
+uv run pytest -q tests/test_openrouter.py -k "heartbeat_prevents_takeover"
+```
+
+```text
+.                                                                        [100%]
+1 passed, 35 deselected in 0.70s
+```
+
+The worker now renews its request claim and request-specific budget reservation together in one owner-fenced SQLite transaction throughout the entire network and retry sequence. Persistence is also fenced by the current request owner.
+
+#### Cycle 20: stale budget reservation recovery on resume
+
+RED:
+
+```text
+uv run pytest -q tests/test_job_store.py -k "stale_budget_reservation"
+```
+
+```text
+F                                                                        [100%]
+TypeError: JobStore.reserve_llm_budget() got an unexpected keyword argument 'owner_token'
+1 failed, 10 deselected in 0.13s
+```
+
+GREEN:
+
+```text
+uv run pytest -q tests/test_job_store.py -k "stale_budget_reservation"
+```
+
+```text
+.                                                                        [100%]
+1 passed, 10 deselected in 0.06s
+```
+
+Active reservations now carry owner and expiry fields. A resumed worker cannot reclaim before expiry, but atomically removes a stale non-unresolved reservation during its next authorization. Unresolved billed reservations are deliberately excluded from stale cleanup.
+
+#### Cycle 21: owner-fenced atomic settlement
+
+RED:
+
+```text
+uv run pytest -q tests/test_job_store.py -k "settlement_requires_current"
+```
+
+```text
+F                                                                        [100%]
+ImportError: cannot import name 'LeaseOwnershipError' from 'src.job_store'
+1 failed, 11 deselected in 0.11s
+```
+
+GREEN:
+
+```text
+uv run pytest -q tests/test_job_store.py -k "settlement_requires_current"
+```
+
+```text
+.                                                                        [100%]
+1 passed, 11 deselected in 0.06s
+```
+
+A stale request owner or stale budget owner can no longer persist a billable attempt or alter its reservation. The correct owners atomically record the call, charge the job, and reduce the reservation.
+
+#### Cycle 22: budget renewal and release fencing
+
+RED:
+
+```text
+uv run pytest -q tests/test_job_store.py -k "renewal_and_release_are_owner_fenced"
+```
+
+```text
+F                                                                        [100%]
+AttributeError: 'JobStore' object has no attribute 'renew_llm_budget'
+1 failed, 12 deselected in 0.13s
+```
+
+GREEN:
+
+```text
+uv run pytest -q tests/test_job_store.py -k "renewal_and_release_are_owner_fenced"
+```
+
+```text
+.                                                                        [100%]
+1 passed, 12 deselected in 0.07s
+```
+
+Only the current owner may renew or release a reservation. Renewal extends the reservation beyond its initial expiry and blocks premature stale cleanup.
+
+#### Cycle 23: charge and reservation settlement rollback together
+
+RED:
+
+```text
+uv run pytest -q tests/test_openrouter.py -k "failed_budget_settlement"
+```
+
+```text
+F                                                                        [100%]
+assert 1 == 0
+1 failed, 36 deselected in 0.32s
+```
+
+A SQLite trigger simulated failure while settling the extraction reservation. The old split operations had already committed one `llm_calls` row and its job charge.
+
+GREEN:
+
+```text
+uv run pytest -q tests/test_openrouter.py -k "failed_budget_settlement"
+```
+
+```text
+.                                                                        [100%]
+1 passed, 36 deselected in 0.27s
+```
+
+The same forced failure now rolls back the attempt row, actual job charge, and reservation change as one transaction.
+
+### Round-3 verification
+
+Focused round-3 behaviors:
+
+```text
+uv run pytest -q tests/test_openrouter.py tests/test_job_store.py -k "heartbeat_prevents_takeover or stale_budget_reservation or settlement_requires_current or renewal_and_release_are_owner_fenced or failed_budget_settlement"
+```
+
+```text
+.....                                                                    [100%]
+5 passed, 45 deselected in 0.87s
+```
+
+Scoped suite:
+
+```text
+uv run pytest -q tests/test_openrouter.py tests/test_job_store.py tests/test_config.py
+```
+
+```text
+......................................................................   [100%]
+70 passed in 4.04s
+```
+
+Full suite:
+
+```text
+uv run pytest -q
+```
+
+```text
+........................................................................ [ 38%]
+........................................................................ [ 76%]
+............................................                             [100%]
+188 passed in 5.58s
+```
+
+Additional checks:
+
+```text
+uv run python -m compileall -q src tests
+uv run python -c "from src.job_store import JobStore, LeaseOwnershipError; from src.openrouter import OpenRouterSummarizer; print('Task 5 round 3 imports OK')"
+git diff --check
+```
+
+`compileall` and `git diff --check` exited 0; the import smoke test printed `Task 5 round 3 imports OK`. Git emitted only Windows LF-to-CRLF notices.
+
+### Round-3 files
+
+- `src/job_store.py` — request/budget lease renewal, reservation owner/expiry migration, stale cleanup, and owner-fenced atomic billing settlement.
+- `src/openrouter.py` — full-lifetime request and synthesis-reservation heartbeats plus atomic attempt settlement.
+- `tests/test_job_store.py` — stale-resume, owner-fencing, and renewal/release coverage.
+- `tests/test_openrouter.py` — expiry-boundary duplicate-dispatch and forced-settlement-rollback regressions using injected HTTP only.
+
+### Round-3 self-review and concerns
+
+- Verified request-claim and request-budget renewal is one transaction: either both owner leases extend or neither does.
+- Verified the heartbeat remains active from immediately before network dispatch through all structured-output retries and persistence.
+- Verified every billable 2xx path uses the combined transaction for the audit row, actual job charge, and reservation consume/retain operation.
+- Verified settlement checks unexpired request and budget ownership, and release checks its owner token.
+- Verified stale cleanup removes only expired reservations whose cost is resolved/not yet billed; unresolved billed attempts remain fail-closed.
+- Verified all OpenRouter traffic remains injected through fakes; no live service request ran.
+- A worker that dies after a remote provider accepted a request but before receiving any billable envelope remains inherently ambiguous; stale takeover is bounded by renewable leases, while received malformed billable envelopes remain durably unresolved.
+- No deferred Minor finding was changed.

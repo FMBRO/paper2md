@@ -19,6 +19,10 @@ _ORDER = [
 _PAUSED = {JobState.NEEDS_INPUT, JobState.BUDGET_EXCEEDED, JobState.FAILED}
 
 
+class LeaseOwnershipError(RuntimeError):
+    """Raised when a stale worker attempts a fenced persistence operation."""
+
+
 class JobStore:
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
@@ -64,11 +68,13 @@ class JobStore:
                 );
                 CREATE TABLE IF NOT EXISTS llm_budget_reservations (
                     id TEXT PRIMARY KEY, job_id TEXT NOT NULL, amount_usd REAL NOT NULL,
+                    owner_token TEXT NOT NULL, lease_expires_at REAL NOT NULL,
                     unresolved INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL,
                     FOREIGN KEY(job_id) REFERENCES jobs(id)
                 );
             """)
             self._migrate_llm_calls(connection)
+            self._migrate_llm_budget_reservations(connection)
 
     @staticmethod
     def _migrate_llm_calls(connection: sqlite3.Connection) -> None:
@@ -94,6 +100,23 @@ class JobStore:
             "CREATE INDEX IF NOT EXISTS idx_llm_calls_cache_validated "
             "ON llm_calls(cache_key, validated, id)"
         )
+
+    @staticmethod
+    def _migrate_llm_budget_reservations(connection: sqlite3.Connection) -> None:
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(llm_budget_reservations)")
+        }
+        if "owner_token" not in columns:
+            connection.execute(
+                "ALTER TABLE llm_budget_reservations "
+                "ADD COLUMN owner_token TEXT NOT NULL DEFAULT ''"
+            )
+        if "lease_expires_at" not in columns:
+            connection.execute(
+                "ALTER TABLE llm_budget_reservations "
+                "ADD COLUMN lease_expires_at REAL NOT NULL DEFAULT 0"
+            )
 
     @staticmethod
     def _now() -> str:
@@ -290,6 +313,80 @@ class JobStore:
                 connection.execute("UPDATE jobs SET total_cost_usd = total_cost_usd + ?, updated_at = ? WHERE id = ?",
                                    (cost_usd, self._now(), job_id))
 
+    def record_llm_call_and_settle_budget(
+        self,
+        job_id: str,
+        *,
+        request_hash: str,
+        cache_key: str,
+        model: str,
+        provider: str | None,
+        response: Any,
+        usage: dict[str, Any],
+        cost_usd: float,
+        validated: bool,
+        reservation_id: str,
+        request_owner_token: str,
+        reservation_owner_token: str,
+        authorized_amount_usd: float,
+        now: float,
+        pricing: dict[str, Any] | None = None,
+        generation_id: str | None = None,
+        cost_resolved: bool = True,
+    ) -> bool:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            request_claim = connection.execute(
+                """SELECT 1 FROM llm_request_claims
+                   WHERE cache_key = ? AND owner_token = ? AND lease_expires_at > ?""",
+                (cache_key, request_owner_token, now),
+            ).fetchone()
+            reservation = connection.execute(
+                """SELECT amount_usd FROM llm_budget_reservations
+                   WHERE id = ? AND owner_token = ? AND unresolved = 0
+                   AND lease_expires_at > ?""",
+                (reservation_id, reservation_owner_token, now),
+            ).fetchone()
+            if request_claim is None or reservation is None:
+                raise LeaseOwnershipError("LLM request or budget lease ownership was lost")
+            inserted = connection.execute(
+                """INSERT OR IGNORE INTO llm_calls
+                   (job_id, request_hash, cache_key, model, provider, generation_id,
+                    response_json, usage_json, pricing_json, cost_usd, cost_resolved,
+                    validated, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    job_id, request_hash, cache_key, model, provider, generation_id,
+                    json.dumps(response, ensure_ascii=False),
+                    json.dumps(usage, ensure_ascii=False),
+                    json.dumps(pricing or {}, ensure_ascii=False),
+                    cost_usd, int(cost_resolved), int(validated), self._now(),
+                ),
+            )
+            if not inserted.rowcount:
+                return False
+            connection.execute(
+                """UPDATE jobs SET total_cost_usd = total_cost_usd + ?, updated_at = ?
+                   WHERE id = ?""",
+                (cost_usd, self._now(), job_id),
+            )
+            if cost_resolved:
+                remaining = max(
+                    0.0, float(reservation["amount_usd"]) - authorized_amount_usd,
+                )
+                connection.execute(
+                    "UPDATE llm_budget_reservations SET amount_usd = ? WHERE id = ?",
+                    (remaining, reservation_id),
+                )
+            else:
+                connection.execute(
+                    """UPDATE llm_budget_reservations
+                       SET amount_usd = MIN(amount_usd, ?), unresolved = 1
+                       WHERE id = ?""",
+                    (authorized_amount_usd, reservation_id),
+                )
+        return True
+
     def get_cached_llm_result(self, cache_key: str) -> dict[str, Any] | None:
         with self._connect() as connection:
             row = connection.execute(
@@ -348,6 +445,47 @@ class JobStore:
                 (cache_key, owner_token),
             )
 
+    def renew_llm_request(
+        self, cache_key: str, owner_token: str, *, now: float, lease_seconds: float,
+    ) -> bool:
+        with self._connect() as connection:
+            renewed = connection.execute(
+                """UPDATE llm_request_claims SET lease_expires_at = ?
+                   WHERE cache_key = ? AND owner_token = ? AND lease_expires_at > ?""",
+                (now + lease_seconds, cache_key, owner_token, now),
+            )
+        return bool(renewed.rowcount)
+
+    def renew_llm_leases(
+        self,
+        cache_key: str,
+        request_owner_token: str,
+        reservation_id: str,
+        reservation_owner_token: str,
+        *,
+        now: float,
+        lease_seconds: float,
+    ) -> bool:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            request_renewed = connection.execute(
+                """UPDATE llm_request_claims SET lease_expires_at = ?
+                   WHERE cache_key = ? AND owner_token = ? AND lease_expires_at > ?""",
+                (now + lease_seconds, cache_key, request_owner_token, now),
+            )
+            budget_renewed = connection.execute(
+                """UPDATE llm_budget_reservations SET lease_expires_at = ?
+                   WHERE id = ? AND owner_token = ? AND lease_expires_at > ?""",
+                (
+                    now + lease_seconds, reservation_id,
+                    reservation_owner_token, now,
+                ),
+            )
+            if not request_renewed.rowcount or not budget_renewed.rowcount:
+                connection.rollback()
+                return False
+        return True
+
     @staticmethod
     def _paper_cost_in_transaction(
         connection: sqlite3.Connection, job_id: str,
@@ -384,61 +522,55 @@ class JobStore:
         job_id: str,
         reservation_id: str,
         *,
+        owner_token: str,
         amount_usd: float,
         budget_usd: float,
+        now: float,
+        lease_seconds: float,
     ) -> bool:
-        if amount_usd < 0 or budget_usd < 0:
+        if amount_usd < 0 or budget_usd < 0 or lease_seconds <= 0:
             raise ValueError("budget reservation amounts must not be negative")
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "DELETE FROM llm_budget_reservations "
+                "WHERE unresolved = 0 AND lease_expires_at <= ?",
+                (now,),
+            )
             actual, reserved = self._paper_cost_in_transaction(connection, job_id)
             if actual + reserved + amount_usd > budget_usd + 1e-12:
                 return False
             inserted = connection.execute(
                 """INSERT OR IGNORE INTO llm_budget_reservations
-                   (id, job_id, amount_usd, unresolved, created_at)
-                   VALUES (?, ?, ?, 0, ?)""",
-                (reservation_id, job_id, amount_usd, self._now()),
+                   (id, job_id, amount_usd, owner_token, lease_expires_at,
+                    unresolved, created_at)
+                   VALUES (?, ?, ?, ?, ?, 0, ?)""",
+                (
+                    reservation_id, job_id, amount_usd, owner_token,
+                    now + lease_seconds, self._now(),
+                ),
             )
         return bool(inserted.rowcount)
 
-    def consume_llm_budget(self, reservation_id: str, amount_usd: float) -> None:
+    def renew_llm_budget(
+        self, reservation_id: str, owner_token: str, *, now: float, lease_seconds: float,
+    ) -> bool:
         with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
-                "SELECT amount_usd FROM llm_budget_reservations WHERE id = ?",
-                (reservation_id,),
-            ).fetchone()
-            if row is None:
-                raise KeyError(f"Unknown LLM budget reservation: {reservation_id}")
-            remaining = max(0.0, float(row["amount_usd"]) - amount_usd)
-            if remaining <= 1e-12:
-                connection.execute(
-                    "DELETE FROM llm_budget_reservations WHERE id = ?", (reservation_id,)
-                )
-            else:
-                connection.execute(
-                    "UPDATE llm_budget_reservations SET amount_usd = ? WHERE id = ?",
-                    (remaining, reservation_id),
-                )
-
-    def retain_unresolved_llm_budget(
-        self, reservation_id: str, amount_usd: float,
-    ) -> None:
-        with self._connect() as connection:
-            connection.execute(
-                """UPDATE llm_budget_reservations
-                   SET amount_usd = MIN(amount_usd, ?), unresolved = 1
-                   WHERE id = ?""",
-                (amount_usd, reservation_id),
+            renewed = connection.execute(
+                """UPDATE llm_budget_reservations SET lease_expires_at = ?
+                   WHERE id = ? AND owner_token = ? AND lease_expires_at > ?""",
+                (now + lease_seconds, reservation_id, owner_token, now),
             )
+        return bool(renewed.rowcount)
 
-    def release_llm_budget(self, reservation_id: str) -> None:
+    def release_llm_budget(self, reservation_id: str, owner_token: str) -> bool:
         with self._connect() as connection:
-            connection.execute(
-                "DELETE FROM llm_budget_reservations WHERE id = ? AND unresolved = 0",
-                (reservation_id,),
+            released = connection.execute(
+                """DELETE FROM llm_budget_reservations
+                   WHERE id = ? AND owner_token = ? AND unresolved = 0""",
+                (reservation_id, owner_token),
             )
+        return bool(released.rowcount)
 
     def llm_budget_reservation(self, reservation_id: str) -> float | None:
         with self._connect() as connection:
