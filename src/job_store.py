@@ -62,6 +62,11 @@ class JobStore:
                     cache_key TEXT PRIMARY KEY, owner_token TEXT NOT NULL,
                     lease_expires_at REAL NOT NULL, created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS llm_budget_reservations (
+                    id TEXT PRIMARY KEY, job_id TEXT NOT NULL, amount_usd REAL NOT NULL,
+                    unresolved INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL,
+                    FOREIGN KEY(job_id) REFERENCES jobs(id)
+                );
             """)
             self._migrate_llm_calls(connection)
 
@@ -342,6 +347,106 @@ class JobStore:
                 "DELETE FROM llm_request_claims WHERE cache_key = ? AND owner_token = ?",
                 (cache_key, owner_token),
             )
+
+    @staticmethod
+    def _paper_cost_in_transaction(
+        connection: sqlite3.Connection, job_id: str,
+    ) -> tuple[float, float]:
+        job = connection.execute(
+            "SELECT paper_id, total_cost_usd FROM jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+        if job is None:
+            raise KeyError(f"Unknown job: {job_id}")
+        if job["paper_id"] is None:
+            actual = float(job["total_cost_usd"])
+            reserved = connection.execute(
+                "SELECT COALESCE(SUM(amount_usd), 0) AS total "
+                "FROM llm_budget_reservations WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()["total"]
+        else:
+            actual = connection.execute(
+                "SELECT COALESCE(SUM(total_cost_usd), 0) AS total "
+                "FROM jobs WHERE paper_id = ?",
+                (job["paper_id"],),
+            ).fetchone()["total"]
+            reserved = connection.execute(
+                """SELECT COALESCE(SUM(r.amount_usd), 0) AS total
+                   FROM llm_budget_reservations r
+                   JOIN jobs j ON j.id = r.job_id
+                   WHERE j.paper_id = ?""",
+                (job["paper_id"],),
+            ).fetchone()["total"]
+        return float(actual), float(reserved)
+
+    def reserve_llm_budget(
+        self,
+        job_id: str,
+        reservation_id: str,
+        *,
+        amount_usd: float,
+        budget_usd: float,
+    ) -> bool:
+        if amount_usd < 0 or budget_usd < 0:
+            raise ValueError("budget reservation amounts must not be negative")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            actual, reserved = self._paper_cost_in_transaction(connection, job_id)
+            if actual + reserved + amount_usd > budget_usd + 1e-12:
+                return False
+            inserted = connection.execute(
+                """INSERT OR IGNORE INTO llm_budget_reservations
+                   (id, job_id, amount_usd, unresolved, created_at)
+                   VALUES (?, ?, ?, 0, ?)""",
+                (reservation_id, job_id, amount_usd, self._now()),
+            )
+        return bool(inserted.rowcount)
+
+    def consume_llm_budget(self, reservation_id: str, amount_usd: float) -> None:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT amount_usd FROM llm_budget_reservations WHERE id = ?",
+                (reservation_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown LLM budget reservation: {reservation_id}")
+            remaining = max(0.0, float(row["amount_usd"]) - amount_usd)
+            if remaining <= 1e-12:
+                connection.execute(
+                    "DELETE FROM llm_budget_reservations WHERE id = ?", (reservation_id,)
+                )
+            else:
+                connection.execute(
+                    "UPDATE llm_budget_reservations SET amount_usd = ? WHERE id = ?",
+                    (remaining, reservation_id),
+                )
+
+    def retain_unresolved_llm_budget(
+        self, reservation_id: str, amount_usd: float,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """UPDATE llm_budget_reservations
+                   SET amount_usd = MIN(amount_usd, ?), unresolved = 1
+                   WHERE id = ?""",
+                (amount_usd, reservation_id),
+            )
+
+    def release_llm_budget(self, reservation_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM llm_budget_reservations WHERE id = ? AND unresolved = 0",
+                (reservation_id,),
+            )
+
+    def llm_budget_reservation(self, reservation_id: str) -> float | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT amount_usd FROM llm_budget_reservations WHERE id = ?",
+                (reservation_id,),
+            ).fetchone()
+        return float(row["amount_usd"]) if row else None
 
     def get_cached_llm_call(self, request_hash: str) -> dict[str, Any] | None:
         with self._connect() as connection:

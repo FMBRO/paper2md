@@ -71,6 +71,7 @@ class OpenRouterSettings:
     chunk_max_chars: int = 12_000
     max_validation_retries: int = 1
     max_reduction_levels: int = 8
+    request_timeout_seconds: float = 60.0
 
     def __post_init__(self) -> None:
         if self.endpoint != OPENROUTER_CHAT_COMPLETIONS_ENDPOINT:
@@ -89,6 +90,8 @@ class OpenRouterSettings:
                 raise ValueError(f"{name} must be positive")
         if self.max_validation_retries < 0:
             raise ValueError("max_validation_retries must not be negative")
+        if self.request_timeout_seconds <= 0:
+            raise ValueError("request_timeout_seconds must be positive")
 
 
 @dataclass
@@ -180,6 +183,7 @@ def load_settings(config_path: Path | str, overrides: dict[str, Any] | None = No
             chunk_max_chars=int(openrouter.get("chunk_max_chars", 12_000)),
             max_validation_retries=int(openrouter.get("max_validation_retries", 1)),
             max_reduction_levels=int(openrouter.get("max_reduction_levels", 8)),
+            request_timeout_seconds=float(openrouter.get("request_timeout_seconds", 60.0)),
         ),
         notion=NotionSettings(
             data_source_id=notion.get("data_source_id"),

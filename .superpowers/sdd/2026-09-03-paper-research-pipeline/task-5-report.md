@@ -549,3 +549,213 @@ Task 5 imports OK
 - Confirmed legacy Task 1 cache methods retain their original return shape and charging behavior.
 - Conservative UTF-8-byte token estimates can reject requests that a model tokenizer might accept; this is intentional fail-closed behavior.
 - Uncached production work now depends on availability of the official OpenRouter model catalog. Catalog failure blocks paid completion requests instead of using stale prices.
+
+## Review round 2
+
+Addressed the five remaining load-bearing findings. The deferred Minor findings were not changed.
+
+### Round-2 TDD evidence
+
+#### Cycle 14: pricing-independent logical request identity
+
+RED:
+
+```text
+uv run pytest -q tests/test_openrouter.py -k "price_change_does_not"
+```
+
+```text
+F                                                                        [100%]
+Failed: no resend
+1 failed, 30 deselected in 0.34s
+```
+
+Changing the catalog price changed `provider.max_price`, produced a new full-payload key, and allowed the logically identical unresolved request to be sent again.
+
+GREEN:
+
+```text
+uv run pytest -q tests/test_openrouter.py -k "price_change_does_not"
+```
+
+```text
+.                                                                        [100%]
+1 passed, 30 deselected in 0.24s
+```
+
+The durable logical key now hashes semantic request fields only. The separately persisted request hash and pricing snapshot still audit the exact dispatched payload.
+
+#### Cycle 15: whitespace-only evidence
+
+RED:
+
+```text
+uv run pytest -q tests/test_openrouter.py -k "whitespace_only_evidence"
+```
+
+```text
+F                                                                        [100%]
+assert 2 == 3
+1 failed, 31 deselected in 0.35s
+```
+
+GREEN:
+
+```text
+uv run pytest -q tests/test_openrouter.py -k "whitespace_only_evidence"
+```
+
+```text
+.                                                                        [100%]
+1 passed, 31 deselected in 0.21s
+```
+
+#### Cycle 16: atomic paper-scoped budget reservation
+
+RED:
+
+```text
+uv run pytest -q tests/test_openrouter.py -k "atomically_reserve_one_shared"
+```
+
+```text
+F                                                                        [100%]
+assert 2 == 1
+1 failed, 32 deselected in 0.54s
+```
+
+Both concurrent jobs completed against the same paper budget, proving that read/check/charge was not atomic.
+
+GREEN:
+
+```text
+uv run pytest -q tests/test_openrouter.py -k "atomically_reserve_one_shared"
+```
+
+```text
+.                                                                        [100%]
+1 passed, 32 deselected in 0.45s
+```
+
+SQLite `BEGIN IMMEDIATE` now serializes paper-scoped authorization. Resolved attempts consume their authorized slice, non-billable failures release it, and billed attempts with unresolved cost retain a conservative unresolved reservation.
+
+#### Cycle 17: request lease derived from the bounded retry window
+
+RED:
+
+```text
+uv run pytest -q tests/test_openrouter.py -k "outlives_former_fixed_lease"
+```
+
+```text
+F                                                                        [100%]
+TypeError: OpenRouterSettings.__init__() got an unexpected keyword argument 'request_timeout_seconds'
+1 failed, 33 deselected in 0.30s
+```
+
+GREEN:
+
+```text
+uv run pytest -q tests/test_openrouter.py -k "outlives_former_fixed_lease"
+```
+
+```text
+.                                                                        [100%]
+1 passed, 33 deselected in 0.53s
+```
+
+The claim lease is now `request_timeout_seconds * maximum_attempts + 30 seconds`; each POST receives the configured timeout. The test advances the claim clock by 301 seconds while the first owner remains active and proves that the second caller cannot dispatch a duplicate.
+
+#### Cycle 18: mandatory final-synthesis headroom
+
+RED:
+
+```text
+uv run pytest -q tests/test_openrouter.py -k "reserved_final_synthesis_headroom"
+```
+
+```text
+F                                                                        [100%]
+assert 22 == 21
+1 failed, 34 deselected in 0.68s
+```
+
+All reduction calls consumed budget before the final synthesis authorization failed.
+
+GREEN:
+
+```text
+uv run pytest -q tests/test_openrouter.py -k "reserved_final_synthesis_headroom"
+```
+
+```text
+.                                                                        [100%]
+1 passed, 34 deselected in 0.61s
+```
+
+Final synthesis headroom is reserved atomically before maps/reductions. Every extraction and reduction independently reserves its own bounded attempt cost. The low-budget multi-level regression stops before a reduction can consume final headroom and never dispatches synthesis without authorization.
+
+### Round-2 verification
+
+Focused round-2 behaviors:
+
+```text
+uv run pytest -q tests/test_openrouter.py -k "price_change_does_not or atomically_reserve_one_shared or whitespace_only_evidence or outlives_former_fixed_lease or reserved_final_synthesis_headroom"
+```
+
+```text
+.....                                                                    [100%]
+5 passed, 30 deselected in 1.35s
+```
+
+Scoped suite:
+
+```text
+uv run pytest -q tests/test_openrouter.py tests/test_job_store.py tests/test_config.py
+```
+
+```text
+.................................................................        [100%]
+65 passed in 3.69s
+```
+
+Full suite:
+
+```text
+uv run pytest -q
+```
+
+```text
+........................................................................ [ 39%]
+........................................................................ [ 78%]
+.......................................                                  [100%]
+183 passed in 4.31s
+```
+
+Additional checks:
+
+```text
+uv run python -m compileall -q src tests
+uv run python -c "from src.openrouter import OpenRouterModelCatalog, OpenRouterSummarizer, PricingSnapshot; print('Task 5 round 2 imports OK')"
+git diff --check
+```
+
+`compileall` and `git diff --check` exited 0; the import smoke test printed `Task 5 round 2 imports OK`. Git emitted only Windows LF-to-CRLF notices.
+
+### Round-2 files
+
+- `src/config.py` — configurable positive request timeout used to derive the safe claim lease.
+- `src/job_store.py` — transactional paper/job budget reservations with settle, release, and unresolved retention operations.
+- `src/openrouter.py` — semantic logical keys, per-attempt transactional authorization, derived leases, synthesis-headroom reservation, and empty-normalized-quote rejection.
+- `tests/test_openrouter.py` — price-change resume, two-job budget race, whitespace quote, former-lease-overrun, and low-budget reduction regressions.
+
+### Round-2 self-review and concerns
+
+- Rechecked all five round-2 findings against the diff and their focused behavior tests.
+- Confirmed cache, unresolved-attempt, retry-exhaustion, and request-claim lookups all use the stable semantic key; exact payload hashes and catalog pricing versions remain persisted separately.
+- Confirmed `BEGIN IMMEDIATE` makes the paper cost plus active reservation decision atomic across separate jobs and connections.
+- Confirmed final synthesis authorization is reserved before any paid map or reduction work and is retained when its billable response has unresolved cost.
+- Confirmed HTTP/API failures release ordinary reservations, while malformed billable 2xx responses retain one conservative attempt allocation.
+- Confirmed all tests use injected transports/catalogs and no live OpenRouter request was made.
+- The conservative reservations use configured maximum input/output ceilings, so low budgets can reject work even when likely actual token use would cost less. This is intentional fail-closed authorization.
+- No deferred Minor finding was addressed in this round.

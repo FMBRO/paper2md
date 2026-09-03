@@ -351,7 +351,7 @@ class OpenRouterSummarizer:
     ) -> None:
         self.store = store
         self.settings = settings or OpenRouterSettings()
-        self.client = client or httpx.Client(timeout=60.0)
+        self.client = client or httpx.Client(timeout=self.settings.request_timeout_seconds)
         self.catalog = catalog or OpenRouterModelCatalog(self.client)
 
     @staticmethod
@@ -362,7 +362,14 @@ class OpenRouterSummarizer:
         return hashlib.sha256(canonical).hexdigest()
 
     def _cache_key(self, payload: dict[str, Any]) -> str:
-        return self._request_hash(payload)
+        logical_request = {
+            key: payload[key]
+            for key in (
+                "model", "messages", "max_tokens", "temperature", "stream",
+                "response_format",
+            )
+        }
+        return self._request_hash(logical_request)
 
     def _cached(
         self,
@@ -392,6 +399,7 @@ class OpenRouterSummarizer:
         max_input_tokens: int,
         stage: str,
         validate: Callable[[ResponseModel], None] | None = None,
+        reservation_id: str | None = None,
     ) -> ResponseModel:
         owner_token = str(uuid.uuid4())
         deadline = time.monotonic() + 30.0
@@ -399,6 +407,8 @@ class OpenRouterSummarizer:
         while True:
             cached = self._cached(cache_key, response_model, validate)
             if cached is not None:
+                if reservation_id is not None:
+                    self.store.release_llm_budget(reservation_id)
                 return cached
             if self.store.has_unresolved_llm_call(cache_key):
                 raise UnresolvedUsageError(
@@ -409,13 +419,38 @@ class OpenRouterSummarizer:
                     f"Structured output retries already exhausted after {attempts} attempts"
                 )
             if self.store.claim_llm_request(
-                cache_key, owner_token, now=time.time(), lease_seconds=300.0,
+                cache_key,
+                owner_token,
+                now=time.time(),
+                lease_seconds=(
+                    self.settings.request_timeout_seconds * attempts + 30.0
+                ),
             ):
                 break
             if time.monotonic() >= deadline:
                 raise RequestInFlightError("Timed out waiting for an identical LLM request")
             time.sleep(0.01)
+        active_reservation = reservation_id or str(uuid.uuid4())
+        preserve_reservation = False
         try:
+            authorized_per_attempt = self._call_cost(
+                pricing, max_input_tokens, int(payload["max_tokens"]),
+            )
+            first_attempt = self.store.llm_attempt_count(cache_key)
+            required = float(authorized_per_attempt * (attempts - first_attempt))
+            if reservation_id is None:
+                reserved = self.store.reserve_llm_budget(
+                    job_id,
+                    active_reservation,
+                    amount_usd=required,
+                    budget_usd=self.settings.paper_budget_usd,
+                )
+                if not reserved:
+                    raise BudgetExceededError("OpenRouter request would exceed paper budget")
+            else:
+                available = self.store.llm_budget_reservation(active_reservation)
+                if available is None or available + 1e-12 < required:
+                    raise BudgetExceededError("Reserved synthesis budget is insufficient")
             return self._claimed_structured_call(
                 payload=payload,
                 response_model=response_model,
@@ -425,8 +460,15 @@ class OpenRouterSummarizer:
                 max_input_tokens=max_input_tokens,
                 stage=stage,
                 validate=validate,
+                reservation_id=active_reservation,
+                authorized_per_attempt=float(authorized_per_attempt),
             )
+        except UnresolvedUsageError:
+            preserve_reservation = True
+            raise
         finally:
+            if not preserve_reservation:
+                self.store.release_llm_budget(active_reservation)
             self.store.release_llm_request(cache_key, owner_token)
 
     def _claimed_structured_call(
@@ -440,6 +482,8 @@ class OpenRouterSummarizer:
         max_input_tokens: int,
         stage: str,
         validate: Callable[[ResponseModel], None] | None = None,
+        reservation_id: str,
+        authorized_per_attempt: float,
     ) -> ResponseModel:
         cached = self._cached(cache_key, response_model, validate)
         if cached is not None:
@@ -480,6 +524,7 @@ class OpenRouterSummarizer:
                         "Content-Type": "application/json",
                     },
                     json=attempt_payload,
+                    timeout=self.settings.request_timeout_seconds,
                 )
             except httpx.HTTPError as error:
                 raise OpenRouterAPIError("OpenRouter request failed") from error
@@ -501,6 +546,9 @@ class OpenRouterSummarizer:
                     cost_resolved=False,
                     validated=False,
                     pricing=pricing.as_record(),
+                )
+                self.store.retain_unresolved_llm_budget(
+                    reservation_id, authorized_per_attempt,
                 )
                 raise UnresolvedUsageError(
                     "OpenRouter returned 2xx without parseable cost metadata"
@@ -536,6 +584,9 @@ class OpenRouterSummarizer:
                     validated=False,
                     pricing=pricing.as_record(),
                 )
+                self.store.retain_unresolved_llm_budget(
+                    reservation_id, authorized_per_attempt,
+                )
                 raise UnresolvedUsageError(
                     "OpenRouter returned 2xx but usage cost is unavailable"
                 ) from last_error
@@ -555,6 +606,7 @@ class OpenRouterSummarizer:
                     validated=False,
                     pricing=pricing.as_record(),
                 )
+                self.store.consume_llm_budget(reservation_id, authorized_per_attempt)
                 raise OpenRouterAPIError("OpenRouter returned an unexpected model")
             try:
                 envelope = _CompletionResponse.model_validate(raw_response)
@@ -572,6 +624,7 @@ class OpenRouterSummarizer:
                     validated=False,
                     pricing=pricing.as_record(),
                 )
+                self.store.consume_llm_budget(reservation_id, authorized_per_attempt)
                 last_error = error
                 continue
             content = envelope.choices[0].message.content
@@ -594,6 +647,7 @@ class OpenRouterSummarizer:
                     validated=False,
                     pricing=pricing.as_record(),
                 )
+                self.store.consume_llm_budget(reservation_id, authorized_per_attempt)
                 last_error = error
                 continue
             self.store.record_llm_call(
@@ -609,6 +663,7 @@ class OpenRouterSummarizer:
                 validated=True,
                 pricing=pricing.as_record(),
             )
+            self.store.consume_llm_budget(reservation_id, authorized_per_attempt)
             return parsed
         raise StructuredOutputError(
             f"Structured output remained invalid after {attempts} attempts"
@@ -805,6 +860,8 @@ class OpenRouterSummarizer:
                 if not matching_spans:
                     raise ValueError("evidence page and section do not identify a source span")
                 quote = normalize(anchor.quote)
+                if not quote:
+                    raise ValueError("evidence quote is empty after normalization")
                 if not any(quote in source for source in matching_spans):
                     raise ValueError("evidence quote is absent from its source span")
 
@@ -837,113 +894,94 @@ class OpenRouterSummarizer:
             self._cached(key, ChunkExtractionResponse, self._evidence_validator([chunk]))
             for key, chunk in zip(map_cache_keys, chunks, strict=True)
         ]
-        uncached_count = sum(item is None for item in cached_maps)
-        guard = BudgetGuard(
-            pricing={
-                extraction_pricing.model: extraction_pricing,
-                synthesis_pricing.model: synthesis_pricing,
-            },
-            budget_usd=Decimal(str(self.settings.paper_budget_usd)),
-            spent_usd=Decimal(str(self.store.paper_total_cost(job_id))),
+        synthesis_reservation_id = str(uuid.uuid4())
+        synthesis_headroom = float(
+            self._call_cost(
+                synthesis_pricing,
+                self.settings.synthesis_max_input_tokens,
+                self.settings.synthesis_max_output_tokens,
+            ) * (self.settings.max_validation_retries + 1)
         )
-        attempts = self.settings.max_validation_retries + 1
-        if uncached_count:
-            planned_cost = (
-                self._call_cost(
-                    extraction_pricing,
-                    self.settings.extraction_max_input_tokens,
-                    self.settings.extraction_max_output_tokens,
-                ) * uncached_count * attempts
-                + self._call_cost(
-                    synthesis_pricing,
-                    self.settings.synthesis_max_input_tokens,
-                    self.settings.synthesis_max_output_tokens,
-                ) * attempts
-            )
-            guard.authorize_amount(planned_cost)
-
-        extractions: list[ChunkExtractionResponse] = []
-        for payload, cache_key, cached, chunk in zip(
-            map_payloads, map_cache_keys, cached_maps, chunks, strict=True,
+        if not self.store.reserve_llm_budget(
+            job_id,
+            synthesis_reservation_id,
+            amount_usd=synthesis_headroom,
+            budget_usd=self.settings.paper_budget_usd,
         ):
-            result = cached or self._structured_call(
-                payload=payload,
-                response_model=ChunkExtractionResponse,
-                job_id=job_id,
-                cache_key=cache_key,
-                pricing=extraction_pricing,
-                max_input_tokens=self.settings.extraction_max_input_tokens,
-                stage="extraction",
-                validate=self._evidence_validator([chunk]),
-            )
-            extractions.append(ChunkExtractionResponse.model_validate(result))
-
-        synthesis_payload = self._synthesis_payload(
-            extractions, research_interest, synthesis_pricing,
-        )
-        for level in range(self.settings.max_reduction_levels + 1):
-            if estimate_serialized_tokens(synthesis_payload) <= self.settings.synthesis_max_input_tokens:
-                break
-            if level == self.settings.max_reduction_levels:
-                raise InputLimitExceededError(
-                    f"synthesis request still exceeds its ceiling after {level} reduction levels"
-                )
-            groups = self._reduction_groups(
-                extractions, research_interest, extraction_pricing,
-            )
-            reduction_cost = self._call_cost(
-                extraction_pricing,
-                self.settings.extraction_max_input_tokens,
-                self.settings.extraction_max_output_tokens,
-            ) * len(groups) * attempts
-            BudgetGuard(
-                pricing={extraction_pricing.model: extraction_pricing},
-                budget_usd=Decimal(str(self.settings.paper_budget_usd)),
-                spent_usd=Decimal(str(self.store.paper_total_cost(job_id))),
-            ).authorize_amount(reduction_cost)
-            reduced: list[ChunkExtractionResponse] = []
-            for _, payload in groups:
-                cache_key = self._cache_key(payload)
-                response = self._structured_call(
+            raise BudgetExceededError("Final synthesis headroom is unavailable")
+        try:
+            extractions: list[ChunkExtractionResponse] = []
+            for payload, cache_key, cached, chunk in zip(
+                map_payloads, map_cache_keys, cached_maps, chunks, strict=True,
+            ):
+                result = cached or self._structured_call(
                     payload=payload,
                     response_model=ChunkExtractionResponse,
                     job_id=job_id,
                     cache_key=cache_key,
                     pricing=extraction_pricing,
                     max_input_tokens=self.settings.extraction_max_input_tokens,
-                    stage="reduction",
-                    validate=self._evidence_validator(chunks),
+                    stage="extraction",
+                    validate=self._evidence_validator([chunk]),
                 )
-                reduced.append(ChunkExtractionResponse.model_validate(response))
-            extractions = reduced
+                extractions.append(ChunkExtractionResponse.model_validate(result))
+
             synthesis_payload = self._synthesis_payload(
                 extractions, research_interest, synthesis_pricing,
             )
-        synthesis_cache_key = self._cache_key(synthesis_payload)
-        evidence_validator = self._evidence_validator(chunks)
-        cached_summary = self._cached(
-            synthesis_cache_key, PaperSummaryResponse, evidence_validator,
-        )
-        if cached_summary is None:
-            if not uncached_count:
-                guard.authorize(
-                    self.settings.synthesis_model,
-                    max_input_tokens=self.settings.synthesis_max_input_tokens,
-                    max_output_tokens=self.settings.synthesis_max_output_tokens,
-                    calls=attempts,
+        except BaseException:
+            self.store.release_llm_budget(synthesis_reservation_id)
+            raise
+        try:
+            for level in range(self.settings.max_reduction_levels + 1):
+                if estimate_serialized_tokens(synthesis_payload) <= self.settings.synthesis_max_input_tokens:
+                    break
+                if level == self.settings.max_reduction_levels:
+                    raise InputLimitExceededError(
+                        f"synthesis request still exceeds its ceiling after {level} reduction levels"
+                    )
+                groups = self._reduction_groups(
+                    extractions, research_interest, extraction_pricing,
                 )
-            response = self._structured_call(
-                payload=synthesis_payload,
-                response_model=PaperSummaryResponse,
-                job_id=job_id,
-                cache_key=synthesis_cache_key,
-                pricing=synthesis_pricing,
-                max_input_tokens=self.settings.synthesis_max_input_tokens,
-                stage="synthesis",
-                validate=evidence_validator,
+                reduced: list[ChunkExtractionResponse] = []
+                for _, payload in groups:
+                    cache_key = self._cache_key(payload)
+                    response = self._structured_call(
+                        payload=payload,
+                        response_model=ChunkExtractionResponse,
+                        job_id=job_id,
+                        cache_key=cache_key,
+                        pricing=extraction_pricing,
+                        max_input_tokens=self.settings.extraction_max_input_tokens,
+                        stage="reduction",
+                        validate=self._evidence_validator(chunks),
+                    )
+                    reduced.append(ChunkExtractionResponse.model_validate(response))
+                extractions = reduced
+                synthesis_payload = self._synthesis_payload(
+                    extractions, research_interest, synthesis_pricing,
+                )
+            synthesis_cache_key = self._cache_key(synthesis_payload)
+            evidence_validator = self._evidence_validator(chunks)
+            cached_summary = self._cached(
+                synthesis_cache_key, PaperSummaryResponse, evidence_validator,
             )
-        else:
-            response = cached_summary
+            if cached_summary is None:
+                response = self._structured_call(
+                    payload=synthesis_payload,
+                    response_model=PaperSummaryResponse,
+                    job_id=job_id,
+                    cache_key=synthesis_cache_key,
+                    pricing=synthesis_pricing,
+                    max_input_tokens=self.settings.synthesis_max_input_tokens,
+                    stage="synthesis",
+                    validate=evidence_validator,
+                    reservation_id=synthesis_reservation_id,
+                )
+            else:
+                response = cached_summary
+        finally:
+            self.store.release_llm_budget(synthesis_reservation_id)
         validated = PaperSummaryResponse.model_validate(response)
         artifacts.create()
         artifacts.write_summary(validated.model_dump(mode="json"))

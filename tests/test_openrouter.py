@@ -543,6 +543,51 @@ def test_missing_cost_is_persisted_as_unresolved_and_is_not_retried(
     assert row == ("generation-id", 0, 0)
 
 
+def test_price_change_does_not_bypass_unresolved_logical_request_on_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.artifacts import ArtifactManager
+    from src.job_store import JobStore
+    from src.openrouter import OpenRouterSummarizer, UnresolvedUsageError
+    from src.research_models import InputKind, InputSpec
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "secret")
+    calls = 0
+
+    def unresolved(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        payload = json.loads(request.content)
+        response = _completion(_extraction(), model=payload["model"], provider="p", cost=0.01)
+        response["usage"].pop("cost")  # type: ignore[union-attr]
+        return httpx.Response(200, json=response)
+
+    catalog = _pricing()
+    store = JobStore(tmp_path / "state.sqlite3")
+    job = store.create_job(InputSpec(InputKind.ARXIV, "2401.00001"))
+    artifacts = ArtifactManager(tmp_path / "out", "paper")
+    first = OpenRouterSummarizer(
+        store,
+        settings=_settings(),
+        client=httpx.Client(transport=httpx.MockTransport(unresolved)),
+        catalog=catalog,
+    )
+    with pytest.raises(UnresolvedUsageError):
+        first.summarize(_document(), job_id=job.id, artifacts=artifacts)
+
+    catalog.prices["google/gemini-3.8-flash"] = ("1.25", "5.00")
+    resumed = OpenRouterSummarizer(
+        store,
+        settings=_settings(),
+        client=httpx.Client(transport=httpx.MockTransport(lambda _: pytest.fail("no resend"))),
+        catalog=catalog,
+    )
+    with pytest.raises(UnresolvedUsageError):
+        resumed.summarize(_document(), job_id=job.id, artifacts=artifacts)
+
+    assert calls == 1
+
+
 def test_summarizer_stops_after_bounded_malformed_retries(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -650,6 +695,69 @@ def test_budget_aggregates_cost_across_jobs_for_the_same_paper(
     assert store.paper_total_cost(second.id) == pytest.approx(0.49)
 
 
+def test_concurrent_jobs_atomically_reserve_one_shared_paper_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.artifacts import ArtifactManager
+    from src.job_store import JobStore
+    from src.openrouter import BudgetExceededError, OpenRouterSummarizer
+    from src.research_models import InputKind, InputSpec, PaperMetadata
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "secret")
+    barrier = threading.Barrier(2)
+    calls: list[str] = []
+    lock = threading.Lock()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        with lock:
+            calls.append(payload["model"])
+        time.sleep(0.10)
+        content = _extraction() if payload["model"] == "google/gemini-3.8-flash" else _summary()
+        cost = 0.001 if payload["model"] == "google/gemini-3.8-flash" else 0.01
+        return httpx.Response(
+            200, json=_completion(content, model=payload["model"], provider="p", cost=cost),
+        )
+
+    store = JobStore(tmp_path / "state.sqlite3")
+    paper_id = store.upsert_paper(PaperMetadata(doi="10.1/concurrent"), "b" * 64)
+    jobs = [
+        store.create_job(InputSpec(InputKind.DOI, "10.1/concurrent"), paper_id=paper_id)
+        for _ in range(2)
+    ]
+    settings = _settings(paper_budget_usd=0.025, max_validation_retries=0)
+    summarizer = OpenRouterSummarizer(
+        store,
+        settings=settings,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        catalog=_pricing(),
+    )
+
+    def run(index: int):
+        barrier.wait()
+        return summarizer.summarize(
+            _document(),
+            job_id=jobs[index].id,
+            artifacts=ArtifactManager(tmp_path / "out", f"paper-{index}"),
+            research_interest=f"interest-{index}",
+        )
+
+    outcomes: list[object] = []
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(run, index) for index in range(2)]
+        for future in futures:
+            try:
+                outcomes.append(future.result())
+            except Exception as error:  # asserted by exact type below
+                outcomes.append(error)
+
+    assert sum(not isinstance(item, Exception) for item in outcomes) == 1
+    assert sum(isinstance(item, BudgetExceededError) for item in outcomes) == 1
+    assert store.paper_total_cost(jobs[0].id) == pytest.approx(0.011)
+    assert calls.count("google/gemini-3.8-flash") == 1
+    assert calls.count("openai/gpt-5.6-sol") == 1
+
+
 def test_serialized_map_request_must_fit_configured_input_ceiling(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -728,6 +836,67 @@ def test_many_map_results_are_hierarchically_reduced_before_synthesis(
     assert len(extraction_requests) > 20
     assert len(synthesis_requests) == 1
     assert estimate_serialized_tokens(synthesis_requests[0]) <= settings.synthesis_max_input_tokens
+
+
+def test_reductions_cannot_consume_reserved_final_synthesis_headroom(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.artifacts import ArtifactManager
+    from src.job_store import JobStore
+    from src.openrouter import BudgetExceededError, OpenRouterSummarizer
+    from src.research_models import InputKind, InputSpec
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "secret")
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        calls.append(payload["model"])
+        synthesis = payload["model"] == "openai/gpt-5.6-sol"
+        return httpx.Response(
+            200,
+            json=_completion(
+                _summary() if synthesis else _extraction(),
+                model=payload["model"],
+                provider="p",
+                cost=0.012 if synthesis else 0.005,
+            ),
+        )
+
+    document = _document()
+    document["paragraphs"] = [
+        {
+            "text": "This paper evaluates a compact method.",
+            "page": 1,
+            "section_id": "intro",
+            "source_position": {"page": 1, "line": index + 1},
+        }
+        for index in range(20)
+    ]
+    store = JobStore(tmp_path / "state.sqlite3")
+    job = store.create_job(InputSpec(InputKind.ARXIV, "2401.00001"))
+    summarizer = OpenRouterSummarizer(
+        store,
+        settings=_settings(
+            paper_budget_usd=0.12,
+            chunk_max_chars=50,
+            extraction_max_input_tokens=6_000,
+            synthesis_max_input_tokens=4_000,
+            max_validation_retries=0,
+        ),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        catalog=_pricing(),
+    )
+
+    with pytest.raises(BudgetExceededError):
+        summarizer.summarize(
+            document, job_id=job.id,
+            artifacts=ArtifactManager(tmp_path / "out", "paper"),
+        )
+
+    assert calls.count("google/gemini-3.8-flash") == 21
+    assert "openai/gpt-5.6-sol" not in calls
+    assert store.paper_total_cost(job.id) <= 0.12
 
 
 def test_summarizer_fails_closed_when_configured_model_pricing_is_unknown(
@@ -869,6 +1038,47 @@ def test_summarizer_repairs_fabricated_evidence_quote(
             content = dict(content)
             content["evidence"] = [{
                 "page": 1, "section": "Introduction", "quote": "fabricated evidence",
+            }]
+        return httpx.Response(
+            200, json=_completion(content, model=payload["model"], provider="p", cost=0.01),
+        )
+
+    store = JobStore(tmp_path / "state.sqlite3")
+    job = store.create_job(InputSpec(InputKind.ARXIV, "2401.00001"))
+    result = OpenRouterSummarizer(
+        store,
+        settings=_settings(),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        catalog=_pricing(),
+    ).summarize(
+        _document(), job_id=job.id,
+        artifacts=ArtifactManager(tmp_path / "out", "paper"),
+    )
+
+    assert calls == 3
+    assert result.evidence[0].quote == "evaluates a compact method"
+
+
+def test_summarizer_repairs_whitespace_only_evidence_quote(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.artifacts import ArtifactManager
+    from src.job_store import JobStore
+    from src.openrouter import OpenRouterSummarizer
+    from src.research_models import InputKind, InputSpec
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "secret")
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        payload = json.loads(request.content)
+        content = _extraction() if calls == 1 else _summary()
+        if calls == 2:
+            content = dict(content)
+            content["evidence"] = [{
+                "page": 1, "section": "Introduction", "quote": " \t\n ",
             }]
         return httpx.Response(
             200, json=_completion(content, model=payload["model"], provider="p", cost=0.01),
@@ -1083,3 +1293,81 @@ def test_concurrent_identical_requests_share_one_paid_dispatch_per_cache_key(
     assert [result.relevance_score for result in results] == [4, 4]
     assert calls == ["google/gemini-3.8-flash", "openai/gpt-5.6-sol"]
     assert store.total_cost(job.id) == pytest.approx(0.02)
+
+
+def test_request_claim_outlives_former_fixed_lease_during_bounded_retry_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.artifacts import ArtifactManager
+    from src.job_store import JobStore
+    from src.openrouter import OpenRouterSummarizer
+    from src.research_models import InputKind, InputSpec
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "secret")
+    fake_now = [1_000.0]
+    monkeypatch.setattr("src.openrouter.time.time", lambda: fake_now[0])
+    first_started = threading.Event()
+    release_first = threading.Event()
+    duplicate_dispatch = threading.Event()
+    lock = threading.Lock()
+    extraction_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal extraction_calls
+        payload = json.loads(request.content)
+        if payload["model"] == "google/gemini-3.8-flash":
+            with lock:
+                extraction_calls += 1
+                call_number = extraction_calls
+            if call_number == 1:
+                first_started.set()
+                assert release_first.wait(2)
+            else:
+                duplicate_dispatch.set()
+            content = _extraction()
+        else:
+            content = _summary()
+        return httpx.Response(
+            200, json=_completion(content, model=payload["model"], provider="p", cost=0.01),
+        )
+
+    store = JobStore(tmp_path / "state.sqlite3")
+    job = store.create_job(InputSpec(InputKind.ARXIV, "2401.00001"))
+    second_claim_attempted = threading.Event()
+    claim_calls = 0
+    original_claim = store.claim_llm_request
+
+    def tracked_claim(*args, **kwargs):
+        nonlocal claim_calls
+        claim_calls += 1
+        if claim_calls >= 2:
+            second_claim_attempted.set()
+        return original_claim(*args, **kwargs)
+
+    monkeypatch.setattr(store, "claim_llm_request", tracked_claim)
+    summarizer = OpenRouterSummarizer(
+        store,
+        settings=_settings(request_timeout_seconds=200, max_validation_retries=1),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        catalog=_pricing(),
+    )
+
+    def run(name: str):
+        return summarizer.summarize(
+            _document(), job_id=job.id,
+            artifacts=ArtifactManager(tmp_path / "out", name),
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(run, "first")
+        assert first_started.wait(1)
+        fake_now[0] += 301
+        second = executor.submit(run, "second")
+        assert second_claim_attempted.wait(1)
+        duplicate_before_completion = duplicate_dispatch.wait(0.25)
+        release_first.set()
+        assert first.result().relevance_score == 4
+        assert second.result().relevance_score == 4
+
+    assert not duplicate_before_completion
+    assert extraction_calls == 1
