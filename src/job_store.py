@@ -49,7 +49,8 @@ class JobStore:
                 CREATE TABLE IF NOT EXISTS jobs (
                     id TEXT PRIMARY KEY, paper_id INTEGER, input_json TEXT NOT NULL,
                     state TEXT NOT NULL, artifact_dir TEXT, error TEXT,
-                    total_cost_usd REAL NOT NULL DEFAULT 0, created_at TEXT NOT NULL,
+                    total_cost_usd REAL NOT NULL DEFAULT 0,
+                    max_cost_usd REAL NOT NULL DEFAULT 0.50, created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL, FOREIGN KEY(paper_id) REFERENCES papers(id)
                 );
                 CREATE TABLE IF NOT EXISTS llm_calls (
@@ -73,10 +74,28 @@ class JobStore:
                     unresolved INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL,
                     FOREIGN KEY(job_id) REFERENCES jobs(id)
                 );
+                CREATE TABLE IF NOT EXISTS job_checkpoints (
+                    id INTEGER PRIMARY KEY,
+                    job_id TEXT NOT NULL,
+                    stage TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    completed_at TEXT NOT NULL,
+                    UNIQUE(job_id, stage),
+                    FOREIGN KEY(job_id) REFERENCES jobs(id)
+                );
             """)
             self._migrate_papers(connection)
+            self._migrate_jobs(connection)
             self._migrate_llm_calls(connection)
             self._migrate_llm_budget_reservations(connection)
+
+    @staticmethod
+    def _migrate_jobs(connection: sqlite3.Connection) -> None:
+        columns = {row["name"] for row in connection.execute("PRAGMA table_info(jobs)")}
+        if "max_cost_usd" not in columns:
+            connection.execute(
+                "ALTER TABLE jobs ADD COLUMN max_cost_usd REAL NOT NULL DEFAULT 0.50"
+            )
 
     @staticmethod
     def _migrate_papers(connection: sqlite3.Connection) -> None:
@@ -146,16 +165,20 @@ class JobStore:
                                  research_interest=spec_data.get("research_interest")),
             artifact_dir=Path(row["artifact_dir"]) if row["artifact_dir"] else None,
             error=row["error"], total_cost_usd=float(row["total_cost_usd"]),
+            max_cost_usd=float(row["max_cost_usd"]),
         )
 
     def create_job(self, input_spec: InputSpec, paper_id: int | None = None,
-                   artifact_dir: Path | str | None = None) -> JobRecord:
+                   artifact_dir: Path | str | None = None,
+                   max_cost_usd: float = 0.50) -> JobRecord:
+        if max_cost_usd < 0:
+            raise ValueError("max_cost_usd must not be negative")
         job_id, now = str(uuid.uuid4()), self._now()
         with self._connect() as connection:
             connection.execute(
-                "INSERT INTO jobs (id, paper_id, input_json, state, artifact_dir, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO jobs (id, paper_id, input_json, state, artifact_dir, max_cost_usd, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (job_id, paper_id, self._input_json(input_spec), JobState.QUEUED.value,
-                 str(artifact_dir) if artifact_dir else None, now, now),
+                 str(artifact_dir) if artifact_dir else None, max_cost_usd, now, now),
             )
         return self.get_job(job_id)
 
@@ -165,6 +188,116 @@ class JobStore:
         if row is None:
             raise KeyError(f"Unknown job: {job_id}")
         return self._record(row)
+
+    def link_job_paper(
+        self, job_id: str, paper_id: int, artifact_dir: Path | str,
+    ) -> JobRecord:
+        """Atomically attach the canonical paper and artifact directory to a job."""
+        with self._connect() as connection:
+            updated = connection.execute(
+                "UPDATE jobs SET paper_id = ?, artifact_dir = ?, updated_at = ? WHERE id = ?",
+                (paper_id, str(artifact_dir), self._now(), job_id),
+            )
+        if not updated.rowcount:
+            raise KeyError(f"Unknown job: {job_id}")
+        return self.get_job(job_id)
+
+    def update_input_spec(self, job_id: str, input_spec: InputSpec) -> JobRecord:
+        """Persist user-supplied resume details such as an attachment selection."""
+        with self._connect() as connection:
+            updated = connection.execute(
+                "UPDATE jobs SET input_json = ?, updated_at = ? WHERE id = ?",
+                (self._input_json(input_spec), self._now(), job_id),
+            )
+        if not updated.rowcount:
+            raise KeyError(f"Unknown job: {job_id}")
+        return self.get_job(job_id)
+
+    def update_job_budget(self, job_id: str, max_cost_usd: float) -> JobRecord:
+        if max_cost_usd < 0:
+            raise ValueError("max_cost_usd must not be negative")
+        with self._connect() as connection:
+            updated = connection.execute(
+                "UPDATE jobs SET max_cost_usd = ?, updated_at = ? WHERE id = ?",
+                (max_cost_usd, self._now(), job_id),
+            )
+        if not updated.rowcount:
+            raise KeyError(f"Unknown job: {job_id}")
+        return self.get_job(job_id)
+
+    def save_checkpoint(
+        self, job_id: str, stage: JobState, payload: Any,
+    ) -> None:
+        """Durably replace one completed-stage checkpoint in a SQLite transaction."""
+        if stage in {JobState.QUEUED, JobState.COMPLETED, *_PAUSED}:
+            raise ValueError(f"{stage.value} is not a checkpoint stage")
+        encoded = json.dumps(payload, ensure_ascii=False)
+        with self._connect() as connection:
+            if connection.execute(
+                "SELECT 1 FROM jobs WHERE id = ?", (job_id,),
+            ).fetchone() is None:
+                raise KeyError(f"Unknown job: {job_id}")
+            connection.execute(
+                """INSERT INTO job_checkpoints
+                   (job_id, stage, payload_json, completed_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(job_id, stage) DO UPDATE SET
+                       payload_json = excluded.payload_json,
+                       completed_at = excluded.completed_at""",
+                (job_id, stage.value, encoded, self._now()),
+            )
+
+    def get_checkpoint(self, job_id: str, stage: JobState) -> Any | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT payload_json FROM job_checkpoints WHERE job_id = ? AND stage = ?",
+                (job_id, stage.value),
+            ).fetchone()
+        return json.loads(row["payload_json"]) if row else None
+
+    def list_checkpoints(self, job_id: str) -> dict[str, Any]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT stage, payload_json FROM job_checkpoints
+                   WHERE job_id = ? ORDER BY id""",
+                (job_id,),
+            ).fetchall()
+        return {row["stage"]: json.loads(row["payload_json"]) for row in rows}
+
+    def complete_notion_sync(
+        self, job_id: str, paper_id: int, page_id: str, payload: Any,
+    ) -> None:
+        """Persist a returned Notion ID and its checkpoint in one transaction."""
+        page_id = page_id.strip()
+        if not page_id:
+            raise ValueError("Notion page ID must not be empty")
+        now = self._now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            paper = connection.execute(
+                "SELECT 1 FROM papers WHERE id = ?", (paper_id,),
+            ).fetchone()
+            job = connection.execute(
+                "SELECT 1 FROM jobs WHERE id = ? AND paper_id = ?", (job_id, paper_id),
+            ).fetchone()
+            if paper is None or job is None:
+                raise KeyError("Unknown job/paper association")
+            connection.execute(
+                "UPDATE papers SET notion_page_id = ?, updated_at = ? WHERE id = ?",
+                (page_id, now, paper_id),
+            )
+            connection.execute(
+                """INSERT INTO job_checkpoints
+                   (job_id, stage, payload_json, completed_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(job_id, stage) DO UPDATE SET
+                       payload_json = excluded.payload_json,
+                       completed_at = excluded.completed_at""",
+                (
+                    job_id, JobState.NOTION_SYNC.value,
+                    json.dumps(payload, ensure_ascii=False), now,
+                ),
+            )
 
     def transition(self, job_id: str, state: JobState, error: str | None = None) -> JobRecord:
         job = self.get_job(job_id)
@@ -295,6 +428,18 @@ class JobStore:
             row = connection.execute("SELECT * FROM jobs WHERE paper_id = ? AND state != ? ORDER BY updated_at DESC LIMIT 1",
                                      (paper_id, JobState.COMPLETED.value)).fetchone()
         return self._record(row) if row else None
+
+    def has_completed_job(self, canonical_identity: str) -> bool:
+        """Return whether a canonical paper identity already completed the pipeline."""
+        paper = self.find_paper(canonical_identity)
+        if paper is None:
+            return False
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM jobs WHERE paper_id = ? AND state = ? LIMIT 1",
+                (paper["id"], JobState.COMPLETED.value),
+            ).fetchone()
+        return row is not None
 
     def cache_llm_call(self, job_id: str, request_hash: str, model: str,
                        response: Any, cost_usd: float) -> None:

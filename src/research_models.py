@@ -140,3 +140,4 @@ class JobRecord:
     artifact_dir: Path | None = None
     error: str | None = None
     total_cost_usd: float = 0.0
+    max_cost_usd: float = 0.50
