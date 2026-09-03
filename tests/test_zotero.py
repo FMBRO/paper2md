@@ -2,6 +2,7 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 from typing import Mapping
+import urllib.error
 
 import pytest
 
@@ -222,7 +223,12 @@ def test_upsert_non_zotero_creates_parent_attachment_and_uploads_pdf(tmp_path: P
     http = RecordingHttpClient({
         ("GET", search): FakeResponse(200, {}, b"[]"),
         ("GET", root): FakeResponse(200, {"Zotero-Server-ID": "server-1"}),
-        ("POST", f"{root}local/authorize"): FakeResponse(200, {}, b'{"key":"write-key"}'),
+        ("POST", f"{root}local/authorize"): [
+            FakeResponse(200, {}, b'{"key":"write-key-1","remember":false}'),
+            FakeResponse(200, {}, b'{"key":"write-key-2","remember":false}'),
+            FakeResponse(200, {}, b'{"key":"write-key-3","remember":false}'),
+            FakeResponse(200, {}, b'{"key":"write-key-4","remember":false}'),
+        ],
         ("POST", items_url): [
             FakeResponse(200, {}, b'{"successful":{"0":{"key":"PARENT01"}}}'),
             FakeResponse(200, {}, b'{"successful":{"0":{"key":"PDF00001"}}}'),
@@ -238,6 +244,53 @@ def test_upsert_non_zotero_creates_parent_attachment_and_uploads_pdf(tmp_path: P
 
     assert (result.parent_key, result.attachment_key, result.source_pdf) == ("PARENT01", "PDF00001", source)
     parent_payload = json.loads(http.requests[3][3])
-    attachment_payload = json.loads(http.requests[4][3])
+    attachment_payload = json.loads(http.requests[5][3])
     assert parent_payload == [{"itemType": "journalArticle", "title": "New paper", "DOI": "10.1000/new", "creators": [{"creatorType": "author", "name": "Ada Lovelace"}]}]
     assert attachment_payload == [{"itemType": "attachment", "parentItem": "PARENT01", "linkMode": "imported_file", "contentType": "application/pdf", "filename": "source.pdf", "title": "source.pdf"}]
+    assert http.requests[3][2]["Zotero-API-Key"] == "write-key-1"
+    assert http.requests[5][2]["Zotero-API-Key"] == "write-key-2"
+    assert http.requests[3][2]["Zotero-Write-Token"] != http.requests[5][2]["Zotero-Write-Token"]
+
+
+def test_production_transport_preserves_file_redirect_for_resolver(monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.zotero import UrlLibZoteroHttpClient
+
+    class RedirectingOpener:
+        def open(self, request, timeout):
+            raise urllib.error.HTTPError(request.full_url, 302, "Found", {"Location": "file:///C:/paper.pdf"}, None)
+
+    monkeypatch.setattr("urllib.request.build_opener", lambda *handlers: RedirectingOpener())
+    response = UrlLibZoteroHttpClient().request("GET", "http://localhost:23119/api/users/0/items/PDF00001/file")
+
+    assert response.status_code == 302
+    assert response.headers["Location"] == "file:///C:/paper.pdf"
+
+
+def test_doi_lookup_ignores_search_result_without_any_identifier(tmp_path: Path) -> None:
+    from src.research_models import PaperMetadata
+    from src.zotero import ZoteroClient
+
+    source = tmp_path / "source.pdf"; source.write_bytes(b"%PDF-1.7\n")
+    root = "http://localhost:23119/api/"; items = f"{root}users/0/items"
+    search = f"{items}?q=10.1000%2Fnew&qmode=everything&itemType=-attachment"
+    http = RecordingHttpClient({
+        ("GET", search): FakeResponse(200, {}, b'[{"key":"OTHER001","data":{"itemType":"journalArticle","title":"Unrelated"}}]'),
+        ("GET", root): FakeResponse(200, {"Zotero-Server-ID": "server-1"}),
+        ("POST", f"{root}local/authorize"): FakeResponse(200, {}, b'{"key":"write-key","remember":true}'),
+        ("POST", items): [FakeResponse(200, {}, b'{"successful":{"0":{"key":"PARENT01"}}}'), FakeResponse(200, {}, b'{"successful":{"0":{"key":"PDF00001"}}}')],
+        ("POST", f"{root}users/0/items/PDF00001/file"): FakeResponse(200, {}, b'{"exists":1}'),
+    })
+
+    result = ZoteroClient(http_client=http).upsert_non_zotero(PaperMetadata(doi="10.1000/new"), source)
+
+    assert result.parent_key == "PARENT01"
+
+
+def test_unreadable_source_does_not_authorize_or_write(tmp_path: Path) -> None:
+    from src.research_models import PaperMetadata
+    from src.zotero import ZoteroClient
+
+    http = RecordingHttpClient({})
+    with pytest.raises(FileNotFoundError):
+        ZoteroClient(http_client=http).upsert_non_zotero(PaperMetadata(title="Missing"), tmp_path / "missing.pdf")
+    assert http.requests == []

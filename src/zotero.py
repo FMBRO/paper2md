@@ -6,6 +6,7 @@ import urllib.request
 from dataclasses import dataclass
 import hashlib
 import json
+import uuid
 from pathlib import Path
 from typing import Mapping, Protocol
 from urllib.parse import unquote, urlencode, urlparse
@@ -36,8 +37,12 @@ class UrlLibZoteroHttpClient:
         content: bytes | None = None,
     ) -> ZoteroHttpResponse:
         request = urllib.request.Request(url, data=content, headers=dict(headers or {}), method=method)
+        class _NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
         try:
-            with urllib.request.urlopen(request, timeout=5) as response:
+            opener = urllib.request.build_opener(_NoRedirect())
+            with opener.open(request, timeout=5) as response:
                 return ZoteroHttpResponse(response.status, dict(response.headers.items()), response.read())
         except urllib.error.HTTPError as exc:
             return ZoteroHttpResponse(exc.code, dict(exc.headers.items()) if exc.headers else {}, exc.read())
@@ -93,13 +98,17 @@ class ZoteroClient:
         if metadata.zotero_item_key or metadata.zotero_library_id:
             raise ValueError("Existing Zotero-derived items are read-only")
         source = Path(source_pdf)
+        if not source.is_file():
+            raise FileNotFoundError(f"Source PDF does not exist: {source}")
+        data = source.read_bytes()
         identity = metadata.doi or metadata.arxiv_id
         if identity:
             query = urlencode({"q": identity, "qmode": "everything", "itemType": "-attachment"})
             for item in _item_list(self._get_json(f"users/{self.user_id}/items?{query}")):
-                data = _item_data(item)
-                candidate = PaperMetadata(doi=_as_string(data.get("DOI")), arxiv_id=_as_string(data.get("archiveID")))
-                if candidate.doi == metadata.doi or candidate.arxiv_id == metadata.arxiv_id:
+                item_data = _item_data(item)
+                candidate = PaperMetadata(doi=_as_string(item_data.get("DOI")), arxiv_id=_as_string(item_data.get("archiveID")))
+                if ((metadata.doi is not None and candidate.doi == metadata.doi)
+                        or (metadata.arxiv_id is not None and candidate.arxiv_id == metadata.arxiv_id)):
                     return ZoteroResolution(_metadata(item), source, _item_key(item), None)
         probe = self._request("GET", "")
         server_id = probe.headers.get("Zotero-Server-ID")
@@ -109,18 +118,28 @@ class ZoteroClient:
         key = auth.get("key") if isinstance(auth, dict) else None
         if not isinstance(key, str):
             raise ZoteroError("Zotero write authorization was denied")
+        reusable = bool(auth.get("remember"))
+        used = False
+        def authorize() -> str:
+            value = _json_response(self._request("POST", "local/authorize", content=b'{"appName":"paper2md"}', headers={"Content-Type": "application/json", "Zotero-Server-ID": server_id}), "write authorization")
+            token = value.get("key") if isinstance(value, dict) else None
+            if not isinstance(token, str): raise ZoteroError("Zotero write authorization was denied")
+            return token
         def write(path: str, content: bytes, headers: Mapping[str, str]) -> ZoteroHttpResponse:
+            nonlocal key, used
+            if used and not reusable: key = authorize()
             response = self._request("POST", path, content=content, headers={"Zotero-Server-ID": server_id, "Zotero-API-Key": key, **headers})
+            used = True
             if not 200 <= response.status_code < 300:
                 raise ZoteroError(f"Zotero API returned HTTP {response.status_code} for {path}")
             return response
         parent = {"itemType": "journalArticle", "title": metadata.title or "Untitled"}
         if metadata.doi: parent["DOI"] = metadata.doi
         if metadata.authors: parent["creators"] = [{"creatorType": "author", "name": author} for author in metadata.authors]
-        parent_key = _created_key(_json_response(write(f"users/{self.user_id}/items", json.dumps([parent]).encode(), {"Content-Type": "application/json"}), "parent creation"))
+        parent_key = _created_key(_json_response(write(f"users/{self.user_id}/items", json.dumps([parent]).encode(), {"Content-Type": "application/json", "Zotero-Write-Token": uuid.uuid4().hex}), "parent creation"))
         attachment = {"itemType": "attachment", "parentItem": parent_key, "linkMode": "imported_file", "contentType": "application/pdf", "filename": source.name, "title": source.name}
-        attachment_key = _created_key(_json_response(write(f"users/{self.user_id}/items", json.dumps([attachment]).encode(), {"Content-Type": "application/json"}), "attachment creation"))
-        data = source.read_bytes(); file_path = f"users/{self.user_id}/items/{attachment_key}/file"
+        attachment_key = _created_key(_json_response(write(f"users/{self.user_id}/items", json.dumps([attachment]).encode(), {"Content-Type": "application/json", "Zotero-Write-Token": uuid.uuid4().hex}), "attachment creation"))
+        file_path = f"users/{self.user_id}/items/{attachment_key}/file"
         form = urlencode({"md5": hashlib.md5(data).hexdigest(), "filename": source.name, "filesize": len(data), "mtime": int(source.stat().st_mtime * 1000)}).encode()
         upload = _json_response(write(file_path, form, {"Content-Type": "application/x-www-form-urlencoded", "If-None-Match": "*"}), "file upload authorization")
         if not isinstance(upload, dict): raise ZoteroError("Zotero file upload authorization returned malformed JSON")
