@@ -42,7 +42,8 @@ class JobStore:
                     id INTEGER PRIMARY KEY,
                     canonical_identity TEXT NOT NULL UNIQUE,
                     doi TEXT, arxiv_id TEXT, zotero_library_id TEXT,
-                    zotero_item_key TEXT, pdf_sha256 TEXT, metadata_json TEXT NOT NULL,
+                    zotero_item_key TEXT, pdf_sha256 TEXT, notion_page_id TEXT,
+                    metadata_json TEXT NOT NULL,
                     artifact_dir TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS jobs (
@@ -73,8 +74,15 @@ class JobStore:
                     FOREIGN KEY(job_id) REFERENCES jobs(id)
                 );
             """)
+            self._migrate_papers(connection)
             self._migrate_llm_calls(connection)
             self._migrate_llm_budget_reservations(connection)
+
+    @staticmethod
+    def _migrate_papers(connection: sqlite3.Connection) -> None:
+        columns = {row["name"] for row in connection.execute("PRAGMA table_info(papers)")}
+        if "notion_page_id" not in columns:
+            connection.execute("ALTER TABLE papers ADD COLUMN notion_page_id TEXT")
 
     @staticmethod
     def _migrate_llm_calls(connection: sqlite3.Connection) -> None:
@@ -206,6 +214,7 @@ class JobStore:
             zotero_library_id = self._first_value(rows, "zotero_library_id") or metadata.zotero_library_id
             zotero_item_key = self._first_value(rows, "zotero_item_key") or metadata.zotero_item_key
             sha256 = self._first_value(rows, "pdf_sha256") or pdf_sha256
+            notion_page_id = self._first_value(rows, "notion_page_id")
             canonical_identity = PaperMetadata(
                 doi=doi, arxiv_id=arxiv_id, zotero_library_id=zotero_library_id,
                 zotero_item_key=zotero_item_key,
@@ -215,9 +224,9 @@ class JobStore:
                 connection.execute("DELETE FROM papers WHERE id = ?", (duplicate["id"],))
             connection.execute("""UPDATE papers SET canonical_identity = ?, doi = ?, arxiv_id = ?,
                 zotero_library_id = ?, zotero_item_key = ?, pdf_sha256 = ?, metadata_json = ?,
-                artifact_dir = COALESCE(?, artifact_dir), updated_at = ? WHERE id = ?""",
+                notion_page_id = ?, artifact_dir = COALESCE(?, artifact_dir), updated_at = ? WHERE id = ?""",
                 (canonical_identity, doi, arxiv_id, zotero_library_id, zotero_item_key, sha256,
-                 payload, str(artifact_dir) if artifact_dir else None, now, primary["id"]))
+                 payload, notion_page_id, str(artifact_dir) if artifact_dir else None, now, primary["id"]))
             return int(primary["id"])
 
     @staticmethod
@@ -259,6 +268,27 @@ class JobStore:
                     clauses.append("(zotero_library_id = ? AND zotero_item_key = ?)")
                     values.extend((library_id, item_key))
             return connection.execute(f"SELECT * FROM papers WHERE {' OR '.join(clauses)}", values).fetchone()
+
+    def get_notion_page_id(self, paper_id: int) -> str | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT notion_page_id FROM papers WHERE id = ?", (paper_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"Unknown paper: {paper_id}")
+        return row["notion_page_id"]
+
+    def set_notion_page_id(self, paper_id: int, page_id: str) -> None:
+        page_id = page_id.strip()
+        if not page_id:
+            raise ValueError("Notion page ID must not be empty")
+        with self._connect() as connection:
+            updated = connection.execute(
+                "UPDATE papers SET notion_page_id = ?, updated_at = ? WHERE id = ?",
+                (page_id, self._now(), paper_id),
+            )
+        if not updated.rowcount:
+            raise KeyError(f"Unknown paper: {paper_id}")
 
     def find_resumable_job(self, paper_id: int) -> JobRecord | None:
         with self._connect() as connection:

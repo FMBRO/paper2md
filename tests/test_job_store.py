@@ -4,6 +4,19 @@ import sqlite3
 import pytest
 
 
+def test_job_store_persists_notion_page_id_on_the_canonical_paper(tmp_path: Path) -> None:
+    from src.job_store import JobStore
+    from src.research_models import PaperMetadata
+
+    store = JobStore(tmp_path / "state.sqlite3")
+    paper_id = store.upsert_paper(PaperMetadata(doi="10.1000/notion"))
+
+    assert store.get_notion_page_id(paper_id) is None
+    store.set_notion_page_id(paper_id, "notion-page-1")
+
+    assert store.get_notion_page_id(paper_id) == "notion-page-1"
+
+
 def test_job_store_enforces_ordered_state_transitions(tmp_path: Path) -> None:
     from src.job_store import JobStore
     from src.research_models import InputKind, InputSpec, JobState
