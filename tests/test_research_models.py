@@ -18,6 +18,12 @@ def test_metadata_falls_back_through_arxiv_zotero_and_pdf_identity() -> None:
     assert PaperMetadata().canonical_identity(pdf_sha256="A" * 64) == f"sha256:{'a' * 64}"
 
 
+def test_metadata_normalizes_an_arxiv_prefixed_identifier() -> None:
+    from src.research_models import PaperMetadata
+
+    assert PaperMetadata(arxiv_id="arXiv:2401.01234v2").arxiv_id == "2401.01234"
+
+
 def test_input_spec_requires_a_nonempty_source() -> None:
     from src.research_models import InputKind, InputSpec
 

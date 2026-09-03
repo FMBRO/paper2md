@@ -57,6 +57,7 @@ def _normalize_arxiv(value: str | None) -> str | None:
     if not value:
         return None
     value = value.strip().lower()
+    value = re.sub(r"^arxiv:\s*", "", value)
     value = re.sub(r"^https?://arxiv\.org/(?:abs|pdf)/", "", value)
     value = re.sub(r"\.pdf$", "", value)
     return re.sub(r"v\d+$", "", value) or None

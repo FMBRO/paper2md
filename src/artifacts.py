@@ -79,3 +79,18 @@ class ArtifactManager:
             Path(temporary_name).unlink(missing_ok=True)
             raise
         return self.bundle.source_pdf
+
+    def write_source_pdf(self, content: bytes) -> Path:
+        """Durably store already-validated downloaded PDF content."""
+        self.create()
+        handle, temporary_name = tempfile.mkstemp(prefix=".source.", suffix=".tmp", dir=self.root)
+        try:
+            with os.fdopen(handle, "wb") as temporary:
+                temporary.write(content)
+                temporary.flush()
+                os.fsync(temporary.fileno())
+            os.replace(temporary_name, self.bundle.source_pdf)
+        except BaseException:
+            Path(temporary_name).unlink(missing_ok=True)
+            raise
+        return self.bundle.source_pdf
