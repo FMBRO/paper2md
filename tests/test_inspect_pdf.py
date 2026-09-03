@@ -1,8 +1,11 @@
 import json
 from pathlib import Path
 
+import fitz
+
 from src.inspect_pdf import (
     has_text_layer,
+    inspect_page_text,
     inspect_pdf,
     render_pages,
     write_text_layer_report,
@@ -29,6 +32,7 @@ def test_inspect_pdf_returns_report(text_pdf: Path) -> None:
     assert report["page_count"] == 1
     assert report["checked_pages"] == 1
     assert report["extracted_char_count"] > 100
+    assert report["pages"] == inspect_page_text(text_pdf)
 
 
 def test_write_text_layer_report(text_pdf: Path, tmp_path: Path) -> None:
@@ -46,3 +50,19 @@ def test_render_pages_writes_one_png_per_page(text_pdf: Path, tmp_path: Path) ->
     assert paths[0] == pages_dir / "page_001.png"
     assert paths[0].exists()
     assert paths[0].stat().st_size > 0
+
+
+def test_inspect_page_text_reports_every_page_in_mixed_pdf(tmp_path: Path) -> None:
+    pdf = tmp_path / "mixed.pdf"
+    doc = fitz.open()
+    doc.new_page().insert_text((72, 72), "Text on first page")
+    doc.new_page()
+    doc.save(pdf)
+    doc.close()
+
+    pages = inspect_page_text(pdf)
+
+    assert pages == [
+        {"page": 1, "character_count": 18, "has_text": True},
+        {"page": 2, "character_count": 0, "has_text": False},
+    ]

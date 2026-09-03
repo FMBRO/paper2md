@@ -7,6 +7,23 @@ from pathlib import Path
 import fitz
 
 
+def inspect_page_text(pdf_path: Path | str) -> list[dict]:
+    """Return text coverage for every page, including mixed-text PDFs."""
+    doc = fitz.open(str(pdf_path))
+    try:
+        result: list[dict] = []
+        for index, page in enumerate(doc):
+            text = page.get_text().strip()
+            result.append({
+                "page": index + 1,
+                "character_count": len(text),
+                "has_text": bool(text),
+            })
+        return result
+    finally:
+        doc.close()
+
+
 def has_text_layer(pdf_path: Path | str, min_chars: int = 100, max_pages: int = 3) -> bool:
     """Return True when the first ``max_pages`` pages contain at least ``min_chars`` of text."""
     doc = fitz.open(str(pdf_path))
@@ -26,6 +43,14 @@ def inspect_pdf(pdf_path: Path | str, min_chars: int = 100, max_pages: int = 3) 
     pdf_path = Path(pdf_path)
     doc = fitz.open(str(pdf_path))
     try:
+        pages = []
+        for index, page in enumerate(doc):
+            page_text = page.get_text().strip()
+            pages.append({
+                "page": index + 1,
+                "character_count": len(page_text),
+                "has_text": bool(page_text),
+            })
         text = ""
         checked = 0
         for i, page in enumerate(doc):
@@ -40,6 +65,7 @@ def inspect_pdf(pdf_path: Path | str, min_chars: int = 100, max_pages: int = 3) 
             "page_count": doc.page_count,
             "checked_pages": checked,
             "extracted_char_count": char_count,
+            "pages": pages,
         }
     finally:
         doc.close()
