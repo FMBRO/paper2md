@@ -64,3 +64,19 @@ The GUI provides the following checkboxes:
 | **Deskew** | Passes `--deskew` to OCRmyPDF to straighten tilted pages. | Has an effect only when OCR runs. |
 | **Clean** | Requests OCRmyPDF's `--clean` preprocessing to remove page noise. | Has an effect only when OCR runs. It requires `unpaper`; when `unpaper` is unavailable, paper2md logs a warning and continues without cleaning. |
 | **Skip existing** | Skips a PDF when its `output/{paper_name}/paper.md` already exists. | Useful when resuming a batch without converting completed PDFs again. |
+
+## Research pipeline
+
+The same desktop app also has a **Research pipeline** tab for resumable arXiv,
+DOI, PDF URL, local PDF, and Zotero workflows. A matching CLI provides
+`ingest`, `status`, and `resume` commands:
+
+```text
+uv run python -m src.cli ingest 2401.01234
+uv run python -m src.cli status JOB_ID
+uv run python -m src.cli resume JOB_ID
+```
+
+OpenRouter, Notion, Zotero, privacy, budget, artifact, diagnostics,
+troubleshooting, and license-boundary setup is documented in
+[Research pipeline setup and operation](docs/research-pipeline.md).

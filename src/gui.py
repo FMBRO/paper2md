@@ -1,18 +1,22 @@
 """Tkinter desktop interface for the paper2md batch pipeline."""
 from __future__ import annotations
 
+import math
 import os
 import queue
 import subprocess
 import sys
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Mapping
 
+from src.acquisition import parse_input
 from src.batch_convert import run_batch
 from src.config import Settings, load_settings
 from src.pipeline_events import PipelineEvent
+from src.pipeline import PipelineService
+from src.research_models import InputKind, InputSpec, JobRecord
 
 try:
     import tkinter as tk
@@ -63,8 +67,127 @@ class RunFailed:
     error: str
 
 
-QueueItem = PipelineEvent | RunFinished | RunFailed
+@dataclass(frozen=True)
+class PipelineGuiOptions:
+    """Display-independent values from the research-pipeline form."""
+
+    input_kind: str = InputKind.ARXIV.value
+    input_value: str = ""
+    attachment_key: str = ""
+    research_interest: str = ""
+    max_cost_usd: str = "0.50"
+    only_unprocessed: bool = False
+
+    @classmethod
+    def from_settings(cls, settings: Settings) -> "PipelineGuiOptions":
+        return cls(max_cost_usd=f"{settings.openrouter.paper_budget_usd:g}")
+
+
+@dataclass(frozen=True)
+class PipelineRunFinished:
+    jobs: tuple[JobRecord, ...]
+
+
+@dataclass(frozen=True)
+class PipelineStatusFinished:
+    job: JobRecord
+
+
+@dataclass(frozen=True)
+class DiagnosticCheck:
+    name: str
+    ok: bool
+    detail: str
+
+
+@dataclass(frozen=True)
+class DiagnosticsFinished:
+    checks: tuple[DiagnosticCheck, ...]
+
+
+@dataclass(frozen=True)
+class PipelineRunFailed:
+    error: str
+
+
+@dataclass
+class ResearchViewModel:
+    """Display-independent projection of research worker messages."""
+
+    job_id: str = ""
+    stage: str = ""
+    status: str = "Ready"
+    actual_cost: str = "$0.000000"
+    artifact_dir: str = ""
+    logs: list[str] = field(default_factory=list)
+
+    @property
+    def can_resume(self) -> bool:
+        return bool(self.job_id) and self.stage in {
+            "needs_input", "budget_exceeded", "failed", "completed",
+        }
+
+    def apply(self, item: QueueItem) -> None:
+        if isinstance(item, PipelineEvent):
+            if item.pdf_name:
+                self.job_id = item.pdf_name
+            if item.stage:
+                self.stage = item.stage
+                self.status = "Running"
+            if item.stage:
+                self.logs.append(f"[{item.stage}] {item.message or 'Started'}")
+            elif item.message:
+                self.logs.append(item.message)
+            return
+        if isinstance(item, (PipelineRunFinished, PipelineStatusFinished)):
+            jobs = item.jobs if isinstance(item, PipelineRunFinished) else (item.job,)
+            if not jobs:
+                self.status = "No jobs matched"
+                return
+            job = jobs[-1]
+            self.job_id = job.id
+            self.stage = job.state.value
+            self.actual_cost = f"${job.total_cost_usd:.6f}"
+            self.artifact_dir = str(job.artifact_dir or "")
+            self.status = job.state.value + (f": {job.error}" if job.error else "")
+            if len(jobs) > 1:
+                self.logs.append(f"Collection finished: {len(jobs)} jobs")
+            return
+        if isinstance(item, DiagnosticsFinished):
+            for check in item.checks:
+                self.logs.append(
+                    f"[{'OK' if check.ok else 'FAIL'}] {check.name}: {check.detail}"
+                )
+            self.status = (
+                "Diagnostics: all checks passed"
+                if all(check.ok for check in item.checks)
+                else "Diagnostics: attention needed"
+            )
+            return
+        if isinstance(item, RunFailed):
+            self.status = f"Failed: {item.error}"
+            self.logs.append(self.status)
+        if isinstance(item, PipelineRunFailed):
+            self.status = f"Failed: {item.error}"
+            self.logs.append(self.status)
+
+
+QueueItem = (
+    PipelineEvent | RunFinished | RunFailed | PipelineRunFinished
+    | PipelineStatusFinished | DiagnosticsFinished | PipelineRunFailed
+)
 BatchRunner = Callable[[Settings, Callable[[PipelineEvent], None] | None], dict]
+PipelineFactory = Callable[
+    [Settings, Callable[[PipelineEvent], None] | None], PipelineService
+]
+
+
+def create_pipeline_service(
+    settings: Settings,
+    on_event: Callable[[PipelineEvent], None] | None = None,
+) -> PipelineService:
+    """Compose production pipeline clients at the GUI/CLI boundary."""
+    return PipelineService(settings, on_event=on_event)
 
 
 def load_gui_options(config_path: Path | str = DEFAULT_CONFIG) -> GuiOptions:
@@ -73,6 +196,96 @@ def load_gui_options(config_path: Path | str = DEFAULT_CONFIG) -> GuiOptions:
     if path.exists():
         return GuiOptions.from_settings(load_settings(path))
     return GuiOptions(input_dir="input", output_dir="output")
+
+
+def build_pipeline_input(
+    options: PipelineGuiOptions,
+    *,
+    default_research_interest: str = "",
+) -> tuple[InputSpec, float]:
+    """Validate research form values and map them to the service contract."""
+    try:
+        kind = InputKind(options.input_kind)
+    except ValueError as error:
+        raise ValueError(f"Unsupported pipeline input type: {options.input_kind}") from error
+    source = options.input_value.strip()
+    if not source:
+        raise ValueError("Pipeline input value cannot be empty")
+    try:
+        budget = float(options.max_cost_usd)
+    except ValueError as error:
+        raise ValueError("Budget must be a non-negative finite number") from error
+    if not math.isfinite(budget) or budget < 0:
+        raise ValueError("Budget must be a non-negative finite number")
+    interest = options.research_interest.strip() or default_research_interest.strip()
+    attachment_key = options.attachment_key.strip().upper() or None
+    if kind is InputKind.LOCAL_PDF:
+        local_path = Path(source).expanduser()
+        if local_path.suffix.lower() != ".pdf":
+            raise ValueError("Local pipeline input must be a PDF path")
+        spec = InputSpec(
+            kind, str(local_path.resolve()), attachment_key, interest or None,
+        )
+    else:
+        parse_source = (
+            f"collection:{source}"
+            if kind is InputKind.ZOTERO_COLLECTION and ":" not in source
+            else source
+        )
+        spec = parse_input(
+            parse_source,
+            attachment_key=attachment_key,
+            research_interest=interest or None,
+        )
+        if spec.kind is not kind:
+            raise ValueError(
+                f"Input value is {spec.kind.value}, not selected type {kind.value}"
+            )
+    return spec, budget
+
+
+def run_pipeline_diagnostics(
+    settings: Settings,
+    *,
+    service_factory: PipelineFactory = create_pipeline_service,
+    environ: Mapping[str, str] = os.environ,
+) -> tuple[DiagnosticCheck, ...]:
+    """Probe configured boundaries without conversion, writes, or paid requests."""
+    checks = [DiagnosticCheck("Local storage", True, str(settings.state_path))]
+    checks.append(DiagnosticCheck(
+        "OpenRouter",
+        bool(environ.get("OPENROUTER_API_KEY")),
+        (
+            "API key configured; no paid request sent"
+            if environ.get("OPENROUTER_API_KEY")
+            else "OPENROUTER_API_KEY is not configured"
+        ),
+    ))
+    try:
+        service = service_factory(settings, None)
+    except Exception as error:
+        detail = str(error)
+        checks.extend((
+            DiagnosticCheck("Zotero local API", False, detail),
+            DiagnosticCheck("Notion data source", False, detail),
+        ))
+        return tuple(checks)
+    try:
+        zotero_ok = bool(service.zotero.is_available())
+        checks.append(DiagnosticCheck(
+            "Zotero local API", zotero_ok,
+            settings.zotero.base_url if zotero_ok else "Zotero is not reachable",
+        ))
+    except Exception as error:
+        checks.append(DiagnosticCheck("Zotero local API", False, str(error)))
+    try:
+        service.notion.validate_schema()
+        checks.append(DiagnosticCheck(
+            "Notion data source", True, "Schema valid; no content written",
+        ))
+    except Exception as error:
+        checks.append(DiagnosticCheck("Notion data source", False, str(error)))
+    return tuple(checks)
 
 
 def list_input_pdfs(input_dir: Path | str) -> list[Path]:
@@ -184,6 +397,121 @@ class BatchRunController:
                 self._running = False
 
 
+class PipelineRunController:
+    """Run research-pipeline operations on one worker and publish queue items."""
+
+    def __init__(
+        self,
+        event_queue: "queue.Queue[QueueItem]",
+        *,
+        service_factory: PipelineFactory = create_pipeline_service,
+        diagnostics_runner: Callable[..., tuple[DiagnosticCheck, ...]] = (
+            run_pipeline_diagnostics
+        ),
+    ) -> None:
+        self.event_queue = event_queue
+        self.service_factory = service_factory
+        self.diagnostics_runner = diagnostics_runner
+        self._running = False
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+
+    @property
+    def running(self) -> bool:
+        with self._lock:
+            return self._running
+
+    def _start(self, target: Callable[[], None]) -> None:
+        with self._lock:
+            if self._running:
+                raise RuntimeError("A research pipeline operation is already running")
+            self._running = True
+        self._thread = threading.Thread(
+            target=self._run,
+            args=(target,),
+            name="paper2md-research-worker",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def wait(self, timeout: float | None = None) -> None:
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout)
+
+    def start_ingest(
+        self,
+        settings: Settings,
+        spec: InputSpec,
+        max_cost_usd: float,
+        *,
+        only_unprocessed: bool = False,
+    ) -> None:
+        def operation() -> None:
+            service = self.service_factory(settings, self.event_queue.put)
+            if spec.kind is InputKind.ZOTERO_COLLECTION:
+                jobs = service.ingest_collection(
+                    spec,
+                    max_cost_usd=max_cost_usd,
+                    only_unprocessed=only_unprocessed,
+                )
+            else:
+                if only_unprocessed:
+                    raise ValueError(
+                        "Only-unprocessed requires a Zotero collection"
+                    )
+                jobs = [service.ingest(spec, max_cost_usd)]
+            self.event_queue.put(PipelineRunFinished(tuple(jobs)))
+
+        self._start(operation)
+
+    def start_resume(
+        self,
+        settings: Settings,
+        job_id: str,
+        *,
+        max_cost_usd: float | None = None,
+        attachment_key: str | None = None,
+        research_interest: str | None = None,
+    ) -> None:
+        def operation() -> None:
+            service = self.service_factory(settings, self.event_queue.put)
+            job = service.resume(
+                job_id,
+                max_cost_usd,
+                attachment_key=attachment_key,
+                research_interest=research_interest,
+            )
+            self.event_queue.put(PipelineRunFinished((job,)))
+
+        self._start(operation)
+
+    def start_status(self, settings: Settings, job_id: str) -> None:
+        def operation() -> None:
+            service = self.service_factory(settings, self.event_queue.put)
+            self.event_queue.put(PipelineStatusFinished(service.status(job_id)))
+
+        self._start(operation)
+
+    def start_diagnostics(self, settings: Settings) -> None:
+        def operation() -> None:
+            checks = self.diagnostics_runner(
+                settings, service_factory=self.service_factory,
+            )
+            self.event_queue.put(DiagnosticsFinished(tuple(checks)))
+
+        self._start(operation)
+
+    def _run(self, operation: Callable[[], None]) -> None:
+        try:
+            operation()
+        except Exception as error:
+            self.event_queue.put(PipelineRunFailed(str(error)))
+        finally:
+            with self._lock:
+                self._running = False
+
+
 class Paper2MdApp:
     """English-language Tkinter view for local batch conversion."""
 
@@ -197,18 +525,25 @@ class Paper2MdApp:
     def __init__(self, root: "tk.Tk") -> None:
         self.root = root
         self.root.title("paper2md")
-        self.root.minsize(900, 680)
+        self.root.minsize(960, 720)
         self.events: "queue.Queue[QueueItem]" = queue.Queue()
         self.controller = BatchRunController(self.events)
+        self.pipeline_controller = PipelineRunController(self.events)
+        self.research_model = ResearchViewModel()
         self._is_running = False
+        self._pipeline_running = False
         self._row_ids: dict[str, str] = {}
         self._interactive_widgets: list[object] = []
+        self._pipeline_widgets: list[object] = []
 
         try:
-            defaults = load_gui_options()
+            configured_settings = load_settings(DEFAULT_CONFIG)
+            defaults = GuiOptions.from_settings(configured_settings)
+            pipeline_defaults = PipelineGuiOptions.from_settings(configured_settings)
             startup_warning = None
         except Exception as error:
             defaults = GuiOptions(input_dir="input", output_dir="output")
+            pipeline_defaults = PipelineGuiOptions()
             startup_warning = f"Could not load config defaults: {error}"
 
         self.input_var = tk.StringVar(value=defaults.input_dir)
@@ -221,6 +556,17 @@ class Paper2MdApp:
         self.skip_existing_var = tk.BooleanVar(value=defaults.skip_existing)
         self.progress_var = tk.DoubleVar(value=0)
         self.progress_text_var = tk.StringVar(value="Ready")
+        self.pipeline_kind_var = tk.StringVar(value=InputKind.ARXIV.value)
+        self.pipeline_input_var = tk.StringVar()
+        self.pipeline_attachment_var = tk.StringVar()
+        self.pipeline_interest_var = tk.StringVar()
+        self.pipeline_budget_var = tk.StringVar(value=pipeline_defaults.max_cost_usd)
+        self.pipeline_only_unprocessed_var = tk.BooleanVar(value=False)
+        self.pipeline_job_id_var = tk.StringVar()
+        self.pipeline_stage_var = tk.StringVar(value="-")
+        self.pipeline_cost_var = tk.StringVar(value="$0.000000")
+        self.pipeline_status_var = tk.StringVar(value="Ready")
+        self.pipeline_artifact_var = tk.StringVar(value="-")
 
         self._build_layout()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -230,10 +576,18 @@ class Paper2MdApp:
 
     def _build_layout(self) -> None:
         self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(1, weight=1)
-        self.root.rowconfigure(2, weight=1)
+        self.root.rowconfigure(0, weight=1)
+        notebook = ttk.Notebook(self.root)
+        notebook.grid(row=0, column=0, sticky="nsew")
+        legacy_tab = ttk.Frame(notebook)
+        research_tab = ttk.Frame(notebook)
+        notebook.add(legacy_tab, text="Batch conversion")
+        notebook.add(research_tab, text="Research pipeline")
+        legacy_tab.columnconfigure(0, weight=1)
+        legacy_tab.rowconfigure(1, weight=1)
+        legacy_tab.rowconfigure(2, weight=1)
 
-        settings_frame = ttk.LabelFrame(self.root, text="Conversion settings", padding=10)
+        settings_frame = ttk.LabelFrame(legacy_tab, text="Conversion settings", padding=10)
         settings_frame.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 5))
         settings_frame.columnconfigure(1, weight=1)
 
@@ -288,7 +642,7 @@ class Paper2MdApp:
             language_entry,
         ])
 
-        list_frame = ttk.LabelFrame(self.root, text="PDF files", padding=8)
+        list_frame = ttk.LabelFrame(legacy_tab, text="PDF files", padding=8)
         list_frame.grid(row=1, column=0, sticky="nsew", padx=10, pady=5)
         list_frame.columnconfigure(0, weight=1)
         list_frame.rowconfigure(0, weight=1)
@@ -312,7 +666,7 @@ class Paper2MdApp:
         self.pdf_tree.tag_configure("failed", foreground="#a02020")
         self.pdf_tree.tag_configure("skipped", foreground="#6b6b6b")
 
-        log_frame = ttk.LabelFrame(self.root, text="Live log", padding=8)
+        log_frame = ttk.LabelFrame(legacy_tab, text="Live log", padding=8)
         log_frame.grid(row=2, column=0, sticky="nsew", padx=10, pady=5)
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(0, weight=1)
@@ -321,7 +675,7 @@ class Paper2MdApp:
         )
         self.log_text.grid(row=0, column=0, sticky="nsew")
 
-        bottom = ttk.Frame(self.root, padding=(10, 5, 10, 10))
+        bottom = ttk.Frame(legacy_tab, padding=(10, 5, 10, 10))
         bottom.grid(row=3, column=0, sticky="ew")
         bottom.columnconfigure(0, weight=1)
         progress = ttk.Progressbar(bottom, variable=self.progress_var, maximum=100)
@@ -336,7 +690,107 @@ class Paper2MdApp:
         self.start_button = ttk.Button(bottom, text="Start conversion", command=self._start)
         self.start_button.grid(row=0, column=3)
 
+        self._build_research_layout(research_tab)
         self._refresh_pdf_list()
+
+    def _build_research_layout(self, parent: object) -> None:
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(2, weight=1)
+        form = ttk.LabelFrame(parent, text="Paper research pipeline", padding=10)
+        form.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 5))
+        form.columnconfigure(1, weight=1)
+
+        ttk.Label(form, text="Input type").grid(row=0, column=0, sticky="w")
+        kind = ttk.Combobox(
+            form,
+            textvariable=self.pipeline_kind_var,
+            values=tuple(value.value for value in InputKind),
+            state="readonly",
+            width=22,
+        )
+        kind.grid(row=0, column=1, sticky="w", padx=8, pady=3)
+        ttk.Label(form, text="Input value").grid(row=1, column=0, sticky="w")
+        source = ttk.Entry(form, textvariable=self.pipeline_input_var)
+        source.grid(row=1, column=1, sticky="ew", padx=8, pady=3)
+        browse = ttk.Button(form, text="Browse PDF...", command=self._choose_pipeline_pdf)
+        browse.grid(row=1, column=2, pady=3)
+
+        ttk.Label(form, text="Attachment key").grid(row=2, column=0, sticky="w")
+        attachment = ttk.Entry(form, textvariable=self.pipeline_attachment_var)
+        attachment.grid(row=2, column=1, sticky="ew", padx=8, pady=3)
+        ttk.Label(
+            form, text="Use when a Zotero item has multiple PDF attachments"
+        ).grid(row=2, column=2, sticky="w")
+
+        ttk.Label(form, text="Research interest").grid(row=3, column=0, sticky="w")
+        interest = ttk.Entry(form, textvariable=self.pipeline_interest_var)
+        interest.grid(row=3, column=1, columnspan=2, sticky="ew", padx=8, pady=3)
+
+        ttk.Label(form, text="Maximum cost (USD)").grid(row=4, column=0, sticky="w")
+        budget = ttk.Entry(form, textvariable=self.pipeline_budget_var, width=12)
+        budget.grid(row=4, column=1, sticky="w", padx=8, pady=3)
+        only_unprocessed = ttk.Checkbutton(
+            form,
+            text="Collection: only unprocessed items",
+            variable=self.pipeline_only_unprocessed_var,
+        )
+        only_unprocessed.grid(row=4, column=2, sticky="w")
+
+        ttk.Label(form, text="Job ID").grid(row=5, column=0, sticky="w")
+        job_id = ttk.Entry(form, textvariable=self.pipeline_job_id_var)
+        job_id.grid(row=5, column=1, columnspan=2, sticky="ew", padx=8, pady=3)
+
+        actions = ttk.Frame(parent, padding=(10, 5))
+        actions.grid(row=1, column=0, sticky="ew")
+        self.pipeline_start_button = ttk.Button(
+            actions, text="Start pipeline", command=self._start_pipeline,
+        )
+        self.pipeline_start_button.grid(row=0, column=0, padx=(0, 8))
+        self.pipeline_resume_button = ttk.Button(
+            actions, text="Resume", command=self._resume_pipeline,
+        )
+        self.pipeline_resume_button.grid(row=0, column=1, padx=(0, 8))
+        self.pipeline_status_button = ttk.Button(
+            actions, text="Refresh status", command=self._pipeline_status,
+        )
+        self.pipeline_status_button.grid(row=0, column=2, padx=(0, 8))
+        self.pipeline_diagnostics_button = ttk.Button(
+            actions, text="Run diagnostics", command=self._pipeline_diagnostics,
+        )
+        self.pipeline_diagnostics_button.grid(row=0, column=3)
+
+        results = ttk.LabelFrame(parent, text="Job status and diagnostics", padding=8)
+        results.grid(row=2, column=0, sticky="nsew", padx=10, pady=(5, 10))
+        results.columnconfigure(1, weight=1)
+        results.rowconfigure(4, weight=1)
+        ttk.Label(results, text="Stage").grid(row=0, column=0, sticky="nw")
+        ttk.Label(results, textvariable=self.pipeline_stage_var).grid(
+            row=0, column=1, sticky="nw",
+        )
+        ttk.Label(results, text="Actual cost").grid(row=1, column=0, sticky="nw")
+        ttk.Label(results, textvariable=self.pipeline_cost_var).grid(
+            row=1, column=1, sticky="nw",
+        )
+        ttk.Label(results, text="Status").grid(row=2, column=0, sticky="nw")
+        ttk.Label(results, textvariable=self.pipeline_status_var).grid(
+            row=2, column=1, sticky="nw",
+        )
+        ttk.Label(results, text="Artifacts").grid(row=3, column=0, sticky="nw")
+        ttk.Label(results, textvariable=self.pipeline_artifact_var).grid(
+            row=3, column=1, sticky="nw",
+        )
+        self.pipeline_log_text = scrolledtext.ScrolledText(
+            results, height=14, wrap="word", state="disabled",
+        )
+        self.pipeline_log_text.grid(
+            row=4, column=0, columnspan=2, sticky="nsew", pady=(8, 0),
+        )
+
+        self._pipeline_widgets.extend((
+            kind, source, browse, attachment, interest, budget, only_unprocessed,
+            job_id, self.pipeline_start_button, self.pipeline_resume_button,
+            self.pipeline_status_button, self.pipeline_diagnostics_button,
+        ))
 
     def _options(self) -> GuiOptions:
         return GuiOptions(
@@ -364,6 +818,131 @@ class Paper2MdApp:
         )
         if selected:
             self.output_var.set(selected)
+
+    def _choose_pipeline_pdf(self) -> None:
+        selected = filedialog.askopenfilename(
+            title="Select paper PDF",
+            filetypes=(("PDF files", "*.pdf"), ("All files", "*.*")),
+        )
+        if selected:
+            self.pipeline_kind_var.set(InputKind.LOCAL_PDF.value)
+            self.pipeline_input_var.set(selected)
+
+    def _pipeline_options(self) -> PipelineGuiOptions:
+        return PipelineGuiOptions(
+            input_kind=self.pipeline_kind_var.get(),
+            input_value=self.pipeline_input_var.get(),
+            attachment_key=self.pipeline_attachment_var.get(),
+            research_interest=self.pipeline_interest_var.get(),
+            max_cost_usd=self.pipeline_budget_var.get(),
+            only_unprocessed=self.pipeline_only_unprocessed_var.get(),
+        )
+
+    def _pipeline_settings(self) -> Settings:
+        return load_settings(DEFAULT_CONFIG)
+
+    def _start_pipeline(self) -> None:
+        if self._pipeline_running:
+            return
+        try:
+            settings = self._pipeline_settings()
+            options = self._pipeline_options()
+            spec, budget = build_pipeline_input(
+                options,
+                default_research_interest=settings.research_interest,
+            )
+            self.pipeline_controller.start_ingest(
+                settings, spec, budget,
+                only_unprocessed=options.only_unprocessed,
+            )
+        except (OSError, ValueError, RuntimeError) as error:
+            messagebox.showerror("Cannot start pipeline", str(error), parent=self.root)
+            return
+        self.research_model = ResearchViewModel(status="Running")
+        self._set_pipeline_running(True)
+        self._render_research_model()
+
+    def _resume_pipeline(self) -> None:
+        if self._pipeline_running:
+            return
+        job_id = self.pipeline_job_id_var.get().strip()
+        if not job_id:
+            messagebox.showerror("Cannot resume", "Job ID cannot be empty", parent=self.root)
+            return
+        try:
+            settings = self._pipeline_settings()
+            options = self._pipeline_options()
+            try:
+                budget = float(options.max_cost_usd)
+            except ValueError as error:
+                raise ValueError("Budget must be a non-negative finite number") from error
+            if not math.isfinite(budget) or budget < 0:
+                raise ValueError("Budget must be a non-negative finite number")
+            self.pipeline_controller.start_resume(
+                settings,
+                job_id,
+                max_cost_usd=budget,
+                attachment_key=options.attachment_key.strip() or None,
+                research_interest=options.research_interest.strip() or None,
+            )
+        except (OSError, ValueError, RuntimeError) as error:
+            messagebox.showerror("Cannot resume", str(error), parent=self.root)
+            return
+        self.research_model.status = "Running"
+        self._set_pipeline_running(True)
+        self._render_research_model()
+
+    def _pipeline_status(self) -> None:
+        if self._pipeline_running:
+            return
+        job_id = self.pipeline_job_id_var.get().strip()
+        if not job_id:
+            messagebox.showerror(
+                "Cannot load status", "Job ID cannot be empty", parent=self.root,
+            )
+            return
+        try:
+            self.pipeline_controller.start_status(self._pipeline_settings(), job_id)
+        except (OSError, ValueError, RuntimeError) as error:
+            messagebox.showerror("Cannot load status", str(error), parent=self.root)
+            return
+        self.research_model.status = "Loading status"
+        self._set_pipeline_running(True)
+        self._render_research_model()
+
+    def _pipeline_diagnostics(self) -> None:
+        if self._pipeline_running:
+            return
+        try:
+            self.pipeline_controller.start_diagnostics(self._pipeline_settings())
+        except (OSError, ValueError, RuntimeError) as error:
+            messagebox.showerror("Cannot run diagnostics", str(error), parent=self.root)
+            return
+        self.research_model.status = "Running diagnostics"
+        self._set_pipeline_running(True)
+        self._render_research_model()
+
+    def _set_pipeline_running(self, running: bool) -> None:
+        self._pipeline_running = running
+        state = "disabled" if running else "normal"
+        for widget in self._pipeline_widgets:
+            widget.configure(state=state)
+        if not running:
+            # A readonly combobox must be restored explicitly.
+            self._pipeline_widgets[0].configure(state="readonly")
+
+    def _render_research_model(self) -> None:
+        self.pipeline_job_id_var.set(self.research_model.job_id)
+        self.pipeline_stage_var.set(self.research_model.stage or "-")
+        self.pipeline_cost_var.set(self.research_model.actual_cost)
+        self.pipeline_status_var.set(self.research_model.status)
+        self.pipeline_artifact_var.set(self.research_model.artifact_dir or "-")
+        self.pipeline_log_text.configure(state="normal")
+        self.pipeline_log_text.delete("1.0", "end")
+        if self.research_model.logs:
+            self.pipeline_log_text.insert("end", "\n".join(self.research_model.logs) + "\n")
+        self.pipeline_log_text.see("end")
+        self.pipeline_log_text.configure(state="disabled")
 
     def _refresh_pdf_list(self, pdfs: list[Path] | None = None) -> None:
         if pdfs is None:
@@ -412,11 +991,19 @@ class Paper2MdApp:
             while True:
                 item = self.events.get_nowait()
                 if isinstance(item, PipelineEvent):
-                    self._handle_event(item)
+                    if self._pipeline_running:
+                        self.research_model.apply(item)
+                        self._render_research_model()
+                    else:
+                        self._handle_event(item)
                 elif isinstance(item, RunFinished):
                     self._handle_finished(item.summary)
-                else:
+                elif isinstance(item, RunFailed):
                     self._handle_worker_failure(item.error)
+                else:
+                    self.research_model.apply(item)
+                    self._set_pipeline_running(False)
+                    self._render_research_model()
         except queue.Empty:
             pass
         self.root.after(100, self._drain_queue)
@@ -517,10 +1104,10 @@ class Paper2MdApp:
             messagebox.showerror("Cannot open output folder", str(error), parent=self.root)
 
     def _on_close(self) -> None:
-        if self._is_running:
+        if self._is_running or self._pipeline_running:
             messagebox.showwarning(
-                "Conversion in progress",
-                "Wait for the current batch to finish before closing paper2md.",
+                "Work in progress",
+                "Wait for the current operation to finish before closing paper2md.",
                 parent=self.root,
             )
             return
