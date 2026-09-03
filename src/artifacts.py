@@ -94,3 +94,10 @@ class ArtifactManager:
             Path(temporary_name).unlink(missing_ok=True)
             raise
         return self.bundle.source_pdf
+
+    def adopt_source(self, source: Path | str) -> Path:
+        """Atomically promote an acquired staging PDF into this artifact bundle."""
+        source = Path(source)
+        self.create()
+        os.replace(source, self.bundle.source_pdf)
+        return self.bundle.source_pdf

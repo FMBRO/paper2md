@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import asdict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+import threading
 from types import SimpleNamespace
 
 from src.acquisition import (
@@ -61,6 +63,24 @@ class ChangingAcquirer(FakeAcquirer):
         )
 
 
+class IdentityPoorAcquirer(FakeAcquirer):
+    def __init__(self, barrier: threading.Barrier | None = None) -> None:
+        super().__init__()
+        self.barrier = barrier
+        self.artifact_roots: list[Path] = []
+
+    def acquire(self, spec: InputSpec, artifacts: ArtifactManager) -> AcquisitionResult:
+        self.calls += 1
+        self.specs.append(spec)
+        self.artifact_roots.append(artifacts.bundle.root)
+        if self.barrier is not None:
+            self.barrier.wait(timeout=2)
+        content = b"%PDF-1.4\nidentical bytes\n%%EOF"
+        return AcquisitionResult(
+            metadata=PaperMetadata(title="Identity-poor fixture", source_url=spec.source),
+            source_pdf=artifacts.write_source_pdf(content),
+            pdf_sha256=hashlib.sha256(content).hexdigest(),
+        )
 class ErrorAcquirer:
     def __init__(self, error: Exception) -> None:
         self.error = error
@@ -175,6 +195,12 @@ class FakeConverter:
         return bundle
 
 
+class FailingConverter(FakeConverter):
+    def convert(self, pdf_path: Path, artifact_dir: Path) -> ArtifactBundle:
+        self.calls += 1
+        raise RuntimeError("conversion failed")
+
+
 class FakeSummarizer:
     def __init__(self) -> None:
         self.calls = 0
@@ -199,6 +225,7 @@ class FakeSummarizer:
 class FakeNotion:
     def __init__(self) -> None:
         self.calls: list[str | None] = []
+        self.model_prompt_versions: list[str] = []
 
     def upsert(
         self, metadata: PaperMetadata, summary: PaperSummary, *,
@@ -206,6 +233,7 @@ class FakeNotion:
         processing_status: str = "Completed", model_prompt_version: str = "",
     ) -> str:
         self.calls.append(stored_page_id)
+        self.model_prompt_versions.append(model_prompt_version)
         return "notion-page-1"
 
 
@@ -290,6 +318,35 @@ def test_successful_local_pipeline_persists_every_checkpoint_and_notion_id(
     ]
 
 
+def test_pipeline_records_explicit_prompt_schema_versions_in_notion_and_manifest(
+    tmp_path: Path,
+) -> None:
+    from src.openrouter import (
+        EXTRACTION_PROMPT_SCHEMA_VERSION,
+        SYNTHESIS_PROMPT_SCHEMA_VERSION,
+    )
+
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF-1.4\nfixture\n%%EOF")
+    service, dependencies = _service(tmp_path)
+
+    job = service.ingest(InputSpec(InputKind.LOCAL_PDF, str(source)))
+
+    expected = (
+        f"{service.settings.openrouter.extraction_model}"
+        f"@{EXTRACTION_PROMPT_SCHEMA_VERSION} / "
+        f"{service.settings.openrouter.synthesis_model}"
+        f"@{SYNTHESIS_PROMPT_SCHEMA_VERSION}"
+    )
+    assert dependencies["notion"].model_prompt_versions == [expected]
+    manifest = json.loads((job.artifact_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["models"]["model_prompt_version"] == expected
+    assert manifest["models"]["prompt_schema_versions"] == {
+        "extraction": EXTRACTION_PROMPT_SCHEMA_VERSION,
+        "synthesis": SYNTHESIS_PROMPT_SCHEMA_VERSION,
+    }
+
+
 def test_mocked_remote_pipeline_uses_the_same_service_without_live_calls(
     tmp_path: Path,
 ) -> None:
@@ -304,7 +361,7 @@ def test_mocked_remote_pipeline_uses_the_same_service_without_live_calls(
     assert dependencies["notion"].calls == [None]
 
 
-def test_a_later_ingest_reuses_the_persisted_notion_page_id(tmp_path: Path) -> None:
+def test_a_later_ingest_reuses_the_completed_canonical_generation(tmp_path: Path) -> None:
     source = tmp_path / "paper.pdf"
     source.write_bytes(b"%PDF-1.4\nfixture\n%%EOF")
     service, dependencies = _service(tmp_path)
@@ -313,7 +370,105 @@ def test_a_later_ingest_reuses_the_persisted_notion_page_id(tmp_path: Path) -> N
     first = service.ingest(spec)
     second = service.ingest(spec)
 
+    assert (first.id, first.paper_id, first.artifact_dir) == (
+        second.id, second.paper_id, second.artifact_dir,
+    )
+    assert dependencies["acquirer"].calls == 2
+    assert dependencies["converter"].calls == 1
+    assert dependencies["summarizer"].calls == 1
+    assert dependencies["notion"].calls == [None]
+
+
+def test_pdf_url_spellings_with_identical_bytes_converge_after_staging(
+    tmp_path: Path,
+) -> None:
+    service, dependencies = _service(tmp_path)
+    acquirer = IdentityPoorAcquirer()
+    service.acquirer = acquirer
+
+    first = service.ingest(InputSpec(InputKind.PDF_URL, "https://one.test/download?id=1"))
+    second = service.ingest(InputSpec(InputKind.PDF_URL, "https://two.test/paper"))
+
+    assert first.id == second.id
+    assert first.artifact_dir == second.artifact_dir
+    assert dependencies["converter"].calls == 1
+    assert dependencies["notion"].calls == [None]
+    assert len(acquirer.artifact_roots) == 2
+    assert all(root.parent.name == ".staging" for root in acquirer.artifact_roots)
+    staging = service.settings.output_dir / "papers" / ".staging"
+    assert not list(staging.iterdir())
+
+
+def test_concurrent_equivalent_ingests_share_paper_lock_and_one_generation(
+    tmp_path: Path,
+) -> None:
+    service, dependencies = _service(tmp_path)
+    service.acquirer = IdentityPoorAcquirer(threading.Barrier(2))
+    specs = [
+        InputSpec(InputKind.PDF_URL, "https://one.test/download"),
+        InputSpec(InputKind.PDF_URL, "https://two.test/download"),
+    ]
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        jobs = list(executor.map(service.ingest, specs))
+
+    assert jobs[0].id == jobs[1].id
+    assert all(job.state is JobState.COMPLETED for job in jobs)
+    assert dependencies["converter"].calls == 1
+    assert dependencies["summarizer"].calls == 1
+    assert dependencies["notion"].calls == [None]
+
+
+def test_concurrent_equivalent_ingests_share_one_terminal_failure(
+    tmp_path: Path,
+) -> None:
+    service, dependencies = _service(tmp_path)
+    service.acquirer = IdentityPoorAcquirer(threading.Barrier(2))
+    converter = FailingConverter()
+    service.converter = converter
+    store = dependencies["store"]
+    assert isinstance(store, JobStore)
+    original_resolve = store.resolve_ingest
+    resolution_barrier = threading.Barrier(2)
+
+    def synchronized_resolve(*args: object, **kwargs: object):
+        result = original_resolve(*args, **kwargs)
+        resolution_barrier.wait(timeout=2)
+        return result
+
+    store.resolve_ingest = synchronized_resolve  # type: ignore[method-assign]
+    specs = [
+        InputSpec(InputKind.PDF_URL, "https://one.test/download"),
+        InputSpec(InputKind.PDF_URL, "https://two.test/download"),
+    ]
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        jobs = list(executor.map(service.ingest, specs))
+
+    assert jobs[0].id == jobs[1].id
+    assert all(job.state is JobState.FAILED for job in jobs)
+    assert all(job.error == "conversion failed" for job in jobs)
+    assert converter.calls == 1
+    assert dependencies["summarizer"].calls == 0
+    assert dependencies["notion"].calls == []
+
+
+def test_force_reprocess_creates_a_distinct_generation_only_when_requested(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF-1.4\nfixture\n%%EOF")
+    service, dependencies = _service(tmp_path)
+    spec = InputSpec(InputKind.LOCAL_PDF, str(source))
+
+    first = service.ingest(spec)
+    second = service.ingest(spec, force_reprocess=True)
+
+    assert first.id != second.id
     assert first.paper_id == second.paper_id
+    assert first.artifact_dir != second.artifact_dir
+    assert dependencies["converter"].calls == 2
+    assert dependencies["summarizer"].calls == 2
     assert dependencies["notion"].calls == [None, "notion-page-1"]
 
 
@@ -619,7 +774,41 @@ def test_resume_accepts_attachment_selection_without_any_early_llm_call(
     assert paused.error == "Multiple PDF attachments found; select one"
     assert resumed.state is JobState.COMPLETED
     assert zotero.selections == [None, "ATTACH02"]
+    expected_root = (
+        service.settings.output_dir
+        / "papers"
+        / hashlib.sha256(b"zotero:0:PARENT01").hexdigest()[:24]
+    )
+    assert resumed.artifact_dir == expected_root
     assert dependencies["summarizer"].calls == 1
+
+
+def test_unidentified_resume_reuses_a_completed_canonical_generation(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "zotero.pdf"
+    source.write_bytes(b"%PDF-1.4\nfixture\n%%EOF")
+    service, dependencies = _service(tmp_path)
+    service.zotero = AttachmentSelectingZotero(source)
+
+    paused = service.ingest(InputSpec(InputKind.ZOTERO_ITEM, "PARENT01"))
+    completed = service.ingest(
+        InputSpec(
+            InputKind.ZOTERO_ITEM,
+            "PARENT01",
+            attachment_key="ATTACH02",
+        )
+    )
+    resumed = service.resume(paused.id, attachment_key="ATTACH02")
+
+    assert completed.state is JobState.COMPLETED
+    assert resumed.state is JobState.COMPLETED
+    assert resumed.paper_id == completed.paper_id
+    assert resumed.artifact_dir == completed.artifact_dir
+    assert service.status(paused.id).state is JobState.COMPLETED
+    assert dependencies["converter"].calls == 1
+    assert dependencies["summarizer"].calls == 1
+    assert dependencies["notion"].calls == [None]
 
 
 def test_resume_without_cost_override_reuses_the_persisted_job_budget(

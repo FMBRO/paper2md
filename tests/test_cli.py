@@ -36,18 +36,21 @@ def _job(state: JobState, *, job_id: str = "job-1", error: str | None = None) ->
 class FakeCLIService:
     def __init__(self, result: JobRecord | None = None) -> None:
         self.result = result or _job(JobState.COMPLETED)
-        self.collection_args: tuple[InputSpec, float, bool] | None = None
-        self.ingest_args: tuple[InputSpec, float] | None = None
+        self.collection_args: tuple[InputSpec, float, bool, bool] | None = None
+        self.ingest_args: tuple[InputSpec, float, bool] | None = None
         self.resume_args: tuple[str, float | None, str | None, str | None] | None = None
 
-    def ingest(self, spec: InputSpec, max_cost_usd: float) -> JobRecord:
-        self.ingest_args = (spec, max_cost_usd)
+    def ingest(
+        self, spec: InputSpec, max_cost_usd: float, *, force_reprocess: bool = False,
+    ) -> JobRecord:
+        self.ingest_args = (spec, max_cost_usd, force_reprocess)
         return self.result
 
     def ingest_collection(
         self, spec: InputSpec, *, max_cost_usd: float, only_unprocessed: bool,
+        force_reprocess: bool = False,
     ) -> list[JobRecord]:
-        self.collection_args = (spec, max_cost_usd, only_unprocessed)
+        self.collection_args = (spec, max_cost_usd, only_unprocessed, force_reprocess)
         return [self.result]
 
     def resume(
@@ -83,12 +86,13 @@ def test_collection_ingest_forwards_all_overrides_and_emits_stable_json(
     assert exit_code == 0
     assert stderr.getvalue() == ""
     assert service.collection_args is not None
-    spec, cost, only_unprocessed = service.collection_args
+    spec, cost, only_unprocessed, force_reprocess = service.collection_args
     assert spec == InputSpec(
         InputKind.ZOTERO_COLLECTION, "COLLECT1", "ATTACH01", "graph learning",
     )
     assert cost == 0.30
     assert only_unprocessed is True
+    assert force_reprocess is False
     assert json.loads(stdout.getvalue()) == {
         "jobs": [{
             "artifact_dir": "C:\\artifacts\\paper",
@@ -181,6 +185,31 @@ def test_only_unprocessed_rejects_a_non_collection_instead_of_being_ignored(
     assert stdout.getvalue() == ""
     assert stderr.getvalue() == (
         "error: --only-unprocessed requires a Zotero collection\n"
+    )
+
+
+def test_ingest_force_reprocess_is_forwarded_only_when_explicit(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF-1.4\nfixture\n%%EOF")
+    service = FakeCLIService()
+
+    exit_code = main(
+        [
+            "ingest", str(source), "--config", str(_config(tmp_path)),
+            "--force-reprocess",
+        ],
+        service_factory=lambda settings: service,
+        stdout=io.StringIO(),
+        stderr=io.StringIO(),
+    )
+
+    assert exit_code == 0
+    assert service.ingest_args == (
+        InputSpec(InputKind.LOCAL_PDF, str(source.resolve())),
+        pytest.approx(0.5),
+        True,
     )
 
 

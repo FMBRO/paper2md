@@ -40,6 +40,10 @@ def build_parser() -> argparse.ArgumentParser:
     ingest.add_argument("--research-interest")
     ingest.add_argument("--attachment-key")
     ingest.add_argument("--only-unprocessed", action="store_true")
+    ingest.add_argument(
+        "--force-reprocess", action="store_true",
+        help="Create a new artifact generation even when this paper completed",
+    )
     ingest.add_argument("--max-cost-usd", type=float)
     _add_common_options(ingest)
 
@@ -119,6 +123,7 @@ def main(
                 jobs = service.ingest_collection(
                     spec, max_cost_usd=max_cost,
                     only_unprocessed=args.only_unprocessed,
+                    force_reprocess=args.force_reprocess,
                 )
                 if args.json:
                     stdout.write(json.dumps(
@@ -134,7 +139,9 @@ def main(
                 raise ValueError(
                     "--only-unprocessed requires a Zotero collection"
                 )
-            job = service.ingest(spec, max_cost)
+            job = service.ingest(
+                spec, max_cost, force_reprocess=args.force_reprocess,
+            )
         elif args.command == "resume":
             job = service.resume(
                 args.job_id,

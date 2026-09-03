@@ -1,0 +1,10 @@
+{
+  "data": {
+    "id": "generation-fixture",
+    "model": "google/gemini-3.8-flash",
+    "provider_name": "Google",
+    "tokens_prompt": 100,
+    "tokens_completion": 20,
+    "total_cost": 0.01
+  }
+}

@@ -2,21 +2,23 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from email.utils import parsedate_to_datetime
 import os
-import re
 import time
 from typing import Any, Protocol
 
 import httpx
 
 from src.config import NotionSettings
-from src.research_models import PaperMetadata, PaperSummary
+from src.research_models import (
+    PaperMetadata,
+    PaperSummary,
+    has_sufficient_japanese_narrative,
+)
 
 
 NOTION_API_BASE_URL = "https://api.notion.com/v1"
-_JAPANESE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]")
 _PROPERTY_TYPES = {
     "title": {"title"},
     "authors": {"rich_text"},
@@ -94,6 +96,11 @@ class NotionSummaryUpserter:
         self._initial_backoff_seconds = initial_backoff_seconds
         self._schema_property_types: dict[str, str] = {}
         self._schema_option_ids: dict[str, dict[str, str]] = {}
+        self._diagnostics: list[str] = []
+
+    @property
+    def diagnostics(self) -> tuple[str, ...]:
+        return tuple(self._diagnostics)
 
     @property
     def _headers(self) -> dict[str, str]:
@@ -251,7 +258,7 @@ class NotionSummaryUpserter:
         )
         if (
             summary.relevance_score is None or not 1 <= summary.relevance_score <= 5
-            or any(not value.strip() or not _JAPANESE.search(value) for value in narratives)
+            or any(not has_sufficient_japanese_narrative(value) for value in narratives)
         ):
             raise ValueError("Notion accepts only a validated Japanese PaperSummary")
         sections = [
@@ -269,10 +276,11 @@ class NotionSummaryUpserter:
     ) -> dict[str, Any]:
         names = self.settings.properties
         imported_at = self._now().isoformat()
+        published_date = self._notion_date(metadata)
         return {
             names["title"]: self._title(metadata.title),
             names["authors"]: self._rich_text(", ".join(metadata.authors)),
-            names["published_date"]: {"date": {"start": metadata.published_date} if metadata.published_date else None},
+            names["published_date"]: {"date": {"start": published_date} if published_date else None},
             names["doi"]: self._rich_text(metadata.doi),
             names["arxiv_id"]: self._rich_text(metadata.arxiv_id),
             names["source_url"]: {"url": metadata.source_url},
@@ -290,6 +298,29 @@ class NotionSummaryUpserter:
             names["imported_at"]: {"date": {"start": imported_at}},
             names["model_prompt_version"]: self._rich_text(model_prompt_version),
         }
+
+    def _notion_date(self, metadata: PaperMetadata) -> str | None:
+        value = metadata.published_date
+        valid = False
+        if value:
+            try:
+                if len(value) == 4 and value.isdigit():
+                    date(int(value), 1, 1)
+                    valid = True
+                elif len(value) == 7:
+                    date.fromisoformat(value + "-01")
+                    valid = True
+                elif len(value) == 10:
+                    date.fromisoformat(value)
+                    valid = True
+            except ValueError:
+                valid = False
+        if valid:
+            return value
+        raw = metadata.published_date_raw or value
+        if raw:
+            self._diagnostics.append(f"Omitted unparseable Zotero date: {raw}")
+        return None
 
     def _find_page(self, metadata: PaperMetadata, stored_page_id: str | None) -> str | None:
         if stored_page_id:
@@ -382,6 +413,7 @@ class NotionSummaryUpserter:
         model_prompt_version: str = "",
     ) -> str:
         """Update a uniquely identified page, or create one only when none exists."""
+        self._diagnostics.clear()
         markdown = self._validated_summary_markdown(summary)
         self.validate_schema()
         properties = self._properties(

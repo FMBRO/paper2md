@@ -45,6 +45,30 @@ def test_run_ocrmypdf_uses_force_mode_for_explicit_preprocessing(mocker, tmp_pat
     assert "--skip-text" not in args
 
 
+def test_run_ocrmypdf_uses_redo_mode_for_sparse_or_garbled_text(mocker, tmp_path: Path) -> None:
+    src_pdf = tmp_path / "in.pdf"
+    dst_pdf = tmp_path / "out.pdf"
+    fake_run = mocker.patch("src.run_ocr.run_streaming_command", return_value=0)
+
+    run_ocrmypdf(src_pdf, dst_pdf, clean=False, mode="redo")
+
+    args = fake_run.call_args.args[0]
+    assert "--redo-ocr" in args
+    assert "--skip-text" not in args
+    assert "--force-ocr" not in args
+
+
+def test_run_ocrmypdf_auto_mode_leaves_text_policy_to_ocrmypdf(mocker, tmp_path: Path) -> None:
+    fake_run = mocker.patch("src.run_ocr.run_streaming_command", return_value=0)
+
+    run_ocrmypdf(tmp_path / "in.pdf", tmp_path / "out.pdf", clean=False, mode="auto")
+
+    args = fake_run.call_args.args[0]
+    assert "--redo-ocr" not in args
+    assert "--skip-text" not in args
+    assert "--force-ocr" not in args
+
+
 def test_run_ocrmypdf_omits_flags_when_disabled(mocker, tmp_path: Path) -> None:
     src_pdf = tmp_path / "in.pdf"
     src_pdf.write_bytes(b"%PDF-1.4")

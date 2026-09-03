@@ -29,3 +29,20 @@ def test_input_spec_requires_a_nonempty_source() -> None:
 
     with pytest.raises(ValueError, match="source"):
         InputSpec(kind=InputKind.DOI, source="  ")
+
+
+def test_input_spec_centrally_normalizes_valid_zotero_keys() -> None:
+    from src.research_models import InputKind, InputSpec
+
+    item = InputSpec(
+        kind=InputKind.ZOTERO_ITEM,
+        source="abcd1234",
+        attachment_key="pdf00001",
+    )
+    collection = InputSpec(
+        kind=InputKind.ZOTERO_COLLECTION,
+        source="wxyz5678",
+    )
+
+    assert (item.source, item.attachment_key) == ("ABCD1234", "PDF00001")
+    assert collection.source == "WXYZ5678"

@@ -77,7 +77,7 @@ def test_converter_uses_ocr_only_for_empty_pages_then_gates_post_ocr_text(
     assert quality["passed"] is True
 
 
-def test_converter_recovers_sparse_nonempty_text_with_skip_text_ocr(tmp_path: Path) -> None:
+def test_converter_recovers_sparse_nonempty_text_with_redo_ocr(tmp_path: Path) -> None:
     source = tmp_path / "sparse.pdf"
     doc = fitz.open()
     doc.new_page().insert_text((72, 72), "tiny")
@@ -104,7 +104,7 @@ def test_converter_recovers_sparse_nonempty_text_with_skip_text_ocr(tmp_path: Pa
 
     Converter(marker_runner=fake_marker, ocr_runner=fake_ocr).convert(source, tmp_path / "artifact")
 
-    assert ocr_kwargs["mode"] == "skip_text"
+    assert ocr_kwargs["mode"] == "redo"
 
 
 def test_converter_uses_force_ocr_mode_when_explicitly_requested(text_pdf: Path, tmp_path: Path) -> None:
@@ -160,4 +160,74 @@ def test_converter_recovers_garbled_nonempty_source_text_with_automatic_ocr(
     Converter(marker_runner=fake_marker, ocr_runner=fake_ocr).convert(text_pdf, tmp_path / "artifact")
 
     assert inspect_pages.call_count == 2
+    assert ocr_kwargs["mode"] == "redo"
+
+
+def test_converter_uses_skip_text_only_for_truly_textless_pages_in_mixed_pdf(
+    mocker, text_pdf: Path, tmp_path: Path,
+) -> None:
+    source_pages = [
+        {"page": 1, "character_count": 80, "has_text": True, "has_garbled_text": False},
+        {"page": 2, "character_count": 0, "has_text": False, "has_garbled_text": False},
+    ]
+    recovered_pages = [
+        {"page": 1, "character_count": 80, "has_text": True, "has_garbled_text": False},
+        {"page": 2, "character_count": 80, "has_text": True, "has_garbled_text": False},
+    ]
+    mocker.patch("src.converter.inspect_page_text", side_effect=[source_pages, recovered_pages])
+    ocr_kwargs: dict = {}
+
+    def fake_ocr(_src: Path, dst: Path, **kwargs) -> Path:
+        ocr_kwargs.update(kwargs)
+        dst.write_bytes(text_pdf.read_bytes())
+        return dst
+
+    def fake_marker(_pdf: Path, output_dir: Path) -> Path:
+        output_dir.mkdir(parents=True)
+        markdown = output_dir / "paper.md"
+        markdown.write_text("# Paper\n", encoding="utf-8")
+        (output_dir / "document.json").write_text(json.dumps({"pages": [
+            {"page": 1, "blocks": [{"type": "SectionHeader", "text": "Paper"}]},
+            {"page": 2, "blocks": [{"type": "Text", "text": "Recovered body text."}]},
+        ]}), encoding="utf-8")
+        return markdown
+
+    Converter(marker_runner=fake_marker, ocr_runner=fake_ocr).convert(
+        text_pdf, tmp_path / "artifact",
+    )
+
     assert ocr_kwargs["mode"] == "skip_text"
+
+
+def test_converter_uses_auto_ocr_for_a_fully_textless_document(
+    mocker, text_pdf: Path, tmp_path: Path,
+) -> None:
+    empty_pages = [
+        {"page": 1, "character_count": 0, "has_text": False, "has_garbled_text": False},
+    ]
+    recovered_pages = [
+        {"page": 1, "character_count": 80, "has_text": True, "has_garbled_text": False},
+    ]
+    mocker.patch("src.converter.inspect_page_text", side_effect=[empty_pages, recovered_pages])
+    ocr_kwargs: dict = {}
+
+    def fake_ocr(_src: Path, dst: Path, **kwargs) -> Path:
+        ocr_kwargs.update(kwargs)
+        dst.write_bytes(text_pdf.read_bytes())
+        return dst
+
+    def fake_marker(_pdf: Path, output_dir: Path) -> Path:
+        output_dir.mkdir(parents=True)
+        markdown = output_dir / "paper.md"
+        markdown.write_text("# Paper\n", encoding="utf-8")
+        (output_dir / "document.json").write_text(json.dumps({"pages": [{
+            "page": 1,
+            "blocks": [{"type": "Text", "text": "Recovered body text."}],
+        }]}), encoding="utf-8")
+        return markdown
+
+    Converter(marker_runner=fake_marker, ocr_runner=fake_ocr).convert(
+        text_pdf, tmp_path / "artifact",
+    )
+
+    assert ocr_kwargs["mode"] == "auto"

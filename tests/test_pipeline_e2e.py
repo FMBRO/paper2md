@@ -157,7 +157,14 @@ def _service(tmp_path: Path, *, acquirer, zotero):
 
 
 def _assert_one_complete_artifact_set(output_dir: Path) -> Path:
-    roots = [path for path in (output_dir / "papers").iterdir() if path.is_dir()]
+    papers_dir = output_dir / "papers"
+    staging_dir = papers_dir / ".staging"
+    if staging_dir.exists():
+        assert not list(staging_dir.iterdir())
+    roots = [
+        path for path in papers_dir.iterdir()
+        if path.is_dir() and path.name != ".staging"
+    ]
     assert len(roots) == 1
     root = roots[0]
     assert {

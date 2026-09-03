@@ -123,6 +123,7 @@ Run commands from the project root:
 uv run python -m src.cli ingest 2401.01234
 uv run python -m src.cli ingest 10.1000/example --research-interest "causal ML"
 uv run python -m src.cli ingest C:\papers\paper.pdf --max-cost-usd 0.35
+uv run python -m src.cli ingest C:\papers\paper.pdf --force-reprocess
 uv run python -m src.cli ingest zotero://select/library/items/ABCD1234
 uv run python -m src.cli ingest collection:ABCD1234 --only-unprocessed
 uv run python -m src.cli status JOB_ID
@@ -132,6 +133,8 @@ uv run python -m src.cli resume JOB_ID --max-cost-usd 0.75
 
 Add `--json` for machine-readable output and `--config PATH` to use another
 configuration file. `--only-unprocessed` is valid only for a Zotero collection.
+Completed canonical papers are reused by default; `--force-reprocess` is the
+explicit opt-in for creating a new artifact generation.
 Exit code 2 means user input or configuration is needed; exit code 3 means the
 budget was exceeded; other failures return 1.
 

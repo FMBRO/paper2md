@@ -1,0 +1,13 @@
+{
+  "authorize": {
+    "key": "fixture-write-key",
+    "remember": true
+  },
+  "upload": {
+    "url": "http://localhost:23119/api/local/uploads/upload-1",
+    "uploadKey": "upload-1",
+    "contentType": "application/pdf",
+    "prefix": "",
+    "suffix": ""
+  }
+}

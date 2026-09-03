@@ -13,6 +13,7 @@ from src.gui import (
     DiagnosticsFinished,
     GuiOptions,
     PipelineGuiOptions,
+    PipelineRunFailed,
     PipelineRunController,
     PipelineRunFinished,
     PipelineStatusFinished,
@@ -450,6 +451,16 @@ def test_research_view_model_logs_stage_events_without_messages() -> None:
     model.apply(PipelineEvent(kind="stage_changed", stage="quality_check"))
 
     assert model.logs == ["[quality_check] Started"]
+
+
+def test_research_view_model_preserves_typed_job_id_when_resume_or_status_fails() -> None:
+    model = ResearchViewModel()
+
+    model.begin_job_operation("user-entered-job", status="Loading status")
+    model.apply(PipelineRunFailed("Unknown job"))
+
+    assert model.job_id == "user-entered-job"
+    assert model.status == "Failed: Unknown job"
 
 
 def test_concurrent_controllers_keep_identical_event_types_source_routed(

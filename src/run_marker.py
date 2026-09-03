@@ -5,6 +5,7 @@ import shutil
 import tempfile
 from pathlib import Path
 
+from src.document_normalizer import load_marker_document, materialize_marker_markdown
 from src.subprocess_utils import OutputCallback, run_streaming_command
 
 
@@ -39,7 +40,10 @@ def run_marker(
         shutil.copy2(input_pdf, short_input)
 
         returncode = run_streaming_command(
-            ["marker_single", str(short_input), "--output_dir", str(tmpdir)],
+            [
+                "marker_single", str(short_input), "--output_dir", str(tmpdir),
+                "--output_format", "json",
+            ],
             on_output,
         )
         if returncode != 0:
@@ -47,10 +51,22 @@ def run_marker(
                 f"marker_single failed (exit {returncode}) — see output above"
             )
 
-        candidates = sorted(tmpdir.rglob("*.md"))
-        if not candidates:
-            raise MarkerError(f"marker_single produced no .md under {tmpdir}")
-        produced_md = candidates[0]
+        produced_dir = tmpdir / _SHORT_STEM
+        marker_document = load_marker_document(produced_dir)
+        if marker_document is not None:
+            produced_md = produced_dir / f"{_SHORT_STEM}.md"
+            produced_md.write_text(
+                materialize_marker_markdown(marker_document), encoding="utf-8",
+            )
+        else:
+            candidates = sorted(produced_dir.glob(f"{_SHORT_STEM}.md"))
+            if not candidates:
+                candidates = sorted(tmpdir.rglob("*.md"))
+            if not candidates:
+                raise MarkerError(
+                    f"marker_single produced no supported renderer artifact under {tmpdir}"
+                )
+            produced_md = candidates[0]
 
         for item in produced_md.parent.iterdir():
             dst = output_dir / item.name

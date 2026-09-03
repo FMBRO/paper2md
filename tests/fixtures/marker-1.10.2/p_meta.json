@@ -1,0 +1,20 @@
+{
+  "table_of_contents": [
+    {"title": "Introduction", "heading_level": 2, "page_id": 0},
+    {"title": "Results", "heading_level": 3, "page_id": 1}
+  ],
+  "page_stats": [
+    {
+      "page_id": 0,
+      "text_extraction_method": "pdftext",
+      "block_counts": [["SectionHeader", 1], ["Text", 2]],
+      "block_metadata": {}
+    },
+    {
+      "page_id": 1,
+      "text_extraction_method": "pdftext",
+      "block_counts": [["SectionHeader", 1], ["Table", 1], ["Equation", 1], ["FigureGroup", 1]],
+      "block_metadata": {}
+    }
+  ]
+}

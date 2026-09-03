@@ -12,14 +12,24 @@ def test_run_marker_invokes_cli_with_tempdir_and_flattens(mocker, tmp_path: Path
     def fake_run(args, _on_output=None):
         # Wrapper copies the input to a short name inside tempdir and passes
         # that short path to marker_single. Marker derives the stem from the
-        # input filename, so it writes {tmpdir}/{short_stem}/{short_stem}.md
-        # plus a sibling images/ directory.
+        # input filename, so it writes the explicit JSON renderer artifacts.
         input_path = Path(args[1])
+        assert args[args.index("--output_format") + 1] == "json"
         tmpdir = Path(args[args.index("--output_dir") + 1])
         short_stem = input_path.stem
         produced = tmpdir / short_stem
         produced.mkdir(parents=True)
-        (produced / f"{short_stem}.md").write_text("# Paper\n")
+        (produced / f"{short_stem}.json").write_text(
+            '{"children":[{"id":"/page/0/Page/0","block_type":"Page",'
+            '"html":"","bbox":[0,0,10,10],"polygon":[],"children":['
+            '{"id":"/page/0/SectionHeader/0","block_type":"SectionHeader",'
+            '"html":"<h1>Paper</h1>","bbox":[0,0,10,2],"polygon":[],"children":null}]}],'
+            '"block_type":"Document"}',
+            encoding="utf-8",
+        )
+        (produced / f"{short_stem}_meta.json").write_text(
+            '{"page_stats":[{"page_id":0}]}', encoding="utf-8",
+        )
         images = produced / "images"
         images.mkdir()
         (images / "fig.png").write_bytes(b"PNG")
@@ -32,6 +42,9 @@ def test_run_marker_invokes_cli_with_tempdir_and_flattens(mocker, tmp_path: Path
     assert md_path.parent == out_dir
     assert md_path.suffix == ".md"
     assert md_path.exists()
+    assert md_path.read_text(encoding="utf-8") == "<!-- page: 1 -->\n\n# Paper\n"
+    assert (out_dir / "p.json").exists()
+    assert (out_dir / "p_meta.json").exists()
     assert (out_dir / "images" / "fig.png").exists()
 
 
@@ -68,7 +81,7 @@ def test_run_marker_renames_input_to_short_name_to_avoid_max_path(mocker, tmp_pa
     assert md_path.exists()
 
 
-def test_run_marker_raises_when_no_markdown_produced(mocker, tmp_path: Path) -> None:
+def test_run_marker_raises_when_no_known_renderer_artifact_is_produced(mocker, tmp_path: Path) -> None:
     src_pdf = tmp_path / "paper.pdf"
     src_pdf.write_bytes(b"%PDF-1.4")
     mocker.patch("src.run_marker.run_streaming_command", return_value=0)

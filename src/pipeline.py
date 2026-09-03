@@ -5,7 +5,10 @@ from dataclasses import asdict
 import hashlib
 import json
 from pathlib import Path
+import tempfile
+import time
 from typing import Any, Callable
+import uuid
 
 import httpx
 
@@ -21,11 +24,13 @@ from src.notion import (
 )
 from src.openrouter import (
     BudgetExceededError,
+    EXTRACTION_PROMPT_SCHEMA_VERSION,
     InputLimitExceededError,
     OpenRouterConfigurationError,
     OpenRouterSummarizer,
     PricingUnavailableError,
     PrivacyRequirementsError,
+    SYNTHESIS_PROMPT_SCHEMA_VERSION,
     UnresolvedUsageError,
 )
 from src.pipeline_events import PipelineEvent
@@ -44,6 +49,13 @@ from src.zotero import ZoteroClient, ZoteroInputError, ZoteroResolution
 
 class NeedsInputError(RuntimeError):
     """A known user action is required before the job can continue."""
+
+
+def _model_prompt_version(settings: Settings) -> str:
+    return (
+        f"{settings.openrouter.extraction_model}@{EXTRACTION_PROMPT_SCHEMA_VERSION} / "
+        f"{settings.openrouter.synthesis_model}@{SYNTHESIS_PROMPT_SCHEMA_VERSION}"
+    )
 
 
 def _metadata_payload(metadata: PaperMetadata) -> dict[str, Any]:
@@ -82,7 +94,9 @@ class PipelineService:
         self.settings = settings
         self.store = store or JobStore(settings.state_path)
         self.acquirer = acquirer or DocumentAcquirer()
-        self.zotero = zotero or ZoteroClient(settings.zotero)
+        self.zotero = zotero or ZoteroClient(
+            settings.zotero, operation_store=self.store,
+        )
         self.converter = converter or Converter(
             enable_ocr=settings.enable_ocr,
             force_ocr=settings.force_ocr,
@@ -104,15 +118,85 @@ class PipelineService:
             )
         return self._notion
 
-    def ingest(self, spec: InputSpec, max_cost_usd: float = 0.50) -> JobRecord:
+    def ingest(
+        self,
+        spec: InputSpec,
+        max_cost_usd: float = 0.50,
+        *,
+        force_reprocess: bool = False,
+    ) -> JobRecord:
         if max_cost_usd < 0:
             raise ValueError("max_cost_usd must not be negative")
-        artifact_dir = self._artifact_manager(spec).bundle.root
-        job = self.store.create_job(
-            spec, artifact_dir=artifact_dir, max_cost_usd=max_cost_usd,
-        )
-        self._emit(job.id, JobState.QUEUED)
-        return self._run(job.id, max_cost_usd=max_cost_usd)
+        staging_parent = self.settings.output_dir / "papers" / ".staging"
+        staging_parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix="ingest-", dir=staging_parent,
+        ) as staging_name:
+            staging_root = Path(staging_name)
+            staging_manager = ArtifactManager(
+                staging_root.parent, staging_root.name,
+            )
+            staging_job = JobRecord(
+                id="staging",
+                paper_id=None,
+                state=JobState.QUEUED,
+                input_spec=spec,
+                artifact_dir=staging_root,
+                max_cost_usd=max_cost_usd,
+            )
+            try:
+                acquisition, acquired_zotero = self._acquire(
+                    staging_job, staging_manager,
+                )
+                if (
+                    acquisition.state is JobState.NEEDS_INPUT
+                    or acquisition.source_pdf is None
+                    or acquisition.pdf_sha256 is None
+                ):
+                    raise NeedsInputError("A readable PDF is required to continue")
+            except (NeedsInputError, AcquisitionInputError, ZoteroInputError) as error:
+                return self._create_stopped_ingest(
+                    spec, max_cost_usd, JobState.NEEDS_INPUT, error,
+                )
+            except Exception as error:
+                return self._create_stopped_ingest(
+                    spec, max_cost_usd, JobState.FAILED, error,
+                )
+            identity = acquisition.metadata.canonical_identity(
+                acquisition.pdf_sha256,
+            )
+            if identity is None:
+                return self._create_stopped_ingest(
+                    spec,
+                    max_cost_usd,
+                    JobState.FAILED,
+                    ValueError("A canonical paper identity is required"),
+                )
+            digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+            canonical_root = self.settings.output_dir / "papers" / digest[:24]
+            job, reused = self.store.resolve_ingest(
+                spec,
+                acquisition.metadata,
+                acquisition.pdf_sha256,
+                canonical_root,
+                max_cost_usd=max_cost_usd,
+                force_reprocess=force_reprocess,
+            )
+            if not reused:
+                self._emit(job.id, JobState.QUEUED)
+            if job.state is JobState.COMPLETED:
+                return job
+            if job.state in {
+                JobState.NEEDS_INPUT, JobState.BUDGET_EXCEEDED, JobState.FAILED,
+            }:
+                if max_cost_usd > job.max_cost_usd:
+                    job = self.store.update_job_budget(job.id, max_cost_usd)
+                job = self.store.transition(job.id, JobState.QUEUED)
+            return self._run(
+                job.id,
+                max_cost_usd=job.max_cost_usd,
+                staged_acquisition=(acquisition, acquired_zotero),
+            )
 
     def ingest_collection(
         self,
@@ -120,6 +204,7 @@ class PipelineService:
         *,
         max_cost_usd: float = 0.50,
         only_unprocessed: bool = False,
+        force_reprocess: bool = False,
     ) -> list[JobRecord]:
         if spec.kind is not InputKind.ZOTERO_COLLECTION:
             raise ValueError("ingest_collection requires a Zotero collection input")
@@ -135,7 +220,66 @@ class PipelineService:
                 if self.store.has_completed_job(identity):
                     continue
             unique_specs.append(item_spec)
-        return [self.ingest(item, max_cost_usd) for item in unique_specs]
+        return [
+            self.ingest(
+                item, max_cost_usd, force_reprocess=force_reprocess,
+            )
+            for item in unique_specs
+        ]
+
+    def _create_stopped_ingest(
+        self,
+        spec: InputSpec,
+        max_cost_usd: float,
+        state: JobState,
+        error: Exception,
+    ) -> JobRecord:
+        job = self.store.create_job(spec, max_cost_usd=max_cost_usd)
+        self._emit(job.id, JobState.QUEUED)
+        return self._stop(job.id, state, error)
+
+    def _stage_unidentified_resume(self, job: JobRecord) -> JobRecord:
+        staging_parent = self.settings.output_dir / "papers" / ".staging"
+        staging_parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix="resume-", dir=staging_parent,
+        ) as staging_name:
+            staging_root = Path(staging_name)
+            manager = ArtifactManager(staging_root.parent, staging_root.name)
+            try:
+                acquisition, acquired_zotero = self._acquire(job, manager)
+                if (
+                    acquisition.state is JobState.NEEDS_INPUT
+                    or acquisition.source_pdf is None
+                    or acquisition.pdf_sha256 is None
+                ):
+                    raise NeedsInputError("A readable PDF is required to continue")
+            except (NeedsInputError, AcquisitionInputError, ZoteroInputError) as error:
+                return self._stop(job.id, JobState.NEEDS_INPUT, error)
+            except Exception as error:
+                return self._stop(job.id, JobState.FAILED, error)
+            identity = acquisition.metadata.canonical_identity(
+                acquisition.pdf_sha256,
+            )
+            if identity is None:
+                return self._stop(
+                    job.id,
+                    JobState.FAILED,
+                    ValueError("A canonical paper identity is required"),
+                )
+            digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+            canonical_root = self.settings.output_dir / "papers" / digest[:24]
+            job = self.store.resolve_existing_ingest(
+                job.id,
+                acquisition.metadata,
+                acquisition.pdf_sha256,
+                canonical_root,
+            )
+            return self._run(
+                job.id,
+                max_cost_usd=job.max_cost_usd,
+                staged_acquisition=(acquisition, acquired_zotero),
+            )
 
     def resume(
         self,
@@ -180,6 +324,8 @@ class PipelineService:
             JobState.NEEDS_INPUT, JobState.BUDGET_EXCEEDED, JobState.FAILED,
         }:
             job = self.store.transition(job_id, JobState.QUEUED)
+        if job.paper_id is None:
+            return self._stage_unidentified_resume(job)
         return self._run(
             job_id,
             max_cost_usd=job.max_cost_usd,
@@ -225,7 +371,65 @@ class PipelineService:
         self._emit(job_id, state, str(error))
         return job
 
-    def _run(self, job_id: str, *, max_cost_usd: float) -> JobRecord:
+    def _run(
+        self,
+        job_id: str,
+        *,
+        max_cost_usd: float,
+        staged_acquisition: tuple[
+            AcquisitionResult, ZoteroResolution | None
+        ] | None = None,
+    ) -> JobRecord:
+        job = self.store.get_job(job_id)
+        if job.state is JobState.COMPLETED:
+            return job
+        if job.paper_id is None:
+            return self._run_unlocked(
+                job_id,
+                max_cost_usd=max_cost_usd,
+                staged_acquisition=staged_acquisition,
+            )
+        settled_states = {
+            JobState.COMPLETED,
+            JobState.NEEDS_INPUT,
+            JobState.BUDGET_EXCEEDED,
+            JobState.FAILED,
+        }
+        owner_token = str(uuid.uuid4())
+        deadline = time.monotonic() + 30.0
+        while not self.store.claim_paper_processing(
+            job.paper_id,
+            owner_token,
+            now=time.time(),
+            lease_seconds=3600.0,
+        ):
+            current = self.store.get_job(job_id)
+            if current.state in settled_states:
+                return current
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Timed out waiting for canonical paper processing lock")
+            time.sleep(0.01)
+        try:
+            current = self.store.get_job(job_id)
+            if current.state in settled_states:
+                return current
+            return self._run_unlocked(
+                job_id,
+                max_cost_usd=max_cost_usd,
+                staged_acquisition=staged_acquisition,
+            )
+        finally:
+            self.store.release_paper_processing(job.paper_id, owner_token)
+
+    def _run_unlocked(
+        self,
+        job_id: str,
+        *,
+        max_cost_usd: float,
+        staged_acquisition: tuple[
+            AcquisitionResult, ZoteroResolution | None
+        ] | None = None,
+    ) -> JobRecord:
         try:
             job = self.store.get_job(job_id)
             manager = ArtifactManager(
@@ -238,13 +442,35 @@ class PipelineService:
                 job_id, JobState.ACQUIRING,
             )
             acquisition = self._restored_acquisition(acquisition_checkpoint)
+            fresh_acquisition = acquisition is None
             acquired_zotero: ZoteroResolution | None = None
             if acquisition is not None and job.input_spec.kind is InputKind.ZOTERO_ITEM:
                 acquired_zotero = self._zotero_from_acquisition_checkpoint(
                     acquisition_checkpoint, acquisition,
                 )
-            if acquisition is None:
-                acquisition, acquired_zotero = self._acquire(job, manager)
+            if fresh_acquisition:
+                if staged_acquisition is not None:
+                    staged, staged_zotero = staged_acquisition
+                    if staged.source_pdf is None:
+                        raise NeedsInputError("A readable PDF is required to continue")
+                    promoted_source = manager.adopt_source(staged.source_pdf)
+                    acquisition = AcquisitionResult(
+                        staged.metadata,
+                        promoted_source,
+                        staged.pdf_sha256,
+                        staged.state,
+                    )
+                    if staged_zotero is not None:
+                        acquired_zotero = ZoteroResolution(
+                            staged_zotero.metadata,
+                            promoted_source,
+                            staged_zotero.parent_key,
+                            staged_zotero.attachment_key,
+                            staged_zotero.state,
+                            staged_zotero.diagnostic,
+                        )
+                else:
+                    acquisition, acquired_zotero = self._acquire(job, manager)
                 metadata = acquisition.metadata
                 source_pdf = acquisition.source_pdf
                 if acquisition.state is JobState.NEEDS_INPUT or source_pdf is None:
@@ -406,10 +632,7 @@ class PipelineService:
                 stored_page_id = self.store.get_notion_page_id(paper_id)
                 page_id = self.notion.upsert(
                     metadata, summary, stored_page_id=stored_page_id,
-                    model_prompt_version=(
-                        f"{self.settings.openrouter.extraction_model} / "
-                        f"{self.settings.openrouter.synthesis_model}"
-                    ),
+                    model_prompt_version=_model_prompt_version(self.settings),
                 )
                 self.store.complete_notion_sync(
                     job_id, paper_id, page_id, {"page_id": page_id},
@@ -476,10 +699,7 @@ class PipelineService:
         notion_page_id: str,
         zotero_attachment_key: str | None,
     ) -> None:
-        model_prompt_version = (
-            f"{self.settings.openrouter.extraction_model} / "
-            f"{self.settings.openrouter.synthesis_model}"
-        )
+        model_prompt_version = _model_prompt_version(self.settings)
         artifact_paths = {
             path.relative_to(bundle.root).as_posix(): path
             for path in sorted(bundle.root.rglob("*"))
@@ -503,6 +723,10 @@ class PipelineService:
                 "extraction": self.settings.openrouter.extraction_model,
                 "synthesis": self.settings.openrouter.synthesis_model,
                 "model_prompt_version": model_prompt_version,
+                "prompt_schema_versions": {
+                    "extraction": EXTRACTION_PROMPT_SCHEMA_VERSION,
+                    "synthesis": SYNTHESIS_PROMPT_SCHEMA_VERSION,
+                },
             },
             "external_ids": {
                 "doi": metadata.doi,

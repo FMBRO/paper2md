@@ -161,6 +161,58 @@ def test_create_payload_maps_properties_and_sends_only_japanese_summary_markdown
     assert b"notion-secret" not in b"".join(request.content for request in requests)
 
 
+def test_notion_rejects_mostly_english_narrative_with_one_japanese_character(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary = _summary()
+    summary.background = "This field is almost completely English prose with one character 結"
+    upserter = _upserter(lambda _: pytest.fail("no HTTP"), monkeypatch)
+
+    with pytest.raises(ValueError, match="Japanese"):
+        upserter._validated_summary_markdown(summary)
+
+
+def test_notion_accepts_japanese_narrative_with_technical_english_terms(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary = _summary()
+    summary.background = "本研究ではTransformerとOpenAI APIを用いて検索精度を改善する。"
+    upserter = _upserter(lambda _: pytest.fail("no HTTP"), monkeypatch)
+
+    assert "Transformer" in upserter._validated_summary_markdown(summary)
+
+
+def test_notion_omits_unparseable_zotero_date_and_exposes_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "GET":
+            return httpx.Response(200, json=_schema())
+        if request.url.path.endswith("/query"):
+            return httpx.Response(200, json={"results": []})
+        return httpx.Response(200, json={"id": "created-page"})
+
+    metadata = _metadata()
+    metadata.published_date = "0000"
+    metadata.published_date_raw = "circa Spring-ish 2024"
+    upserter = _upserter(handler, monkeypatch)
+
+    upserter.upsert(metadata, _summary(), model_prompt_version="v1")
+
+    created = next(
+        request for request in requests
+        if request.method == "POST" and request.url.path == "/v1/pages"
+    )
+    payload = json.loads(created.content)
+    assert payload["properties"]["Published Date"] == {"date": None}
+    assert upserter.diagnostics == (
+        "Omitted unparseable Zotero date: circa Spring-ish 2024",
+    )
+
+
 def test_stored_page_id_takes_precedence_and_updates_properties_and_markdown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

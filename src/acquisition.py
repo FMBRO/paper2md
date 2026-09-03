@@ -114,7 +114,7 @@ def parse_input(source: str, *, attachment_key: str | None = None,
         return InputSpec(InputKind.DOI, doi, attachment_key, research_interest)
 
     parsed = urlparse(value)
-    if parsed.scheme in {"http", "https"} and parsed.path.lower().endswith(".pdf"):
+    if parsed.scheme in {"http", "https"}:
         return InputSpec(InputKind.PDF_URL, value, attachment_key, research_interest)
     if _ZOTERO_KEY.fullmatch(value):
         return InputSpec(InputKind.ZOTERO_ITEM, value.upper(), attachment_key, research_interest)
@@ -137,7 +137,7 @@ class DocumentAcquirer:
             except OSError as exc:
                 raise AcquisitionInputError(f"Local PDF is not readable: {source}") from exc
             self._validate_pdf(content, str(source))
-            source_pdf = artifacts.copy_source(source)
+            source_pdf = artifacts.write_source_pdf(content)
             return self._result(PaperMetadata(source_url=source.resolve().as_uri()), source_pdf, content)
         if spec.kind is InputKind.PDF_URL:
             content = self._get_pdf(spec.source)

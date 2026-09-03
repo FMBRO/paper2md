@@ -61,6 +61,8 @@ class JobStore:
                     pricing_json TEXT NOT NULL DEFAULT '{}',
                     cost_usd REAL NOT NULL, cost_resolved INTEGER NOT NULL DEFAULT 1,
                     validated INTEGER NOT NULL DEFAULT 1,
+                    dispatch_state TEXT NOT NULL DEFAULT 'settled',
+                    authorized_amount_usd REAL NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL, FOREIGN KEY(job_id) REFERENCES jobs(id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_jobs_paper_state ON jobs(paper_id, state);
@@ -82,6 +84,36 @@ class JobStore:
                     completed_at TEXT NOT NULL,
                     UNIQUE(job_id, stage),
                     FOREIGN KEY(job_id) REFERENCES jobs(id)
+                );
+                CREATE TABLE IF NOT EXISTS zotero_operations (
+                    id TEXT PRIMARY KEY,
+                    canonical_identity TEXT NOT NULL,
+                    source_sha256 TEXT NOT NULL,
+                    parent_key TEXT NOT NULL,
+                    attachment_key TEXT NOT NULL,
+                    parent_write_token TEXT NOT NULL,
+                    attachment_write_token TEXT NOT NULL,
+                    upload_write_token TEXT NOT NULL,
+                    registration_write_token TEXT NOT NULL,
+                    step TEXT NOT NULL,
+                    state_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(canonical_identity, source_sha256)
+                );
+                CREATE TABLE IF NOT EXISTS zotero_operation_events (
+                    id INTEGER PRIMARY KEY,
+                    operation_id TEXT NOT NULL,
+                    step TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(operation_id) REFERENCES zotero_operations(id)
+                );
+                CREATE TABLE IF NOT EXISTS paper_processing_locks (
+                    paper_id INTEGER PRIMARY KEY,
+                    owner_token TEXT NOT NULL,
+                    lease_expires_at REAL NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(paper_id) REFERENCES papers(id)
                 );
             """)
             self._migrate_papers(connection)
@@ -116,6 +148,8 @@ class JobStore:
             "pricing_json": "TEXT NOT NULL DEFAULT '{}'",
             "cost_resolved": "INTEGER NOT NULL DEFAULT 1",
             "validated": "INTEGER NOT NULL DEFAULT 1",
+            "dispatch_state": "TEXT NOT NULL DEFAULT 'settled'",
+            "authorized_amount_usd": "REAL NOT NULL DEFAULT 0",
         }
         for name, declaration in additions.items():
             if name not in columns:
@@ -383,43 +417,210 @@ class JobStore:
         identity = metadata.canonical_identity(pdf_sha256)
         if identity is None:
             raise ValueError("A paper needs DOI, arXiv ID, Zotero identity, or PDF SHA-256")
-        now = self._now()
-        payload = json.dumps({"title": metadata.title, "authors": metadata.authors,
-                              "published_date": metadata.published_date, "doi": metadata.doi,
-                              "arxiv_id": metadata.arxiv_id, "source_url": metadata.source_url,
-                              "zotero_library_id": metadata.zotero_library_id,
-                              "zotero_item_key": metadata.zotero_item_key})
         with self._connect() as connection:
-            rows = self._find_matching_papers(connection, metadata, pdf_sha256, identity)
-            if not rows:
-                cursor = connection.execute("""INSERT INTO papers
-                    (canonical_identity, doi, arxiv_id, zotero_library_id, zotero_item_key, pdf_sha256, metadata_json, artifact_dir, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (identity, metadata.doi, metadata.arxiv_id, metadata.zotero_library_id,
-                     metadata.zotero_item_key, pdf_sha256, payload,
-                     str(artifact_dir) if artifact_dir else None, now, now))
-                return int(cursor.lastrowid)
+            connection.execute("BEGIN IMMEDIATE")
+            return self._upsert_paper_in_transaction(
+                connection, metadata, pdf_sha256, identity, artifact_dir,
+            )
 
-            primary, *duplicates = rows
-            doi = self._first_value(rows, "doi") or metadata.doi
-            arxiv_id = self._first_value(rows, "arxiv_id") or metadata.arxiv_id
-            zotero_library_id = self._first_value(rows, "zotero_library_id") or metadata.zotero_library_id
-            zotero_item_key = self._first_value(rows, "zotero_item_key") or metadata.zotero_item_key
-            sha256 = self._first_value(rows, "pdf_sha256") or pdf_sha256
-            notion_page_id = self._first_value(rows, "notion_page_id")
-            canonical_identity = PaperMetadata(
-                doi=doi, arxiv_id=arxiv_id, zotero_library_id=zotero_library_id,
-                zotero_item_key=zotero_item_key,
-            ).canonical_identity(sha256)
-            for duplicate in duplicates:
-                connection.execute("UPDATE jobs SET paper_id = ? WHERE paper_id = ?", (primary["id"], duplicate["id"]))
-                connection.execute("DELETE FROM papers WHERE id = ?", (duplicate["id"],))
-            connection.execute("""UPDATE papers SET canonical_identity = ?, doi = ?, arxiv_id = ?,
-                zotero_library_id = ?, zotero_item_key = ?, pdf_sha256 = ?, metadata_json = ?,
-                notion_page_id = ?, artifact_dir = COALESCE(?, artifact_dir), updated_at = ? WHERE id = ?""",
-                (canonical_identity, doi, arxiv_id, zotero_library_id, zotero_item_key, sha256,
-                 payload, notion_page_id, str(artifact_dir) if artifact_dir else None, now, primary["id"]))
-            return int(primary["id"])
+    def _upsert_paper_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        metadata: PaperMetadata,
+        pdf_sha256: str | None,
+        identity: str,
+        artifact_dir: Path | str | None,
+    ) -> int:
+        now = self._now()
+        payload = json.dumps({
+            "title": metadata.title,
+            "authors": metadata.authors,
+            "published_date": metadata.published_date,
+            "published_date_raw": metadata.published_date_raw,
+            "doi": metadata.doi,
+            "arxiv_id": metadata.arxiv_id,
+            "source_url": metadata.source_url,
+            "zotero_library_id": metadata.zotero_library_id,
+            "zotero_item_key": metadata.zotero_item_key,
+        })
+        rows = self._find_matching_papers(
+            connection, metadata, pdf_sha256, identity,
+        )
+        if not rows:
+            cursor = connection.execute(
+                """INSERT INTO papers
+                   (canonical_identity, doi, arxiv_id, zotero_library_id,
+                    zotero_item_key, pdf_sha256, metadata_json, artifact_dir,
+                    created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    identity, metadata.doi, metadata.arxiv_id,
+                    metadata.zotero_library_id, metadata.zotero_item_key,
+                    pdf_sha256, payload,
+                    str(artifact_dir) if artifact_dir else None, now, now,
+                ),
+            )
+            return int(cursor.lastrowid)
+
+        primary, *duplicates = rows
+        doi = self._first_value(rows, "doi") or metadata.doi
+        arxiv_id = self._first_value(rows, "arxiv_id") or metadata.arxiv_id
+        zotero_library_id = (
+            self._first_value(rows, "zotero_library_id")
+            or metadata.zotero_library_id
+        )
+        zotero_item_key = (
+            self._first_value(rows, "zotero_item_key") or metadata.zotero_item_key
+        )
+        sha256 = self._first_value(rows, "pdf_sha256") or pdf_sha256
+        notion_page_id = self._first_value(rows, "notion_page_id")
+        canonical_identity = PaperMetadata(
+            doi=doi,
+            arxiv_id=arxiv_id,
+            zotero_library_id=zotero_library_id,
+            zotero_item_key=zotero_item_key,
+        ).canonical_identity(sha256)
+        for duplicate in duplicates:
+            connection.execute(
+                "UPDATE jobs SET paper_id = ? WHERE paper_id = ?",
+                (primary["id"], duplicate["id"]),
+            )
+            connection.execute("DELETE FROM papers WHERE id = ?", (duplicate["id"],))
+        connection.execute(
+            """UPDATE papers SET canonical_identity = ?, doi = ?, arxiv_id = ?,
+               zotero_library_id = ?, zotero_item_key = ?, pdf_sha256 = ?,
+               metadata_json = ?, notion_page_id = ?,
+               artifact_dir = COALESCE(?, artifact_dir), updated_at = ?
+               WHERE id = ?""",
+            (
+                canonical_identity, doi, arxiv_id, zotero_library_id,
+                zotero_item_key, sha256, payload, notion_page_id,
+                str(artifact_dir) if artifact_dir else None, now, primary["id"],
+            ),
+        )
+        return int(primary["id"])
+
+    def resolve_ingest(
+        self,
+        input_spec: InputSpec,
+        metadata: PaperMetadata,
+        pdf_sha256: str,
+        canonical_artifact_dir: Path | str,
+        *,
+        max_cost_usd: float,
+        force_reprocess: bool = False,
+    ) -> tuple[JobRecord, bool]:
+        """Atomically resolve paper identity, generation reuse, and artifact root."""
+        if max_cost_usd < 0:
+            raise ValueError("max_cost_usd must not be negative")
+        pdf_sha256 = pdf_sha256.strip().lower()
+        identity = metadata.canonical_identity(pdf_sha256)
+        if identity is None:
+            raise ValueError("A canonical paper identity is required")
+        now = self._now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            paper_id = self._upsert_paper_in_transaction(
+                connection, metadata, pdf_sha256, identity, None,
+            )
+            if not force_reprocess:
+                existing = connection.execute(
+                    """SELECT * FROM jobs WHERE paper_id = ?
+                       ORDER BY CASE
+                           WHEN state = ? THEN 0
+                           WHEN state NOT IN (?, ?, ?) THEN 1
+                           ELSE 2
+                       END, updated_at DESC LIMIT 1""",
+                    (
+                        paper_id, JobState.COMPLETED.value,
+                        JobState.NEEDS_INPUT.value,
+                        JobState.BUDGET_EXCEEDED.value,
+                        JobState.FAILED.value,
+                    ),
+                ).fetchone()
+                if existing is not None:
+                    return self._record(existing), True
+            job_id = str(uuid.uuid4())
+            root = Path(canonical_artifact_dir)
+            if force_reprocess:
+                root = root.with_name(f"{root.name}-{job_id[:8]}")
+            connection.execute(
+                """UPDATE papers SET artifact_dir = COALESCE(artifact_dir, ?),
+                   updated_at = ? WHERE id = ?""",
+                (str(root), now, paper_id),
+            )
+            connection.execute(
+                """INSERT INTO jobs
+                   (id, paper_id, input_json, state, artifact_dir, error,
+                    total_cost_usd, max_cost_usd, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, NULL, 0, ?, ?, ?)""",
+                (
+                    job_id, paper_id, self._input_json(input_spec),
+                    JobState.QUEUED.value, str(root), max_cost_usd, now, now,
+                ),
+            )
+            created = connection.execute(
+                "SELECT * FROM jobs WHERE id = ?", (job_id,),
+            ).fetchone()
+        return self._record(created), False
+
+    def resolve_existing_ingest(
+        self,
+        job_id: str,
+        metadata: PaperMetadata,
+        pdf_sha256: str,
+        canonical_artifact_dir: Path | str,
+    ) -> JobRecord:
+        """Atomically attach a formerly identity-less resumable job."""
+        pdf_sha256 = pdf_sha256.strip().lower()
+        identity = metadata.canonical_identity(pdf_sha256)
+        if identity is None:
+            raise ValueError("A canonical paper identity is required")
+        now = self._now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if connection.execute(
+                "SELECT 1 FROM jobs WHERE id = ?", (job_id,),
+            ).fetchone() is None:
+                raise KeyError(f"Unknown job: {job_id}")
+            paper_id = self._upsert_paper_in_transaction(
+                connection, metadata, pdf_sha256, identity, None,
+            )
+            paper = connection.execute(
+                "SELECT artifact_dir FROM papers WHERE id = ?", (paper_id,),
+            ).fetchone()
+            completed = connection.execute(
+                """SELECT artifact_dir FROM jobs
+                   WHERE paper_id = ? AND id != ? AND state = ?
+                   ORDER BY updated_at DESC LIMIT 1""",
+                (paper_id, job_id, JobState.COMPLETED.value),
+            ).fetchone()
+            completed_root = completed["artifact_dir"] if completed else None
+            root = (
+                Path(completed_root)
+                if completed_root
+                else Path(paper["artifact_dir"])
+                if paper["artifact_dir"]
+                else Path(canonical_artifact_dir)
+            )
+            connection.execute(
+                """UPDATE papers SET artifact_dir = ?, updated_at = ? WHERE id = ?""",
+                (str(root), now, paper_id),
+            )
+            connection.execute(
+                """UPDATE jobs SET paper_id = ?, artifact_dir = ?,
+                   state = CASE WHEN ? THEN ? ELSE state END,
+                   error = CASE WHEN ? THEN NULL ELSE error END, updated_at = ?
+                   WHERE id = ?""",
+                (
+                    paper_id, str(root), completed is not None,
+                    JobState.COMPLETED.value, completed is not None, now, job_id,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM jobs WHERE id = ?", (job_id,),
+            ).fetchone()
+        return self._record(row)
 
     @staticmethod
     def _first_value(rows: list[sqlite3.Row], column: str) -> str | None:
@@ -500,6 +701,144 @@ class JobStore:
             ).fetchone()
         return row is not None
 
+    @staticmethod
+    def _zotero_operation(row: sqlite3.Row) -> dict[str, Any]:
+        operation = dict(row)
+        operation["state"] = json.loads(operation.pop("state_json"))
+        return operation
+
+    def get_zotero_operation(
+        self, canonical_identity: str | None, source_sha256: str,
+    ) -> dict[str, Any] | None:
+        if canonical_identity is None:
+            return None
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT * FROM zotero_operations
+                   WHERE canonical_identity = ? AND source_sha256 = ?""",
+                (canonical_identity, source_sha256.lower()),
+            ).fetchone()
+        return self._zotero_operation(row) if row else None
+
+    def create_zotero_operation(
+        self,
+        *,
+        operation_id: str,
+        canonical_identity: str,
+        source_sha256: str,
+        parent_key: str,
+        attachment_key: str,
+        parent_write_token: str,
+        attachment_write_token: str,
+        upload_write_token: str,
+        registration_write_token: str,
+    ) -> dict[str, Any]:
+        now = self._now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            inserted = connection.execute(
+                """INSERT OR IGNORE INTO zotero_operations
+                   (id, canonical_identity, source_sha256, parent_key,
+                    attachment_key, parent_write_token, attachment_write_token,
+                    upload_write_token, registration_write_token, step,
+                    state_json, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'created', '{}', ?, ?)""",
+                (
+                    operation_id, canonical_identity, source_sha256.lower(),
+                    parent_key, attachment_key, parent_write_token,
+                    attachment_write_token, upload_write_token,
+                    registration_write_token, now, now,
+                ),
+            )
+            if inserted.rowcount:
+                connection.execute(
+                    """INSERT INTO zotero_operation_events
+                       (operation_id, step, created_at) VALUES (?, 'created', ?)""",
+                    (operation_id, now),
+                )
+            row = connection.execute(
+                """SELECT * FROM zotero_operations
+                   WHERE canonical_identity = ? AND source_sha256 = ?""",
+                (canonical_identity, source_sha256.lower()),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("Failed to create Zotero operation")
+        return self._zotero_operation(row)
+
+    def checkpoint_zotero_operation(
+        self, operation_id: str, step: str, state: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if not step.strip():
+            raise ValueError("Zotero operation step must not be empty")
+        now = self._now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT state_json FROM zotero_operations WHERE id = ?",
+                (operation_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown Zotero operation: {operation_id}")
+            payload = json.loads(row["state_json"])
+            payload.update(state or {})
+            connection.execute(
+                """UPDATE zotero_operations
+                   SET step = ?, state_json = ?, updated_at = ? WHERE id = ?""",
+                (step, json.dumps(payload, ensure_ascii=False), now, operation_id),
+            )
+            connection.execute(
+                """INSERT INTO zotero_operation_events
+                   (operation_id, step, created_at) VALUES (?, ?, ?)""",
+                (operation_id, step, now),
+            )
+            updated = connection.execute(
+                "SELECT * FROM zotero_operations WHERE id = ?", (operation_id,),
+            ).fetchone()
+        return self._zotero_operation(updated)
+
+    def zotero_operation_events(self, operation_id: str) -> list[str]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT step FROM zotero_operation_events
+                   WHERE operation_id = ? ORDER BY id""",
+                (operation_id,),
+            ).fetchall()
+        return [str(row["step"]) for row in rows]
+
+    def claim_paper_processing(
+        self,
+        paper_id: int,
+        owner_token: str,
+        *,
+        now: float,
+        lease_seconds: float,
+    ) -> bool:
+        if lease_seconds <= 0:
+            raise ValueError("paper lock lease must be positive")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """DELETE FROM paper_processing_locks
+                   WHERE paper_id = ? AND lease_expires_at <= ?""",
+                (paper_id, now),
+            )
+            inserted = connection.execute(
+                """INSERT OR IGNORE INTO paper_processing_locks
+                   (paper_id, owner_token, lease_expires_at, created_at)
+                   VALUES (?, ?, ?, ?)""",
+                (paper_id, owner_token, now + lease_seconds, self._now()),
+            )
+        return bool(inserted.rowcount)
+
+    def release_paper_processing(self, paper_id: int, owner_token: str) -> bool:
+        with self._connect() as connection:
+            released = connection.execute(
+                """DELETE FROM paper_processing_locks
+                   WHERE paper_id = ? AND owner_token = ?""",
+                (paper_id, owner_token),
+            )
+        return bool(released.rowcount)
+
     def cache_llm_call(self, job_id: str, request_hash: str, model: str,
                        response: Any, cost_usd: float) -> None:
         self.record_llm_call(
@@ -577,28 +916,48 @@ class JobStore:
             ).fetchone()
             reservation = connection.execute(
                 """SELECT amount_usd FROM llm_budget_reservations
-                   WHERE id = ? AND owner_token = ? AND unresolved = 0
-                   AND lease_expires_at > ?""",
+                   WHERE id = ? AND owner_token = ? AND lease_expires_at > ?""",
                 (reservation_id, reservation_owner_token, now),
             ).fetchone()
             if request_claim is None or reservation is None:
                 raise LeaseOwnershipError("LLM request or budget lease ownership was lost")
-            inserted = connection.execute(
-                """INSERT OR IGNORE INTO llm_calls
-                   (job_id, request_hash, cache_key, model, provider, generation_id,
-                    response_json, usage_json, pricing_json, cost_usd, cost_resolved,
-                    validated, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            settled = connection.execute(
+                """UPDATE llm_calls
+                   SET model = ?, provider = ?, generation_id = ?, response_json = ?,
+                       usage_json = ?, pricing_json = ?, cost_usd = ?,
+                       cost_resolved = ?, validated = ?, dispatch_state = ?
+                   WHERE request_hash = ? AND cache_key = ?
+                     AND dispatch_state = 'dispatched'""",
                 (
-                    job_id, request_hash, cache_key, model, provider, generation_id,
+                    model, provider, generation_id,
                     json.dumps(response, ensure_ascii=False),
                     json.dumps(usage, ensure_ascii=False),
                     json.dumps(pricing or {}, ensure_ascii=False),
-                    cost_usd, int(cost_resolved), int(validated), self._now(),
+                    cost_usd, int(cost_resolved), int(validated),
+                    "settled" if cost_resolved else "unresolved",
+                    request_hash, cache_key,
                 ),
             )
-            if not inserted.rowcount:
-                return False
+            if not settled.rowcount:
+                settled = connection.execute(
+                    """INSERT OR IGNORE INTO llm_calls
+                       (job_id, request_hash, cache_key, model, provider, generation_id,
+                        response_json, usage_json, pricing_json, cost_usd,
+                        cost_resolved, validated, dispatch_state,
+                        authorized_amount_usd, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        job_id, request_hash, cache_key, model, provider,
+                        generation_id, json.dumps(response, ensure_ascii=False),
+                        json.dumps(usage, ensure_ascii=False),
+                        json.dumps(pricing or {}, ensure_ascii=False), cost_usd,
+                        int(cost_resolved), int(validated),
+                        "settled" if cost_resolved else "unresolved",
+                        authorized_amount_usd, self._now(),
+                    ),
+                )
+                if not settled.rowcount:
+                    return False
             connection.execute(
                 """UPDATE jobs SET total_cost_usd = total_cost_usd + ?, updated_at = ?
                    WHERE id = ?""",
@@ -609,17 +968,70 @@ class JobStore:
                     0.0, float(reservation["amount_usd"]) - authorized_amount_usd,
                 )
                 connection.execute(
-                    "UPDATE llm_budget_reservations SET amount_usd = ? WHERE id = ?",
+                    """UPDATE llm_budget_reservations
+                       SET amount_usd = ?, unresolved = 0 WHERE id = ?""",
                     (remaining, reservation_id),
                 )
             else:
                 connection.execute(
                     """UPDATE llm_budget_reservations
-                       SET amount_usd = MIN(amount_usd, ?), unresolved = 1
+                       SET amount_usd = MAX(amount_usd, ?), unresolved = 1
                        WHERE id = ?""",
                     (authorized_amount_usd, reservation_id),
                 )
         return True
+
+    def begin_llm_dispatch(
+        self,
+        job_id: str,
+        *,
+        request_hash: str,
+        cache_key: str,
+        model: str,
+        reservation_id: str,
+        request_owner_token: str,
+        reservation_owner_token: str,
+        authorized_amount_usd: float,
+        now: float,
+        pricing: dict[str, Any] | None = None,
+    ) -> bool:
+        """Durably fence and record a possibly billable attempt before HTTP POST."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            request_claim = connection.execute(
+                """SELECT 1 FROM llm_request_claims
+                   WHERE cache_key = ? AND owner_token = ? AND lease_expires_at > ?""",
+                (cache_key, request_owner_token, now),
+            ).fetchone()
+            reservation = connection.execute(
+                """SELECT amount_usd FROM llm_budget_reservations
+                   WHERE id = ? AND owner_token = ? AND lease_expires_at > ?""",
+                (reservation_id, reservation_owner_token, now),
+            ).fetchone()
+            if request_claim is None or reservation is None:
+                raise LeaseOwnershipError("LLM request or budget lease ownership was lost")
+            if float(reservation["amount_usd"]) + 1e-12 < authorized_amount_usd:
+                raise LeaseOwnershipError("LLM budget reservation is insufficient")
+            inserted = connection.execute(
+                """INSERT OR IGNORE INTO llm_calls
+                   (job_id, request_hash, cache_key, model, provider, generation_id,
+                    response_json, usage_json, pricing_json, cost_usd, cost_resolved,
+                    validated, dispatch_state, authorized_amount_usd, created_at)
+                   VALUES (?, ?, ?, ?, NULL, NULL, '{}', '{}', ?, 0, 0, 0,
+                           'dispatched', ?, ?)""",
+                (
+                    job_id, request_hash, cache_key, model,
+                    json.dumps(pricing or {}, ensure_ascii=False),
+                    authorized_amount_usd, self._now(),
+                ),
+            )
+            if inserted.rowcount:
+                connection.execute(
+                    """UPDATE llm_budget_reservations SET unresolved = 1
+                       WHERE id = ? AND owner_token = ?""",
+                    (reservation_id, reservation_owner_token),
+                )
+        return bool(inserted.rowcount)
 
     def get_cached_llm_result(self, cache_key: str) -> dict[str, Any] | None:
         with self._connect() as connection:

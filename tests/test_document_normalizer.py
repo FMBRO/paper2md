@@ -1,4 +1,10 @@
+from pathlib import Path
+
+import src.document_normalizer as document_normalizer
 from src.document_normalizer import normalize_marker_document, normalize_markdown_document
+
+
+FIXTURE_DIR = Path(__file__).parent / "fixtures" / "marker-1.10.2"
 
 
 def test_normalize_marker_document_preserves_typed_blocks_and_positions() -> None:
@@ -30,7 +36,8 @@ def test_normalize_marker_document_preserves_typed_blocks_and_positions() -> Non
     assert [page["number"] for page in document["pages"]] == [1, 2]
     assert document["sections"] == [{
         "id": "section-001", "title": "Introduction", "level": 2,
-        "page": 1, "source_position": {"page": 1},
+        "page": 1, "ordinal": 0,
+        "source_position": {"page": 1},
     }]
     assert document["paragraphs"][0]["source_position"] == {
         "page": 2, "bbox": [10, 20, 30, 40],
@@ -69,3 +76,33 @@ def test_markdown_fallback_keeps_form_feed_page_positions() -> None:
         ("First", 1), ("Second", 2),
     ]
     assert document["paragraphs"][1]["source_position"]["page"] == 2
+
+
+def test_real_marker_1_10_2_json_contract_is_recursive_multi_page_and_ordered() -> None:
+    marker_document = document_normalizer.load_marker_document(FIXTURE_DIR)
+
+    assert marker_document is not None
+    assert marker_document["metadata"]["page_stats"][1]["page_id"] == 1
+
+    document = normalize_marker_document(marker_document)
+
+    assert [page["number"] for page in document["pages"]] == [1, 2]
+    assert [section["title"] for section in document["sections"]] == [
+        "Introduction", "Results",
+    ]
+    assert [paragraph["text"] for paragraph in document["paragraphs"]] == [
+        "Left column first.", "Right column second.",
+    ]
+    assert [paragraph["page"] for paragraph in document["paragraphs"]] == [1, 1]
+    assert [paragraph["ordinal"] for paragraph in document["paragraphs"]] == [1, 2]
+    assert document["tables"][0]["page"] == 2
+    assert "<table>" in document["tables"][0]["markdown"]
+    assert document["equations"][0]["text"] == "E = mc^2"
+    assert document["figures"][0]["path"] == "images/figure-1.png"
+    assert document["figures"][0]["caption"] == "Figure 1. Architecture overview."
+
+    markdown = document_normalizer.materialize_marker_markdown(marker_document)
+    assert markdown.count("<!-- page:") == 2
+    assert markdown.index("Left column first.") < markdown.index("Right column second.")
+    assert "### Results" in markdown
+    assert "$$\nE = mc^2\n$$" in markdown

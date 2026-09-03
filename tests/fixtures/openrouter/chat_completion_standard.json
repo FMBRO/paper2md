@@ -1,0 +1,20 @@
+{
+  "id": "generation-fixture",
+  "model": "google/gemini-3.8-flash",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "{}"
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 100,
+    "completion_tokens": 20,
+    "total_tokens": 120,
+    "cost": 0.01
+  }
+}

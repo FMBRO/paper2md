@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -42,6 +43,14 @@ class InputSpec:
         self.source = self.source.strip()
         if not self.source:
             raise ValueError("Input source must not be empty")
+        zotero_key = re.compile(r"^[A-Z0-9]{8}$", re.IGNORECASE)
+        if self.kind in {InputKind.ZOTERO_ITEM, InputKind.ZOTERO_COLLECTION}:
+            if zotero_key.fullmatch(self.source):
+                self.source = self.source.upper()
+        if self.attachment_key is not None:
+            self.attachment_key = self.attachment_key.strip()
+            if zotero_key.fullmatch(self.attachment_key):
+                self.attachment_key = self.attachment_key.upper()
 
 
 def _normalize_doi(value: str | None) -> str | None:
@@ -68,6 +77,7 @@ class PaperMetadata:
     title: str | None = None
     authors: list[str] = field(default_factory=list)
     published_date: str | None = None
+    published_date_raw: str | None = None
     doi: str | None = None
     arxiv_id: str | None = None
     source_url: str | None = None
@@ -92,6 +102,40 @@ class PaperMetadata:
         if pdf_sha256:
             return f"sha256:{pdf_sha256.strip().lower()}"
         return None
+
+
+_JAPANESE_SCRIPT = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]")
+_LATIN_WORD = re.compile(r"[A-Za-z][A-Za-z0-9._/+:-]*")
+_URL_OR_IDENTIFIER = re.compile(
+    r"(?:https?://\S+|(?:doi:)?10\.\d{4,9}/\S+|arxiv:\S+)", re.IGNORECASE,
+)
+_CITATION = re.compile(r"\[[^\]]{1,120}\]|\([^)]*(?:\d{4}|et\s+al\.)[^)]*\)", re.IGNORECASE)
+_MEASUREMENT = re.compile(r"\b\d+(?:\.\d+)?\s*(?:%|ms|s|kg|g|km|m|cm|mm|GB|MB|KB|Hz)\b", re.IGNORECASE)
+
+
+def has_sufficient_japanese_narrative(value: str) -> bool:
+    """Require meaningful Japanese prose while discounting technical notation.
+
+    The check is deliberately deterministic.  URLs, citations, measurements and
+    identifier-like or capitalized technical tokens do not dilute otherwise
+    Japanese prose, while a single Japanese character cannot bless English text.
+    """
+    normalized = unicodedata.normalize("NFKC", value).strip()
+    if not normalized:
+        return False
+    narrative = _MEASUREMENT.sub(" ", _CITATION.sub(" ", _URL_OR_IDENTIFIER.sub(" ", normalized)))
+    japanese_count = len(_JAPANESE_SCRIPT.findall(narrative))
+    if japanese_count < 2:
+        return False
+    ordinary_latin_count = 0
+    for match in _LATIN_WORD.finditer(narrative):
+        token = match.group(0)
+        if any(char.isdigit() for char in token):
+            continue
+        if any(char.isupper() for char in token):
+            continue
+        ordinary_latin_count += sum(char.isalpha() for char in token)
+    return japanese_count / (japanese_count + ordinary_latin_count) >= 0.20
 
 
 @dataclass(frozen=True, slots=True)

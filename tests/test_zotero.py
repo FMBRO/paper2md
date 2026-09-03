@@ -1,12 +1,14 @@
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import re
 from typing import Mapping
 import urllib.error
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 
-from src.research_models import InputKind, InputSpec
+from src.research_models import InputKind, InputSpec, PaperMetadata
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,6 +27,91 @@ class RecordingHttpClient:
         self.requests.append((method, url, headers, content))
         response = self.responses[(method, url)]
         return response.pop(0) if isinstance(response, list) else response
+
+
+class DurableWriteTransport:
+    """Stateful deterministic Zotero wire contract with response-loss injection."""
+
+    root = "http://localhost:23119/api/"
+
+    def __init__(self, *, crash_stage: str) -> None:
+        fixture = json.loads(
+            (Path(__file__).parent / "fixtures" / "zotero" / "write_contract.json")
+            .read_text(encoding="utf-8")
+        )
+        self.authorize_payload = fixture["authorize"]
+        self.upload_payload = fixture["upload"]
+        self.crash_stage = crash_stage
+        self.crashed = False
+        self.items: dict[str, dict[str, object]] = {}
+        self.requests: list[tuple[str, str, Mapping[str, str] | None, bytes | None]] = []
+        self.parent_creation_attempts = 0
+        self.attachment_creation_attempts = 0
+        self.upload_attempts = 0
+        self.registration_attempts = 0
+        self.uploaded = False
+        self.registered = False
+
+    def _maybe_crash(self, stage: str) -> None:
+        if self.crash_stage == stage and not self.crashed:
+            self.crashed = True
+            raise ConnectionResetError(f"lost {stage} response")
+
+    def request(self, method: str, url: str, *, headers=None, content=None) -> FakeResponse:
+        self.requests.append((method, url, headers, content))
+        parsed = urlparse(url)
+        if method == "GET" and url == self.root:
+            return FakeResponse(200, {"zotero-server-id": "server-1"})
+        if method == "GET" and parsed.path.endswith("/users/0/items"):
+            wanted = parse_qs(parsed.query).get("q", [""])[0].casefold()
+            matches = [
+                item for item in self.items.values()
+                if item["data"].get("itemType") != "attachment"
+                and wanted in {
+                    str(item["data"].get("DOI", "")).casefold(),
+                    str(item["data"].get("archiveID", "")).casefold(),
+                }
+            ]
+            return FakeResponse(200, {}, json.dumps(matches).encode())
+        item_match = re.search(r"/users/0/items/([A-Z0-9]{8})$", parsed.path)
+        if method == "GET" and item_match:
+            item = self.items.get(item_match.group(1))
+            return FakeResponse(
+                200 if item else 404, {}, json.dumps(item).encode() if item else b"",
+            )
+        if method == "POST" and parsed.path.endswith("/local/authorize"):
+            return FakeResponse(200, {}, json.dumps(self.authorize_payload).encode())
+        if method == "POST" and parsed.path.endswith("/users/0/items"):
+            payload = json.loads(content)[0]
+            key = payload["key"]
+            item = {"key": key, "data": payload}
+            self.items[key] = item
+            if payload["itemType"] == "attachment":
+                self.attachment_creation_attempts += 1
+                self._maybe_crash("attachment")
+            else:
+                self.parent_creation_attempts += 1
+                self._maybe_crash("parent")
+            return FakeResponse(
+                200, {}, json.dumps({"successful": {"0": {"key": key}}}).encode(),
+            )
+        file_match = re.search(r"/users/0/items/([A-Z0-9]{8})/file$", parsed.path)
+        if method == "POST" and file_match:
+            form = parse_qs((content or b"").decode())
+            if "upload" in form:
+                self.registration_attempts += 1
+                self.registered = True
+                self._maybe_crash("registration")
+                return FakeResponse(204, {})
+            if self.registered:
+                return FakeResponse(200, {}, b'{"exists":1}')
+            return FakeResponse(200, {}, json.dumps(self.upload_payload).encode())
+        if method == "POST" and url == self.upload_payload["url"]:
+            self.upload_attempts += 1
+            self.uploaded = True
+            self._maybe_crash("upload")
+            return FakeResponse(201, {})
+        raise AssertionError(f"Unexpected Zotero request: {method} {url}")
 
 
 def test_availability_probe_uses_local_api_v3() -> None:
@@ -60,6 +147,80 @@ def test_resolve_parent_with_one_pdf_child_returns_metadata_and_local_file(tmp_p
     assert result.metadata.doi == "10.1000/abc"
     assert result.metadata.zotero_library_id == "0"
     assert result.zotero_uri == "zotero://select/library/items/PARENT01"
+
+
+def test_zotero_response_headers_are_case_insensitive(tmp_path: Path) -> None:
+    from src.job_store import JobStore
+    from src.zotero import ZoteroClient
+
+    source = tmp_path / "source.pdf"
+    source.write_bytes(b"%PDF-1.7\n")
+    http = DurableWriteTransport(crash_stage="")
+
+    result = ZoteroClient(
+        http_client=http,
+        operation_store=JobStore(tmp_path / "state.sqlite3"),
+    ).upsert_non_zotero(
+        PaperMetadata(title="Identity-poor paper"),
+        source,
+    )
+
+    assert result.attachment_key is not None
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("Spring 2024", "2024-03"),
+        ("2024", "2024"),
+        ("2024-05", "2024-05"),
+        ("2024-05-17", "2024-05-17"),
+        ("0000", None),
+        ("Winter 0000", None),
+        ("2024-13", None),
+    ],
+)
+def test_zotero_dates_are_normalized_to_notion_safe_iso_precision(
+    raw: str, expected: str | None,
+) -> None:
+    from src.zotero import normalize_zotero_date
+
+    assert normalize_zotero_date(raw) == expected
+
+
+def test_zotero_metadata_prefers_parsed_date_and_retains_raw_local_value() -> None:
+    from src.zotero import _metadata
+
+    item = {
+        "key": "PARENT01",
+        "data": {
+            "itemType": "journalArticle",
+            "title": "Dated paper",
+            "date": "Spring 2024",
+        },
+        "meta": {"parsedDate": "2024-04-15"},
+    }
+
+    metadata = _metadata(item)
+
+    assert metadata.published_date == "2024-04-15"
+    assert metadata.published_date_raw == "Spring 2024"
+
+
+@pytest.mark.parametrize(
+    ("url", "platform", "expected"),
+    [
+        ("file:///C:/Users/A%20B/paper.pdf", "nt", "C:\\Users\\A B\\paper.pdf"),
+        ("file://server/share/paper.pdf", "nt", "\\\\server\\share\\paper.pdf"),
+        ("file:///var/lib/paper.pdf", "posix", "/var/lib/paper.pdf"),
+    ],
+)
+def test_file_url_conversion_is_platform_aware(
+    url: str, platform: str, expected: str,
+) -> None:
+    from src.zotero import file_url_to_path
+
+    assert str(file_url_to_path(url, platform=platform)) == expected
 
 
 def test_resolved_metadata_uses_the_configured_zotero_user_id(tmp_path: Path) -> None:
@@ -261,47 +422,90 @@ def test_upsert_non_zotero_reuses_exact_doi_match_without_writes(tmp_path: Path)
     assert all(method == "GET" for method, _, _, _ in http.requests)
 
 
+def test_durable_upsert_completes_missing_attachment_for_an_existing_parent(
+    tmp_path: Path,
+) -> None:
+    from src.job_store import JobStore
+    from src.zotero import ZoteroClient
+
+    source = tmp_path / "source.pdf"
+    source.write_bytes(b"%PDF-1.7\ndurable fixture\n")
+    transport = DurableWriteTransport(crash_stage="never")
+    transport.items["PARENT01"] = {
+        "key": "PARENT01",
+        "data": {
+            "key": "PARENT01",
+            "itemType": "journalArticle",
+            "title": "Existing",
+            "DOI": "10.1000/durable-existing",
+        },
+    }
+
+    result = ZoteroClient(
+        http_client=transport,
+        operation_store=JobStore(tmp_path / "state.sqlite3"),
+    ).upsert_non_zotero(
+        PaperMetadata(doi="10.1000/durable-existing"),
+        source,
+    )
+
+    assert result.parent_key == "PARENT01"
+    assert result.attachment_key is not None
+    assert transport.parent_creation_attempts == 0
+    assert transport.attachment_creation_attempts == 1
+    assert transport.registered is True
+
+
 def test_upsert_non_zotero_creates_parent_attachment_and_uploads_pdf(tmp_path: Path) -> None:
+    from src.job_store import JobStore
     from src.research_models import PaperMetadata
     from src.zotero import ZoteroClient
 
     source = tmp_path / "source.pdf"
     source.write_bytes(b"%PDF-1.7\nbytes\n")
-    root = "http://localhost:23119/api/"
-    items_url = f"{root}users/0/items"
-    search = f"{items_url}?q=10.1000%2Fnew&qmode=everything&itemType=-attachment"
-    file_url = f"{root}users/0/items/PDF00001/file"
-    upload_url = f"{root}local/uploads/upload-1"
-    http = RecordingHttpClient({
-        ("GET", search): FakeResponse(200, {}, b"[]"),
-        ("GET", root): FakeResponse(200, {"Zotero-Server-ID": "server-1"}),
-        ("POST", f"{root}local/authorize"): [
-            FakeResponse(200, {}, b'{"key":"write-key-1","remember":false}'),
-            FakeResponse(200, {}, b'{"key":"write-key-2","remember":false}'),
-            FakeResponse(200, {}, b'{"key":"write-key-3","remember":false}'),
-            FakeResponse(200, {}, b'{"key":"write-key-4","remember":false}'),
-        ],
-        ("POST", items_url): [
-            FakeResponse(200, {}, b'{"successful":{"0":{"key":"PARENT01"}}}'),
-            FakeResponse(200, {}, b'{"successful":{"0":{"key":"PDF00001"}}}'),
-        ],
-        ("POST", file_url): [
-            FakeResponse(200, {}, b'{"url":"http://localhost:23119/api/local/uploads/upload-1","uploadKey":"upload-1","contentType":"application/pdf","prefix":"","suffix":""}'),
-            FakeResponse(204, {}, b""),
-        ],
-        ("POST", upload_url): FakeResponse(201, {}, b""),
-    })
+    http = DurableWriteTransport(crash_stage="")
+    http.authorize_payload["remember"] = False
 
-    result = ZoteroClient(http_client=http).upsert_non_zotero(PaperMetadata(title="New paper", authors=["Ada Lovelace"], doi="10.1000/new"), source)
+    result = ZoteroClient(
+        http_client=http,
+        operation_store=JobStore(tmp_path / "state.sqlite3"),
+    ).upsert_non_zotero(
+        PaperMetadata(
+            title="New paper", authors=["Ada Lovelace"], doi="10.1000/new",
+        ),
+        source,
+    )
 
-    assert (result.parent_key, result.attachment_key, result.source_pdf) == ("PARENT01", "PDF00001", source)
-    parent_payload = json.loads(http.requests[3][3])
-    attachment_payload = json.loads(http.requests[5][3])
-    assert parent_payload == [{"itemType": "journalArticle", "title": "New paper", "DOI": "10.1000/new", "creators": [{"creatorType": "author", "name": "Ada Lovelace"}]}]
-    assert attachment_payload == [{"itemType": "attachment", "parentItem": "PARENT01", "linkMode": "imported_file", "contentType": "application/pdf", "filename": "source.pdf", "title": "source.pdf"}]
-    assert http.requests[3][2]["Zotero-API-Key"] == "write-key-1"
-    assert http.requests[5][2]["Zotero-API-Key"] == "write-key-2"
-    assert http.requests[3][2]["Zotero-Write-Token"] != http.requests[5][2]["Zotero-Write-Token"]
+    assert result.source_pdf == source
+    item_writes = [
+        request for request in http.requests
+        if request[0] == "POST" and request[1].endswith("/users/0/items")
+    ]
+    parent_payload = json.loads(item_writes[0][3])
+    attachment_payload = json.loads(item_writes[1][3])
+    assert parent_payload == [{
+        "key": result.parent_key,
+        "itemType": "journalArticle",
+        "title": "New paper",
+        "DOI": "10.1000/new",
+        "creators": [{"creatorType": "author", "name": "Ada Lovelace"}],
+    }]
+    assert attachment_payload == [{
+        "key": result.attachment_key,
+        "itemType": "attachment",
+        "parentItem": result.parent_key,
+        "linkMode": "imported_file",
+        "contentType": "application/pdf",
+        "filename": "source.pdf",
+        "title": "source.pdf",
+    }]
+    assert item_writes[0][2]["Zotero-API-Key"] == "fixture-write-key"
+    assert item_writes[1][2]["Zotero-API-Key"] == "fixture-write-key"
+    assert item_writes[0][2]["Zotero-Write-Token"] != item_writes[1][2]["Zotero-Write-Token"]
+    assert len([
+        request for request in http.requests
+        if request[0] == "POST" and request[1].endswith("/local/authorize")
+    ]) == 4
 
 
 def test_production_transport_preserves_file_redirect_for_resolver(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -319,23 +523,23 @@ def test_production_transport_preserves_file_redirect_for_resolver(monkeypatch: 
 
 
 def test_doi_lookup_ignores_search_result_without_any_identifier(tmp_path: Path) -> None:
+    from src.job_store import JobStore
     from src.research_models import PaperMetadata
     from src.zotero import ZoteroClient
 
     source = tmp_path / "source.pdf"; source.write_bytes(b"%PDF-1.7\n")
-    root = "http://localhost:23119/api/"; items = f"{root}users/0/items"
-    search = f"{items}?q=10.1000%2Fnew&qmode=everything&itemType=-attachment"
-    http = RecordingHttpClient({
-        ("GET", search): FakeResponse(200, {}, b'[{"key":"OTHER001","data":{"itemType":"journalArticle","title":"Unrelated"}}]'),
-        ("GET", root): FakeResponse(200, {"Zotero-Server-ID": "server-1"}),
-        ("POST", f"{root}local/authorize"): FakeResponse(200, {}, b'{"key":"write-key","remember":true}'),
-        ("POST", items): [FakeResponse(200, {}, b'{"successful":{"0":{"key":"PARENT01"}}}'), FakeResponse(200, {}, b'{"successful":{"0":{"key":"PDF00001"}}}')],
-        ("POST", f"{root}users/0/items/PDF00001/file"): FakeResponse(200, {}, b'{"exists":1}'),
-    })
+    http = DurableWriteTransport(crash_stage="")
+    http.items["OTHER001"] = {
+        "key": "OTHER001",
+        "data": {"itemType": "journalArticle", "title": "Unrelated"},
+    }
 
-    result = ZoteroClient(http_client=http).upsert_non_zotero(PaperMetadata(doi="10.1000/new"), source)
+    result = ZoteroClient(
+        http_client=http,
+        operation_store=JobStore(tmp_path / "state.sqlite3"),
+    ).upsert_non_zotero(PaperMetadata(doi="10.1000/new"), source)
 
-    assert result.parent_key == "PARENT01"
+    assert result.parent_key != "OTHER001"
 
 
 def test_unreadable_source_does_not_authorize_or_write(tmp_path: Path) -> None:
@@ -346,3 +550,89 @@ def test_unreadable_source_does_not_authorize_or_write(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         ZoteroClient(http_client=http).upsert_non_zotero(PaperMetadata(title="Missing"), tmp_path / "missing.pdf")
     assert http.requests == []
+
+
+def test_zotero_new_item_write_fails_closed_without_a_durable_operation_store(
+    tmp_path: Path,
+) -> None:
+    from src.zotero import ZoteroClient, ZoteroError
+
+    source = tmp_path / "source.pdf"
+    source.write_bytes(b"%PDF-1.7\n")
+    http = RecordingHttpClient({})
+
+    with pytest.raises(ZoteroError, match="durable operation store"):
+        ZoteroClient(http_client=http).upsert_non_zotero(
+            PaperMetadata(title="Identity-poor paper"), source,
+        )
+
+    assert http.requests == []
+
+
+@pytest.mark.parametrize(
+    ("metadata", "crash_stage", "expected_upload_attempts"),
+    [
+        (PaperMetadata(title="DOI paper", doi="10.1000/durable"), "parent", 1),
+        (PaperMetadata(title="arXiv paper", arxiv_id="2401.01234"), "attachment", 1),
+        (PaperMetadata(title="Identity-poor paper"), "upload", 2),
+        (PaperMetadata(title="Registration paper"), "registration", 1),
+    ],
+)
+def test_durable_zotero_write_resumes_exact_operation_without_duplicate_items(
+    tmp_path: Path,
+    metadata: PaperMetadata,
+    crash_stage: str,
+    expected_upload_attempts: int,
+) -> None:
+    from src.job_store import JobStore
+    from src.zotero import ZoteroClient, ZoteroError
+
+    source = tmp_path / "source.pdf"
+    source.write_bytes(b"%PDF-1.7\ndurable fixture\n")
+    store = JobStore(tmp_path / "state.sqlite3")
+    transport = DurableWriteTransport(crash_stage=crash_stage)
+
+    with pytest.raises(ZoteroError, match="unavailable"):
+        ZoteroClient(http_client=transport, operation_store=store).upsert_non_zotero(
+            metadata, source,
+        )
+
+    result = ZoteroClient(
+        http_client=transport, operation_store=store,
+    ).upsert_non_zotero(metadata, source)
+
+    assert result.attachment_key is not None
+    assert transport.parent_creation_attempts == 1
+    assert transport.attachment_creation_attempts == 1
+    assert transport.upload_attempts == expected_upload_attempts
+    assert transport.registration_attempts == 1
+    assert len([
+        item for item in transport.items.values()
+        if item["data"]["itemType"] != "attachment"
+    ]) == 1
+    assert len([
+        item for item in transport.items.values()
+        if item["data"]["itemType"] == "attachment"
+    ]) == 1
+
+    import hashlib
+
+    source_sha256 = hashlib.sha256(source.read_bytes()).hexdigest()
+    operation = store.get_zotero_operation(
+        metadata.canonical_identity(source_sha256), source_sha256,
+    )
+    assert operation is not None
+    assert operation["parent_key"] == result.parent_key
+    assert operation["attachment_key"] == result.attachment_key
+    assert len(operation["parent_write_token"]) == 64
+    assert len(operation["attachment_write_token"]) == 64
+    events = store.zotero_operation_events(operation["id"])
+    assert "parent_creation_planned" in events
+    assert {"parent_created", "parent_reconciled"} & set(events)
+    assert "attachment_creation_planned" in events
+    assert {"attachment_created", "attachment_reconciled"} & set(events)
+    assert "upload_authorization_planned" in events
+    assert "upload_planned" in events
+    assert "registration_planned" in events
+    assert events[-1] == "complete"
+    assert b"fixture-write-key" not in store.path.read_bytes()

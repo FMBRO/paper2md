@@ -7,7 +7,11 @@ from pathlib import Path
 from typing import Any
 
 from src.artifacts import ArtifactManager
-from src.document_normalizer import normalize_markdown_document, normalize_marker_document
+from src.document_normalizer import (
+    load_marker_document,
+    normalize_markdown_document,
+    normalize_marker_document,
+)
 from src.evaluate_quality import write_quality_report
 from src.extract_figures import collect_marker_figures
 from src.inspect_pdf import inspect_pdf, inspect_page_text
@@ -20,14 +24,7 @@ from src.run_ocr import run_ocrmypdf
 
 def _load_marker_document(marker_dir: Path) -> dict[str, Any] | None:
     """Find a Marker JSON document without treating unrelated JSON as one."""
-    for candidate in sorted(marker_dir.rglob("*.json")):
-        try:
-            payload = json.loads(candidate.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if isinstance(payload, dict) and isinstance(payload.get("pages"), list):
-            return payload
-    return None
+    return load_marker_document(marker_dir)
 
 
 class Converter:
@@ -65,19 +62,29 @@ class Converter:
         manager.write_json(bundle.logs_dir / "source_page_text_coverage.json", source_page_text)
 
         target_pdf = source_pdf
-        ocr_used = self.force_ocr or (
-            self.enable_ocr and any(
-                not page["has_text"]
-                or page["character_count"] < self.minimum_page_characters
+        sparse_or_garbled = any(
+            page["has_text"] and (
+                page["character_count"] < self.minimum_page_characters
                 or page["has_garbled_text"]
-                for page in source_page_text
             )
+            for page in source_page_text
+        )
+        textless = any(not page["has_text"] for page in source_page_text)
+        nonempty = any(page["has_text"] for page in source_page_text)
+        ocr_used = self.force_ocr or self.enable_ocr and (
+            sparse_or_garbled or textless
         )
         if ocr_used:
             target_pdf = bundle.root / "paper_ocr.pdf"
+            mode = (
+                "force" if self.force_ocr
+                else "redo" if sparse_or_garbled
+                else "skip_text" if textless and nonempty
+                else "auto"
+            )
             self.ocr_runner(
                 source_pdf, target_pdf, lang=self.language, deskew=self.ocr_deskew,
-                clean=self.ocr_clean, mode="force" if self.force_ocr else "skip_text",
+                clean=self.ocr_clean, mode=mode,
             )
 
         page_text = inspect_page_text(target_pdf)

@@ -6,9 +6,11 @@ import urllib.request
 from dataclasses import dataclass
 import hashlib
 import json
-import uuid
-from pathlib import Path
-from typing import Mapping, Protocol
+import os
+import re
+from datetime import date
+from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
+from typing import Any, Mapping, Protocol
 from urllib.parse import unquote, urlencode, urlparse
 
 from src.config import ZoteroSettings
@@ -59,11 +61,18 @@ class UrlLibZoteroHttpClient:
 class ZoteroClient:
     """Client for a personal Zotero local API library (API version 3)."""
 
-    def __init__(self, settings: ZoteroSettings | None = None, *, http_client: ZoteroHttpClient | None = None) -> None:
+    def __init__(
+        self,
+        settings: ZoteroSettings | None = None,
+        *,
+        http_client: ZoteroHttpClient | None = None,
+        operation_store: Any | None = None,
+    ) -> None:
         settings = settings or ZoteroSettings()
         self.base_url = settings.base_url.rstrip("/") + "/"
         self.user_id = settings.user_id
         self.http_client = http_client or UrlLibZoteroHttpClient()
+        self.operation_store = operation_store
 
     def is_available(self) -> bool:
         try:
@@ -109,56 +118,327 @@ class ZoteroClient:
         if not source.is_file():
             raise FileNotFoundError(f"Source PDF does not exist: {source}")
         data = source.read_bytes()
-        identity = metadata.doi or metadata.arxiv_id
-        if identity:
-            query = urlencode({"q": identity, "qmode": "everything", "itemType": "-attachment"})
-            for item in _item_list(self._get_json(f"users/{self.user_id}/items?{query}")):
-                item_data = _item_data(item)
-                candidate = PaperMetadata(doi=_as_string(item_data.get("DOI")), arxiv_id=_as_string(item_data.get("archiveID")))
-                if ((metadata.doi is not None and candidate.doi == metadata.doi)
-                        or (metadata.arxiv_id is not None and candidate.arxiv_id == metadata.arxiv_id)):
-                    return ZoteroResolution(_metadata(item, str(self.user_id)), source, _item_key(item), None)
-        probe = self._request("GET", "")
-        server_id = probe.headers.get("Zotero-Server-ID")
-        if not server_id:
-            raise ZoteroError("Zotero local API did not provide Zotero-Server-ID required for writes")
-        auth = _json_response(self._request("POST", "local/authorize", content=b'{"appName":"paper2md"}', headers={"Content-Type": "application/json", "Zotero-Server-ID": server_id}), "write authorization")
-        key = auth.get("key") if isinstance(auth, dict) else None
-        if not isinstance(key, str):
-            raise ZoteroError("Zotero write authorization was denied")
-        reusable = bool(auth.get("remember"))
+        if self.operation_store is not None:
+            return self._durable_upsert_non_zotero(metadata, source, data)
+        existing = self._find_existing_parent(metadata)
+        if existing is not None:
+            return ZoteroResolution(
+                _metadata(existing, str(self.user_id)), source,
+                _item_key(existing), None,
+            )
+        raise ZoteroError("A durable operation store is required for Zotero writes")
+
+    def _durable_upsert_non_zotero(
+        self, metadata: PaperMetadata, source: Path, data: bytes,
+    ) -> "ZoteroResolution":
+        source_sha256 = hashlib.sha256(data).hexdigest()
+        canonical_identity = metadata.canonical_identity(source_sha256)
+        if canonical_identity is None:
+            raise ZoteroError("Cannot derive a durable Zotero operation identity")
+        operation = self.operation_store.get_zotero_operation(
+            canonical_identity, source_sha256,
+        )
+        if operation is None:
+            existing = self._find_existing_parent(metadata)
+            operation_id = hashlib.sha256(
+                f"{self.user_id}\0{canonical_identity}\0{source_sha256}".encode()
+            ).hexdigest()
+            operation = self.operation_store.create_zotero_operation(
+                operation_id=operation_id,
+                canonical_identity=canonical_identity,
+                source_sha256=source_sha256,
+                parent_key=(
+                    _item_key(existing)
+                    if existing is not None
+                    else _stable_zotero_key(operation_id, "parent")
+                ),
+                attachment_key=_stable_zotero_key(operation_id, "attachment"),
+                parent_write_token=_stable_token(operation_id, "parent"),
+                attachment_write_token=_stable_token(operation_id, "attachment"),
+                upload_write_token=_stable_token(operation_id, "upload"),
+                registration_write_token=_stable_token(operation_id, "registration"),
+            )
+        parent_key = str(operation["parent_key"])
+        attachment_key = str(operation["attachment_key"])
+        if operation["step"] == "complete":
+            return self._created_resolution(metadata, source, parent_key, attachment_key)
+
+        def checkpoint(step: str, state: dict[str, Any] | None = None) -> None:
+            nonlocal operation
+            operation = self.operation_store.checkpoint_zotero_operation(
+                operation["id"], step, state,
+            )
+
+        parent_item = self._optional_item(parent_key)
+        if parent_item is not None:
+            if _item_data(parent_item).get("itemType") == "attachment":
+                raise ZoteroError("Planned Zotero parent key is occupied by an attachment")
+            checkpoint("parent_reconciled", {"parent_created": True})
+        attachment_item = self._optional_item(attachment_key)
+        if attachment_item is not None:
+            attachment_data = _item_data(attachment_item)
+            if (
+                not _is_pdf_attachment(attachment_item)
+                or attachment_data.get("parentItem") != parent_key
+            ):
+                raise ZoteroError("Planned Zotero attachment key is occupied by another item")
+            checkpoint("attachment_reconciled", {"attachment_created": True})
+
+        server_id: str | None = None
+        api_key: str | None = None
+        reusable = False
         used = False
-        def authorize() -> str:
-            value = _json_response(self._request("POST", "local/authorize", content=b'{"appName":"paper2md"}', headers={"Content-Type": "application/json", "Zotero-Server-ID": server_id}), "write authorization")
+
+        def authorize(action: str) -> str:
+            nonlocal server_id, reusable
+            checkpoint(f"{action}_authorization_planned")
+            if server_id is None:
+                probe = self._request("GET", "")
+                server_id = _header_value(probe.headers, "Zotero-Server-ID")
+                if not server_id:
+                    raise ZoteroError(
+                        "Zotero local API did not provide Zotero-Server-ID required for writes"
+                    )
+            value = _json_response(
+                self._request(
+                    "POST", "local/authorize", content=b'{"appName":"paper2md"}',
+                    headers={
+                        "Content-Type": "application/json",
+                        "Zotero-Server-ID": server_id,
+                    },
+                ),
+                "write authorization",
+            )
             token = value.get("key") if isinstance(value, dict) else None
-            if not isinstance(token, str): raise ZoteroError("Zotero write authorization was denied")
+            if not isinstance(token, str):
+                raise ZoteroError("Zotero write authorization was denied")
+            reusable = bool(value.get("remember"))
             return token
-        def write(path: str, content: bytes, headers: Mapping[str, str]) -> ZoteroHttpResponse:
-            nonlocal key, used
-            if used and not reusable: key = authorize()
-            response = self._request("POST", path, content=content, headers={"Zotero-Server-ID": server_id, "Zotero-API-Key": key, **headers})
+
+        def write(
+            path: str,
+            content: bytes,
+            headers: Mapping[str, str],
+            *,
+            write_token: str,
+            action: str,
+        ) -> ZoteroHttpResponse:
+            nonlocal api_key, used
+            if api_key is None or (used and not reusable):
+                api_key = authorize(action)
+            response = self._request(
+                "POST", path, content=content,
+                headers={
+                    "Zotero-Server-ID": str(server_id),
+                    "Zotero-API-Key": api_key,
+                    "Zotero-Write-Token": write_token,
+                    **headers,
+                },
+            )
             used = True
             if not 200 <= response.status_code < 300:
-                raise ZoteroError(f"Zotero API returned HTTP {response.status_code} for {path}")
+                raise ZoteroError(
+                    f"Zotero API returned HTTP {response.status_code} for {path}"
+                )
             return response
-        parent = {"itemType": "journalArticle", "title": metadata.title or "Untitled"}
-        if metadata.doi: parent["DOI"] = metadata.doi
-        if metadata.authors: parent["creators"] = [{"creatorType": "author", "name": author} for author in metadata.authors]
-        parent_key = _created_key(_json_response(write(f"users/{self.user_id}/items", json.dumps([parent]).encode(), {"Content-Type": "application/json", "Zotero-Write-Token": uuid.uuid4().hex}), "parent creation"))
-        attachment = {"itemType": "attachment", "parentItem": parent_key, "linkMode": "imported_file", "contentType": "application/pdf", "filename": source.name, "title": source.name}
-        attachment_key = _created_key(_json_response(write(f"users/{self.user_id}/items", json.dumps([attachment]).encode(), {"Content-Type": "application/json", "Zotero-Write-Token": uuid.uuid4().hex}), "attachment creation"))
+
+        if parent_item is None:
+            parent: dict[str, object] = {
+                "key": parent_key,
+                "itemType": "journalArticle",
+                "title": metadata.title or "Untitled",
+            }
+            if metadata.doi:
+                parent["DOI"] = metadata.doi
+            if metadata.arxiv_id:
+                parent["archiveID"] = metadata.arxiv_id
+            if metadata.authors:
+                parent["creators"] = [
+                    {"creatorType": "author", "name": author}
+                    for author in metadata.authors
+                ]
+            if metadata.published_date:
+                parent["date"] = metadata.published_date
+            checkpoint("parent_creation_planned")
+            created_key = _created_key(_json_response(
+                write(
+                    f"users/{self.user_id}/items", json.dumps([parent]).encode(),
+                    {"Content-Type": "application/json"},
+                    write_token=str(operation["parent_write_token"]),
+                    action="parent_creation",
+                ),
+                "parent creation",
+            ))
+            if created_key != parent_key:
+                raise ZoteroError("Zotero did not honor the planned parent key")
+            checkpoint("parent_created", {"parent_created": True})
+
+        if attachment_item is None:
+            attachment = {
+                "key": attachment_key,
+                "itemType": "attachment",
+                "parentItem": parent_key,
+                "linkMode": "imported_file",
+                "contentType": "application/pdf",
+                "filename": source.name,
+                "title": source.name,
+            }
+            checkpoint("attachment_creation_planned")
+            created_key = _created_key(_json_response(
+                write(
+                    f"users/{self.user_id}/items", json.dumps([attachment]).encode(),
+                    {"Content-Type": "application/json"},
+                    write_token=str(operation["attachment_write_token"]),
+                    action="attachment_creation",
+                ),
+                "attachment creation",
+            ))
+            if created_key != attachment_key:
+                raise ZoteroError("Zotero did not honor the planned attachment key")
+            checkpoint("attachment_created", {"attachment_created": True})
+
         file_path = f"users/{self.user_id}/items/{attachment_key}/file"
-        form = urlencode({"md5": hashlib.md5(data).hexdigest(), "filename": source.name, "filesize": len(data), "mtime": int(source.stat().st_mtime * 1000)}).encode()
-        upload = _json_response(write(file_path, form, {"Content-Type": "application/x-www-form-urlencoded", "If-None-Match": "*"}), "file upload authorization")
-        if not isinstance(upload, dict): raise ZoteroError("Zotero file upload authorization returned malformed JSON")
-        if upload.get("exists") != 1:
-            url, upload_key = upload.get("url"), upload.get("uploadKey")
-            if not isinstance(url, str) or not isinstance(upload_key, str): raise ZoteroError("Zotero file upload authorization returned malformed JSON")
-            posted = self.http_client.request("POST", url, headers={"Content-Type": str(upload.get("contentType") or "application/pdf"), "Zotero-API-Version": "3"}, content=str(upload.get("prefix", "")).encode() + data + str(upload.get("suffix", "")).encode())
-            if posted.status_code != 201: raise ZoteroError(f"Zotero file upload failed with HTTP {posted.status_code}")
-            registered = write(file_path, urlencode({"upload": upload_key}).encode(), {"Content-Type": "application/x-www-form-urlencoded", "If-None-Match": "*"})
-            if registered.status_code != 204: raise ZoteroError(f"Zotero file upload registration failed with HTTP {registered.status_code}")
-        created = PaperMetadata(title=metadata.title, authors=list(metadata.authors), doi=metadata.doi, arxiv_id=metadata.arxiv_id, source_url=metadata.source_url, zotero_library_id=str(self.user_id), zotero_item_key=parent_key)
+        form = urlencode({
+            "md5": hashlib.md5(data).hexdigest(),
+            "filename": source.name,
+            "filesize": len(data),
+            "mtime": int(source.stat().st_mtime * 1000),
+        }).encode()
+        checkpoint("upload_authorization_planned")
+        upload = _json_response(
+            write(
+                file_path, form,
+                {
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "If-None-Match": "*",
+                },
+                write_token=str(operation["upload_write_token"]),
+                action="upload",
+            ),
+            "file upload authorization",
+        )
+        if not isinstance(upload, dict):
+            raise ZoteroError(
+                "Zotero file upload authorization returned malformed JSON"
+            )
+        if upload.get("exists") == 1:
+            checkpoint("complete", {"registered": True})
+            return self._created_resolution(
+                metadata, source, parent_key, attachment_key,
+            )
+        url, upload_key = upload.get("url"), upload.get("uploadKey")
+        if not isinstance(url, str) or not isinstance(upload_key, str):
+            raise ZoteroError(
+                "Zotero file upload authorization returned malformed JSON"
+            )
+        upload_state = {
+            "upload_url": url,
+            "upload_key": upload_key,
+            "upload_content_type": str(
+                upload.get("contentType") or "application/pdf"
+            ),
+            "upload_prefix": str(upload.get("prefix", "")),
+            "upload_suffix": str(upload.get("suffix", "")),
+        }
+        checkpoint("upload_authorized", upload_state)
+        checkpoint("upload_planned")
+        try:
+            posted = self.http_client.request(
+                "POST", url,
+                headers={
+                    "Content-Type": upload_state["upload_content_type"],
+                    "Zotero-API-Version": "3",
+                },
+                content=(
+                    upload_state["upload_prefix"].encode()
+                    + data
+                    + upload_state["upload_suffix"].encode()
+                ),
+            )
+        except Exception as exc:
+            raise ZoteroError(f"Zotero local API is unavailable: {exc}") from exc
+        if posted.status_code != 201:
+            raise ZoteroError(
+                f"Zotero file upload failed with HTTP {posted.status_code}"
+            )
+        checkpoint("uploaded", {"uploaded": True})
+        checkpoint("registration_planned")
+        registered = write(
+            file_path, urlencode({"upload": upload_key}).encode(),
+            {
+                "Content-Type": "application/x-www-form-urlencoded",
+                "If-None-Match": "*",
+            },
+            write_token=str(operation["registration_write_token"]),
+            action="registration",
+        )
+        if registered.status_code != 204:
+            raise ZoteroError(
+                "Zotero file upload registration failed with "
+                f"HTTP {registered.status_code}"
+            )
+        checkpoint("registered", {"registered": True})
+        checkpoint("complete")
+        return self._created_resolution(metadata, source, parent_key, attachment_key)
+
+    def _find_existing_parent(self, metadata: PaperMetadata) -> object | None:
+        identity = metadata.doi or metadata.arxiv_id
+        if not identity:
+            return None
+        query = urlencode({
+            "q": identity, "qmode": "everything", "itemType": "-attachment",
+        })
+        for item in _item_list(
+            self._get_json(f"users/{self.user_id}/items?{query}")
+        ):
+            item_data = _item_data(item)
+            candidate = PaperMetadata(
+                doi=_as_string(item_data.get("DOI")),
+                arxiv_id=_as_string(item_data.get("archiveID")),
+            )
+            if (
+                (metadata.doi is not None and candidate.doi == metadata.doi)
+                or (
+                    metadata.arxiv_id is not None
+                    and candidate.arxiv_id == metadata.arxiv_id
+                )
+            ):
+                return item
+        return None
+
+    def _optional_item(self, key: str) -> object | None:
+        response = self._request("GET", f"users/{self.user_id}/items/{key}")
+        if response.status_code == 404:
+            return None
+        if not 200 <= response.status_code < 300:
+            raise ZoteroError(
+                f"Zotero API returned HTTP {response.status_code} for item {key}"
+            )
+        try:
+            return json.loads(response.content)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ZoteroError(
+                f"Zotero API returned malformed JSON for item {key}"
+            ) from exc
+
+    def _created_resolution(
+        self,
+        metadata: PaperMetadata,
+        source: Path,
+        parent_key: str,
+        attachment_key: str,
+    ) -> "ZoteroResolution":
+        created = PaperMetadata(
+            title=metadata.title,
+            authors=list(metadata.authors),
+            published_date=metadata.published_date,
+            published_date_raw=metadata.published_date_raw,
+            doi=metadata.doi,
+            arxiv_id=metadata.arxiv_id,
+            source_url=metadata.source_url,
+            zotero_library_id=str(self.user_id),
+            zotero_item_key=parent_key,
+        )
         return ZoteroResolution(created, source, parent_key, attachment_key)
 
     def _resolve_attachment(self, attachment: object, *, parent: object | None = None) -> "ZoteroResolution":
@@ -201,12 +481,12 @@ class ZoteroClient:
             if response.status_code == 404:
                 raise ZoteroInputError(f"Zotero attachment {attachment_key} is missing")
             raise ZoteroError(f"Zotero API returned HTTP {response.status_code} for attachment file {attachment_key}")
-        location = response.headers.get("location") or response.headers.get("Location")
+        location = _header_value(response.headers, "Location")
         if not location or urlparse(location).scheme != "file":
             raise ZoteroInputError(
                 f"Zotero attachment {attachment_key} did not return an accessible local file"
             )
-        path = Path(unquote(urlparse(location).path).lstrip("/"))
+        path = Path(file_url_to_path(location))
         return path if path.is_file() else None
 
     @staticmethod
@@ -257,6 +537,7 @@ def _is_pdf_attachment(item: object) -> bool:
 
 def _metadata(item: object, library_id: str = "0") -> PaperMetadata:
     data = _item_data(item)
+    meta = item.get("meta") if isinstance(item, dict) else None
     creators = data.get("creators")
     authors: list[str] = []
     if isinstance(creators, list):
@@ -264,9 +545,12 @@ def _metadata(item: object, library_id: str = "0") -> PaperMetadata:
             if isinstance(creator, dict):
                 name = " ".join(str(creator.get(name_part, "")).strip() for name_part in ("firstName", "lastName")).strip()
                 authors.append(name or str(creator.get("name", "")).strip())
+    raw_date = _as_string(data.get("date"))
+    parsed_date = _as_string(meta.get("parsedDate")) if isinstance(meta, dict) else None
     return PaperMetadata(
         title=_as_string(data.get("title")), authors=[author for author in authors if author],
-        published_date=_as_string(data.get("date")), doi=_as_string(data.get("DOI")),
+        published_date=normalize_zotero_date(parsed_date) or normalize_zotero_date(raw_date),
+        published_date_raw=raw_date, doi=_as_string(data.get("DOI")),
         arxiv_id=_as_string(data.get("archiveID")), source_url=_as_string(data.get("url")),
         zotero_library_id=library_id, zotero_item_key=_item_key(item),
     )
@@ -274,6 +558,67 @@ def _metadata(item: object, library_id: str = "0") -> PaperMetadata:
 
 def _as_string(value: object) -> str | None:
     return value if isinstance(value, str) and value.strip() else None
+
+
+def _header_value(headers: Mapping[str, str], name: str) -> str | None:
+    wanted = name.casefold()
+    for key, value in headers.items():
+        if key.casefold() == wanted:
+            return value
+    return None
+
+
+def normalize_zotero_date(value: str | None) -> str | None:
+    """Return a Notion-safe ISO date while preserving Zotero precision."""
+    if not value:
+        return None
+    raw = value.strip()
+    season = re.fullmatch(r"(spring|summer|autumn|fall|winter)\s+(\d{4})", raw, re.IGNORECASE)
+    if season:
+        month = {"spring": 3, "summer": 6, "autumn": 9, "fall": 9, "winter": 12}[
+            season.group(1).casefold()
+        ]
+        try:
+            date(int(season.group(2)), month, 1)
+        except ValueError:
+            return None
+        return f"{season.group(2)}-{month:02d}"
+    if re.fullmatch(r"\d{4}", raw):
+        try:
+            date(int(raw), 1, 1)
+        except ValueError:
+            return None
+        return raw
+    if re.fullmatch(r"\d{4}-\d{2}", raw):
+        try:
+            date.fromisoformat(raw + "-01")
+        except ValueError:
+            return None
+        return raw
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+        try:
+            date.fromisoformat(raw)
+        except ValueError:
+            return None
+        return raw
+    return None
+
+
+def file_url_to_path(value: str, *, platform: str = os.name) -> PurePath:
+    """Decode a local ``file:`` URL without losing drive or UNC semantics."""
+    parsed = urlparse(value)
+    if parsed.scheme.casefold() != "file":
+        raise ValueError("Expected a file URL")
+    decoded_path = unquote(parsed.path)
+    if platform == "nt":
+        if parsed.netloc and parsed.netloc.casefold() != "localhost":
+            return PureWindowsPath(f"//{parsed.netloc}{decoded_path}")
+        if re.match(r"^/[A-Za-z]:/", decoded_path):
+            decoded_path = decoded_path[1:]
+        return PureWindowsPath(decoded_path)
+    if parsed.netloc and parsed.netloc.casefold() != "localhost":
+        return PurePosixPath(f"//{parsed.netloc}{decoded_path}")
+    return PurePosixPath(decoded_path)
 
 
 def _json_response(response: ZoteroHttpResponse, operation: str) -> object:
@@ -293,3 +638,18 @@ def _created_key(value: object) -> str:
     if not isinstance(key, str) or not key:
         raise ZoteroError("Zotero item creation did not return a key")
     return key
+
+
+_ZOTERO_KEY_ALPHABET = "23456789ABCDEFGHIJKLMNPQRSTUVWXYZ"
+
+
+def _stable_zotero_key(operation_id: str, purpose: str) -> str:
+    digest = hashlib.sha256(f"{operation_id}:{purpose}".encode()).digest()
+    return "".join(
+        _ZOTERO_KEY_ALPHABET[value % len(_ZOTERO_KEY_ALPHABET)]
+        for value in digest[:8]
+    )
+
+
+def _stable_token(operation_id: str, purpose: str) -> str:
+    return hashlib.sha256(f"{operation_id}:write:{purpose}".encode()).hexdigest()

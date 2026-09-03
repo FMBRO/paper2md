@@ -130,6 +130,11 @@ class ResearchViewModel:
             "needs_input", "budget_exceeded", "failed", "completed",
         }
 
+    def begin_job_operation(self, job_id: str, *, status: str) -> None:
+        """Project an operation before its worker can report success or failure."""
+        self.job_id = job_id.strip()
+        self.status = status
+
     def apply(self, item: QueueItem) -> None:
         if isinstance(item, PipelineEvent):
             if item.pdf_name:
@@ -938,7 +943,7 @@ class Paper2MdApp:
         except (OSError, ValueError, RuntimeError) as error:
             messagebox.showerror("Cannot resume", str(error), parent=self.root)
             return
-        self.research_model.status = "Running"
+        self.research_model.begin_job_operation(job_id, status="Running")
         self._set_pipeline_running(True)
         self._render_research_model()
 
@@ -956,7 +961,7 @@ class Paper2MdApp:
         except (OSError, ValueError, RuntimeError) as error:
             messagebox.showerror("Cannot load status", str(error), parent=self.root)
             return
-        self.research_model.status = "Loading status"
+        self.research_model.begin_job_operation(job_id, status="Loading status")
         self._set_pipeline_running(True)
         self._render_research_model()
 

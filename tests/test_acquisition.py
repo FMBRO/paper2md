@@ -28,6 +28,7 @@ class MappingHttpClient:
         ("doi:10.1000/ABC.Def", "doi", "10.1000/abc.def"),
         ("https://doi.org/10.1000/ABC.Def", "doi", "10.1000/abc.def"),
         ("https://example.test/download/paper.pdf", "pdf_url", "https://example.test/download/paper.pdf"),
+        ("https://example.test/download?id=paper", "pdf_url", "https://example.test/download?id=paper"),
         ("zotero://select/library/items/ABCD1234", "zotero_item", "ABCD1234"),
         ("ABCD1234", "zotero_item", "ABCD1234"),
         ("collection:WXYZ5678", "zotero_collection", "WXYZ5678"),
@@ -91,6 +92,32 @@ def test_acquire_copies_a_local_pdf_and_computes_its_digest(tmp_path: Path) -> N
     assert result.source_pdf.read_bytes() == PDF_BYTES
     assert result.pdf_sha256 == hashlib.sha256(PDF_BYTES).hexdigest()
     assert result.metadata.source_url == original.resolve().as_uri()
+
+
+def test_local_acquisition_persists_the_bytes_already_read_for_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.acquisition import DocumentAcquirer, parse_input
+    from src.artifacts import ArtifactManager
+
+    original = tmp_path / "volatile.pdf"
+    original.write_bytes(PDF_BYTES)
+    original_read_bytes = Path.read_bytes
+
+    def read_then_remove(path: Path) -> bytes:
+        content = original_read_bytes(path)
+        if path == original:
+            path.unlink()
+        return content
+
+    monkeypatch.setattr(Path, "read_bytes", read_then_remove)
+
+    result = DocumentAcquirer().acquire(
+        parse_input(str(original)), ArtifactManager(tmp_path, "local-stable"),
+    )
+
+    assert result.source_pdf is not None
+    assert original_read_bytes(result.source_pdf) == PDF_BYTES
 
 
 def test_acquire_downloads_and_validates_a_direct_pdf_url(tmp_path: Path) -> None:

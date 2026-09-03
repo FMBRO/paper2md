@@ -87,6 +87,82 @@ def test_section_chunks_combine_small_paragraphs_without_crossing_sections() -> 
     ]
 
 
+def test_chunk_builder_uses_renderer_ordinal_across_mixed_block_types() -> None:
+    from src.openrouter import build_document_chunks
+
+    document = {
+        "sections": [{"id": "results", "title": "Results", "page": 1}],
+        "paragraphs": [
+            {"text": "third", "page": 1, "section_id": "results", "ordinal": 30,
+             "source_position": {"page": 1, "bbox": [10, 10, 20, 20]}},
+            {"text": "first", "page": 1, "section_id": "results", "ordinal": 10,
+             "source_position": {"page": 1, "bbox": [300, 300, 400, 320]}},
+        ],
+        "tables": [{
+            "markdown": "<table><tr><td>second</td></tr></table>",
+            "page": 1, "section_id": "results", "ordinal": 20,
+            "source_position": {"page": 1, "bbox": [500, 5, 550, 30]},
+        }],
+        "equations": [],
+        "captions": [],
+    }
+
+    chunks = build_document_chunks(document, max_chars=100)
+
+    assert [chunk.text for chunk in chunks] == [
+        "first", "<table><tr><td>second</td></tr></table>", "third",
+    ]
+
+
+def test_chunk_builder_falls_back_to_page_y_x_when_ordinal_is_absent() -> None:
+    from src.openrouter import build_document_chunks
+
+    document = {
+        "sections": [],
+        "paragraphs": [
+            {"text": "lower-left", "page": 1,
+             "source_position": {"page": 1, "bbox": [20, 200, 200, 240]}},
+            {"text": "upper-right", "page": 1,
+             "source_position": {"page": 1, "bbox": [320, 50, 560, 90]}},
+        ],
+        "tables": [], "equations": [], "captions": [],
+    }
+
+    chunks = build_document_chunks(document, max_chars=12)
+
+    assert [chunk.text for chunk in chunks] == ["upper-right", "lower-left"]
+
+
+def test_chunk_builder_splits_oversized_paragraphs_only_at_stable_boundaries() -> None:
+    from src.openrouter import build_document_chunks
+
+    source_text = "First sentence. Second sentence.\nThird words here."
+    document = {
+        "sections": [{"id": "intro", "title": "Introduction", "page": 3}],
+        "paragraphs": [{
+            "text": source_text,
+            "page": 3,
+            "section_id": "intro",
+            "ordinal": 7,
+            "source_position": {"page": 3, "bbox": [10, 20, 300, 80]},
+        }],
+        "tables": [], "equations": [], "captions": [],
+    }
+
+    chunks = build_document_chunks(document, max_chars=20)
+
+    assert [chunk.text for chunk in chunks] == [
+        "First sentence.", "Second sentence.", "Third words here.",
+    ]
+    assert all(chunk.start_page == chunk.end_page == 3 for chunk in chunks)
+    assert [chunk.evidence[0].source_text for chunk in chunks] == [
+        "First sentence.", "Second sentence.", "Third words here.",
+    ]
+    assert [chunk.evidence[0].source_position["fragment"] for chunk in chunks] == [
+        1, 2, 3,
+    ]
+
+
 def test_structured_payload_requires_schema_zdr_and_no_data_collection() -> None:
     from src.config import OpenRouterSettings
     from src.openrouter import PaperSummaryResponse, PricingSnapshot, build_structured_payload
@@ -185,6 +261,31 @@ def test_final_summary_schema_requires_evidence() -> None:
     payload["background"] = "English only"
     with pytest.raises(ValidationError):
         PaperSummaryResponse.model_validate(payload)
+
+
+def test_openrouter_rejects_mostly_english_narrative_with_one_japanese_character() -> None:
+    from pydantic import ValidationError
+
+    from src.openrouter import PaperSummaryResponse
+
+    payload = _summary()
+    payload["background"] = (
+        "This is an otherwise entirely English background with many ordinary words 結"
+    )
+
+    with pytest.raises(ValidationError, match="Japanese"):
+        PaperSummaryResponse.model_validate(payload)
+
+
+def test_openrouter_accepts_normal_japanese_narrative_with_english_terms() -> None:
+    from src.openrouter import PaperSummaryResponse
+
+    payload = _summary()
+    payload["background"] = (
+        "本研究ではTransformerとOpenAI APIを用いて検索精度を改善する。"
+    )
+
+    assert PaperSummaryResponse.model_validate(payload).background == payload["background"]
 
 
 def test_worst_case_cost_uses_both_configured_token_limits() -> None:
@@ -377,6 +478,67 @@ def test_summarizer_persists_usage_writes_summary_and_reuses_cache(
     assert saved["evidence"][0]["page"] == 1
 
 
+def test_standard_openrouter_response_resolves_provider_from_generation_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.artifacts import ArtifactManager
+    from src.job_store import JobStore
+    from src.openrouter import OpenRouterSummarizer
+    from src.research_models import InputKind, InputSpec
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "secret")
+    fixture_dir = Path(__file__).parent / "fixtures" / "openrouter"
+    completion_fixture = json.loads(
+        (fixture_dir / "chat_completion_standard.json").read_text(encoding="utf-8")
+    )
+    generation_fixture = json.loads(
+        (fixture_dir / "generation_metadata.json").read_text(encoding="utf-8")
+    )
+    posted: list[httpx.Request] = []
+    generation_ids: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            posted.append(request)
+            request_payload = json.loads(request.content)
+            response_payload = json.loads(json.dumps(completion_fixture))
+            response_payload["id"] = f"generation-{len(posted)}"
+            response_payload["model"] = request_payload["model"]
+            response_payload["choices"][0]["message"]["content"] = json.dumps(
+                _extraction() if len(posted) == 1 else _summary(), ensure_ascii=False,
+            )
+            return httpx.Response(200, json=response_payload)
+        assert request.url.path == "/api/v1/generation"
+        generation_id = request.url.params["id"]
+        generation_ids.append(generation_id)
+        metadata = json.loads(json.dumps(generation_fixture))
+        metadata["data"]["id"] = generation_id
+        return httpx.Response(200, json=metadata)
+
+    store = JobStore(tmp_path / "state.sqlite3")
+    job = store.create_job(InputSpec(InputKind.ARXIV, "2401.00001"))
+    summarizer = OpenRouterSummarizer(
+        store,
+        settings=_settings(),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        catalog=_pricing(),
+    )
+
+    result = summarizer.summarize(
+        _document(), job_id=job.id,
+        artifacts=ArtifactManager(tmp_path / "out", "paper"),
+    )
+
+    assert result.relevance_score == 4
+    assert generation_ids == ["generation-1", "generation-2"]
+    assert all(request.headers["x-openrouter-metadata"] == "enabled" for request in posted)
+    with sqlite3.connect(store.path) as connection:
+        providers = [row[0] for row in connection.execute(
+            "SELECT provider FROM llm_calls ORDER BY id"
+        )]
+    assert providers == ["Google", "Google"]
+
+
 def test_summarizer_allows_configured_role_model_ids_without_cross_model_fallback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -541,6 +703,73 @@ def test_missing_cost_is_persisted_as_unresolved_and_is_not_retried(
             "SELECT generation_id, validated, cost_resolved FROM llm_calls"
         ).fetchone()
     assert row == ("generation-id", 0, 0)
+
+
+def test_transport_timeout_after_dispatch_is_durable_and_never_auto_resent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.artifacts import ArtifactManager
+    from src.job_store import JobStore
+    from src.openrouter import OpenRouterSummarizer, UnresolvedUsageError
+    from src.research_models import InputKind, InputSpec
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "secret")
+    store = JobStore(tmp_path / "state.sqlite3")
+    job = store.create_job(InputSpec(InputKind.ARXIV, "2401.00001"))
+    observed_before_post: list[tuple[int, int, float]] = []
+    calls = 0
+
+    def timeout_after_dispatch(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        with sqlite3.connect(store.path) as connection:
+            attempt = connection.execute(
+                "SELECT COUNT(*) FROM llm_calls WHERE cost_resolved = 0"
+            ).fetchone()[0]
+            reservation = connection.execute(
+                "SELECT COUNT(*), MIN(amount_usd) FROM llm_budget_reservations "
+                "WHERE unresolved = 1"
+            ).fetchone()
+        observed_before_post.append((attempt, reservation[0], reservation[1]))
+        raise httpx.ReadTimeout("response lost", request=request)
+
+    summarizer = OpenRouterSummarizer(
+        store,
+        settings=_settings(),
+        client=httpx.Client(transport=httpx.MockTransport(timeout_after_dispatch)),
+        catalog=_pricing(),
+    )
+
+    with pytest.raises(UnresolvedUsageError, match="unresolved"):
+        summarizer.summarize(
+            _document(), job_id=job.id,
+            artifacts=ArtifactManager(tmp_path / "out", "paper"),
+        )
+
+    assert calls == 1
+    assert observed_before_post[0][0:2] == (1, 1)
+    assert observed_before_post[0][2] >= 0.00375
+    with sqlite3.connect(store.path) as connection:
+        row = connection.execute(
+            "SELECT cost_resolved, validated, dispatch_state, authorized_amount_usd "
+            "FROM llm_calls"
+        ).fetchone()
+    assert row == (0, 0, "dispatched", pytest.approx(0.00375))
+
+    resumed = OpenRouterSummarizer(
+        store,
+        settings=_settings(),
+        client=httpx.Client(transport=httpx.MockTransport(
+            lambda _: pytest.fail("ambiguous dispatch must not be resent")
+        )),
+        catalog=_pricing(),
+    )
+    with pytest.raises(UnresolvedUsageError):
+        resumed.summarize(
+            _document(), job_id=job.id,
+            artifacts=ArtifactManager(tmp_path / "out", "paper-resume"),
+        )
+    assert calls == 1
 
 
 def test_price_change_does_not_bypass_unresolved_logical_request_on_resume(
@@ -779,6 +1008,92 @@ def test_serialized_map_request_must_fit_configured_input_ceiling(
     with pytest.raises(InputLimitExceededError, match="extraction"):
         summarizer.summarize(
             _document(), job_id=job.id,
+            artifacts=ArtifactManager(tmp_path / "out", "paper"),
+        )
+
+
+def test_map_chunks_pack_against_complete_serialized_schema_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.artifacts import ArtifactManager
+    from src.job_store import JobStore
+    from src.openrouter import OpenRouterSummarizer, estimate_serialized_tokens
+    from src.research_models import InputKind, InputSpec
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "secret")
+    payloads: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        payloads.append(payload)
+        content = _summary() if payload["model"] == "openai/gpt-5.6-sol" else _extraction()
+        return httpx.Response(
+            200, json=_completion(content, model=payload["model"], provider="p", cost=0.001),
+        )
+
+    document = _document()
+    document["paragraphs"][0]["text"] = " ".join(
+        "This paper evaluates a compact method." for _ in range(40)
+    )
+    settings = _settings(
+        extraction_max_input_tokens=1_800,
+        synthesis_max_input_tokens=20_000,
+        chunk_max_chars=12_000,
+        max_validation_retries=0,
+    )
+    store = JobStore(tmp_path / "state.sqlite3")
+    job = store.create_job(InputSpec(InputKind.ARXIV, "2401.00001"))
+
+    OpenRouterSummarizer(
+        store,
+        settings=settings,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        catalog=_pricing(),
+    ).summarize(
+        document, job_id=job.id,
+        artifacts=ArtifactManager(tmp_path / "out", "paper"),
+    )
+
+    map_payloads = [
+        payload for payload in payloads
+        if payload["model"] == "google/gemini-3.8-flash"
+    ]
+    assert len(map_payloads) > 1
+    assert all(estimate_serialized_tokens(payload) <= 1_800 for payload in map_payloads)
+
+
+def test_atomic_table_fails_closed_when_schema_overhead_exceeds_input_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.artifacts import ArtifactManager
+    from src.job_store import JobStore
+    from src.openrouter import InputLimitExceededError, OpenRouterSummarizer
+    from src.research_models import InputKind, InputSpec
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "secret")
+    document = {
+        "sections": [{"id": "results", "title": "Results", "page": 1}],
+        "paragraphs": [],
+        "tables": [{
+            "markdown": "<table><tr><td>" + "x " * 250 + "</td></tr></table>",
+            "page": 1,
+            "section_id": "results",
+        }],
+        "equations": [],
+        "captions": [],
+    }
+    store = JobStore(tmp_path / "state.sqlite3")
+    job = store.create_job(InputSpec(InputKind.ARXIV, "2401.00001"))
+    summarizer = OpenRouterSummarizer(
+        store,
+        settings=_settings(extraction_max_input_tokens=1_800),
+        client=httpx.Client(transport=httpx.MockTransport(lambda _: pytest.fail("no HTTP"))),
+        catalog=_pricing(),
+    )
+
+    with pytest.raises(InputLimitExceededError, match="indivisible table"):
+        summarizer.summarize(
+            document, job_id=job.id,
             artifacts=ArtifactManager(tmp_path / "out", "paper"),
         )
 
@@ -1442,12 +1757,12 @@ def test_request_claim_heartbeat_prevents_takeover_after_original_lease_expiry(
     assert extraction_calls == 1
 
 
-def test_failed_budget_settlement_rolls_back_llm_charge_atomically(
+def test_failed_budget_settlement_leaves_durable_unresolved_attempt_without_resend(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from src.artifacts import ArtifactManager
     from src.job_store import JobStore
-    from src.openrouter import OpenRouterSummarizer
+    from src.openrouter import OpenRouterSummarizer, UnresolvedUsageError
     from src.research_models import InputKind, InputSpec
 
     monkeypatch.setenv("OPENROUTER_API_KEY", "secret")
@@ -1483,15 +1798,33 @@ def test_failed_budget_settlement_rolls_back_llm_charge_atomically(
         catalog=_pricing(),
     )
 
-    with pytest.raises(sqlite3.IntegrityError, match="simulated settlement crash"):
+    with pytest.raises(UnresolvedUsageError, match="settlement"):
         summarizer.summarize(
             _document(), job_id=job.id,
             artifacts=ArtifactManager(tmp_path / "out", "paper"),
         )
 
     with sqlite3.connect(store.path) as connection:
-        recorded_attempts = connection.execute(
-            "SELECT COUNT(*) FROM llm_calls"
+        recorded_attempt = connection.execute(
+            "SELECT cost_resolved, validated, dispatch_state FROM llm_calls"
+        ).fetchone()
+        unresolved_reservation = connection.execute(
+            "SELECT unresolved FROM llm_budget_reservations"
         ).fetchone()[0]
-    assert recorded_attempts == 0
+    assert recorded_attempt == (0, 0, "dispatched")
+    assert unresolved_reservation == 1
     assert store.total_cost(job.id) == 0
+
+    resumed = OpenRouterSummarizer(
+        store,
+        settings=_settings(max_validation_retries=0),
+        client=httpx.Client(transport=httpx.MockTransport(
+            lambda _: pytest.fail("failed settlement must not be resent")
+        )),
+        catalog=_pricing(),
+    )
+    with pytest.raises(UnresolvedUsageError):
+        resumed.summarize(
+            _document(), job_id=job.id,
+            artifacts=ArtifactManager(tmp_path / "out", "resume"),
+        )

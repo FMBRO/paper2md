@@ -21,10 +21,19 @@ from pydantic import ValidationError
 from src.artifacts import ArtifactManager
 from src.config import OPENROUTER_CHAT_COMPLETIONS_ENDPOINT, OpenRouterSettings
 from src.job_store import JobStore
-from src.research_models import ArtifactBundle, EvidenceAnchor, PaperSummary
+from src.research_models import (
+    ArtifactBundle,
+    EvidenceAnchor,
+    PaperSummary,
+    has_sufficient_japanese_narrative,
+)
 
 
 ResponseModel = TypeVar("ResponseModel", bound=BaseModel)
+
+EXTRACTION_PROMPT_SCHEMA_VERSION = "paper2md-extraction-v1"
+SYNTHESIS_PROMPT_SCHEMA_VERSION = "paper2md-synthesis-v1"
+OPENROUTER_GENERATION_ENDPOINT = "https://openrouter.ai/api/v1/generation"
 
 
 class PrivacyRequirementsError(RuntimeError):
@@ -71,9 +80,6 @@ class EvidenceResponse(BaseModel):
     quote: str = Field(min_length=1)
 
 
-_JAPANESE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]")
-
-
 class PaperSummaryResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -97,7 +103,7 @@ class PaperSummaryResponse(BaseModel):
     )
     @classmethod
     def require_japanese_narrative(cls, value: str) -> str:
-        if not _JAPANESE.search(value):
+        if not has_sufficient_japanese_narrative(value):
             raise ValueError("narrative fields must be written in Japanese")
         return value
 
@@ -114,7 +120,7 @@ class ChunkExtractionResponse(BaseModel):
     @field_validator("summary")
     @classmethod
     def require_japanese_summary(cls, value: str) -> str:
-        if not _JAPANESE.search(value):
+        if not has_sufficient_japanese_narrative(value):
             raise ValueError("chunk summary must be written in Japanese")
         return value
 
@@ -142,7 +148,7 @@ class _BillableResponse(BaseModel):
 
     generation_id: str | None = Field(default=None, alias="id")
     model: str | None = None
-    provider: str | None = None
+    provider: Any = None
     usage: _AuditUsageResponse | None = None
 
 
@@ -162,9 +168,33 @@ class _CompletionResponse(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     model: str
-    provider: str = Field(min_length=1)
+    provider: Any = None
     choices: list[_ChoiceResponse] = Field(min_length=1)
     usage: _UsageResponse
+
+
+def _provider_from_payload(value: object) -> str | None:
+    """Read provider labels from documented or forward-compatible metadata shapes."""
+    if isinstance(value, dict):
+        for key in ("provider_name", "provider"):
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+            if isinstance(candidate, (dict, list)):
+                nested = _provider_from_payload(candidate)
+                if nested:
+                    return nested
+        for candidate in value.values():
+            if isinstance(candidate, (dict, list)):
+                nested = _provider_from_payload(candidate)
+                if nested:
+                    return nested
+    elif isinstance(value, list):
+        for candidate in value:
+            nested = _provider_from_payload(candidate)
+            if nested:
+                return nested
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -437,20 +467,22 @@ class OpenRouterSummarizer:
                         reservation_id, reservation_owner_token,
                     )
                 return cached
-            if self.store.has_unresolved_llm_call(cache_key):
-                raise UnresolvedUsageError(
-                    "OpenRouter cost remains unresolved for this request"
-                )
-            if self.store.llm_attempt_count(cache_key) >= attempts:
-                raise StructuredOutputError(
-                    f"Structured output retries already exhausted after {attempts} attempts"
-                )
             if self.store.claim_llm_request(
                 cache_key,
                 owner_token,
                 now=time.time(),
                 lease_seconds=claim_lease_seconds,
             ):
+                if self.store.has_unresolved_llm_call(cache_key):
+                    self.store.release_llm_request(cache_key, owner_token)
+                    raise UnresolvedUsageError(
+                        "OpenRouter cost remains unresolved for this request"
+                    )
+                if self.store.llm_attempt_count(cache_key) >= attempts:
+                    self.store.release_llm_request(cache_key, owner_token)
+                    raise StructuredOutputError(
+                        f"Structured output retries already exhausted after {attempts} attempts"
+                    )
                 break
             if time.monotonic() >= deadline:
                 raise RequestInFlightError("Timed out waiting for an identical LLM request")
@@ -575,24 +607,62 @@ class OpenRouterSummarizer:
                 ]
             self._ensure_input_limit(attempt_payload, max_input_tokens, stage)
             request_hash = self._request_hash(attempt_payload)
+            dispatched = self.store.begin_llm_dispatch(
+                job_id,
+                request_hash=request_hash,
+                cache_key=cache_key,
+                model=str(attempt_payload["model"]),
+                reservation_id=reservation_id,
+                request_owner_token=request_owner_token,
+                reservation_owner_token=reservation_owner_token,
+                authorized_amount_usd=authorized_per_attempt,
+                now=time.time(),
+                pricing=pricing.as_record(),
+            )
+            if not dispatched:
+                raise UnresolvedUsageError(
+                    "OpenRouter dispatch is already recorded and remains unresolved"
+                )
             try:
                 response = self.client.post(
                     self.settings.endpoint,
                     headers={
                         "Authorization": f"Bearer {api_key}",
                         "Content-Type": "application/json",
+                        "X-OpenRouter-Metadata": "enabled",
                     },
                     json=attempt_payload,
                     timeout=self.settings.request_timeout_seconds,
                 )
             except httpx.HTTPError as error:
-                raise OpenRouterAPIError("OpenRouter request failed") from error
+                raise UnresolvedUsageError(
+                    "OpenRouter dispatch outcome is unresolved after transport failure"
+                ) from error
             if response.status_code < 200 or response.status_code >= 300:
+                self._settle_dispatch(
+                    job_id,
+                    request_hash=request_hash,
+                    cache_key=cache_key,
+                    model=str(attempt_payload["model"]),
+                    provider=None,
+                    generation_id=None,
+                    response={"http_status": response.status_code},
+                    usage={},
+                    cost_usd=0.0,
+                    cost_resolved=True,
+                    validated=False,
+                    pricing=pricing.as_record(),
+                    reservation_id=reservation_id,
+                    request_owner_token=request_owner_token,
+                    reservation_owner_token=reservation_owner_token,
+                    authorized_amount_usd=authorized_per_attempt,
+                    now=time.time(),
+                )
                 raise OpenRouterAPIError(f"OpenRouter returned HTTP {response.status_code}")
             try:
                 raw_response = response.json()
             except ValueError as error:
-                self.store.record_llm_call_and_settle_budget(
+                self._settle_dispatch(
                     job_id,
                     request_hash=request_hash,
                     cache_key=cache_key,
@@ -619,10 +689,15 @@ class OpenRouterSummarizer:
             except ValidationError as error:
                 audit = _BillableResponse()
                 last_error = error
+            provider = _provider_from_payload(raw_response)
+            if provider is None and audit.generation_id is not None:
+                provider = self._provider_from_generation(
+                    audit.generation_id, api_key=api_key,
+                )
             resolved = (
                 audit.generation_id is not None
                 and audit.model is not None
-                and audit.provider is not None
+                and provider is not None
                 and audit.usage is not None
                 and audit.usage.prompt_tokens is not None
                 and audit.usage.completion_tokens is not None
@@ -631,12 +706,12 @@ class OpenRouterSummarizer:
             )
             if not resolved:
                 usage = audit.usage.model_dump(mode="json") if audit.usage else {}
-                self.store.record_llm_call_and_settle_budget(
+                self._settle_dispatch(
                     job_id,
                     request_hash=request_hash,
                     cache_key=cache_key,
                     model=audit.model or str(attempt_payload["model"]),
-                    provider=audit.provider,
+                    provider=provider,
                     generation_id=audit.generation_id,
                     response=raw_response,
                     usage=usage,
@@ -656,12 +731,12 @@ class OpenRouterSummarizer:
             usage = audit.usage.model_dump(mode="json")
             cost_usd = float(audit.usage.cost)
             if audit.model != attempt_payload["model"]:
-                self.store.record_llm_call_and_settle_budget(
+                self._settle_dispatch(
                     job_id,
                     request_hash=request_hash,
                     cache_key=cache_key,
                     model=audit.model,
-                    provider=audit.provider,
+                    provider=provider,
                     generation_id=audit.generation_id,
                     response=raw_response,
                     usage=usage,
@@ -678,12 +753,12 @@ class OpenRouterSummarizer:
             try:
                 envelope = _CompletionResponse.model_validate(raw_response)
             except ValidationError as error:
-                self.store.record_llm_call_and_settle_budget(
+                self._settle_dispatch(
                     job_id,
                     request_hash=request_hash,
                     cache_key=cache_key,
                     model=audit.model,
-                    provider=audit.provider,
+                    provider=provider,
                     generation_id=audit.generation_id,
                     response=raw_response,
                     usage=usage,
@@ -705,12 +780,12 @@ class OpenRouterSummarizer:
                 if validate is not None:
                     validate(parsed)
             except (json.JSONDecodeError, ValidationError, ValueError) as error:
-                self.store.record_llm_call_and_settle_budget(
+                self._settle_dispatch(
                     job_id,
                     request_hash=request_hash,
                     cache_key=cache_key,
                     model=envelope.model,
-                    provider=envelope.provider,
+                    provider=provider,
                     generation_id=audit.generation_id,
                     response={"content": content},
                     usage=usage,
@@ -725,12 +800,12 @@ class OpenRouterSummarizer:
                 )
                 last_error = error
                 continue
-            self.store.record_llm_call_and_settle_budget(
+            self._settle_dispatch(
                 job_id,
                 request_hash=request_hash,
                 cache_key=cache_key,
                 model=envelope.model,
-                provider=envelope.provider,
+                provider=provider,
                 generation_id=audit.generation_id,
                 response=parsed.model_dump(mode="json"),
                 usage=usage,
@@ -747,6 +822,38 @@ class OpenRouterSummarizer:
         raise StructuredOutputError(
             f"Structured output remained invalid after {attempts} attempts"
         ) from last_error
+
+    def _provider_from_generation(self, generation_id: str, *, api_key: str) -> str:
+        try:
+            response = self.client.get(
+                OPENROUTER_GENERATION_ENDPOINT,
+                params={"id": generation_id},
+                headers={"Authorization": f"Bearer {api_key}"},
+                timeout=self.settings.request_timeout_seconds,
+            )
+        except httpx.HTTPError as error:
+            raise UnresolvedUsageError(
+                "OpenRouter provider metadata remains unresolved"
+            ) from error
+        if response.status_code < 200 or response.status_code >= 300:
+            raise UnresolvedUsageError("OpenRouter provider metadata remains unresolved")
+        try:
+            provider = _provider_from_payload(response.json())
+        except ValueError as error:
+            raise UnresolvedUsageError(
+                "OpenRouter provider metadata remains unresolved"
+            ) from error
+        if provider is None:
+            raise UnresolvedUsageError("OpenRouter provider metadata remains unresolved")
+        return provider
+
+    def _settle_dispatch(self, job_id: str, **kwargs: Any) -> bool:
+        try:
+            return self.store.record_llm_call_and_settle_budget(job_id, **kwargs)
+        except Exception as error:
+            raise UnresolvedUsageError(
+                "OpenRouter billing settlement remains unresolved"
+            ) from error
 
     def _map_payload(
         self, chunk: DocumentChunk, research_interest: str, pricing: PricingSnapshot,
@@ -955,11 +1062,18 @@ class OpenRouterSummarizer:
         research_interest: str = "",
     ) -> PaperSummary:
         self._validate_endpoint()
-        chunks = build_document_chunks(document, max_chars=self.settings.chunk_max_chars)
-        if not chunks:
-            raise ValueError("document contains no summarizable content")
         extraction_pricing = self.catalog.pricing_for(self.settings.extraction_model)
         synthesis_pricing = self.catalog.pricing_for(self.settings.synthesis_model)
+        chunks = build_document_chunks(
+            document,
+            max_chars=self.settings.chunk_max_chars,
+            fits=lambda chunk: estimate_serialized_tokens(
+                self._map_payload(chunk, research_interest, extraction_pricing)
+            ) <= self.settings.extraction_max_input_tokens,
+            fit_error_label="extraction request",
+        )
+        if not chunks:
+            raise ValueError("document contains no summarizable content")
         map_payloads = [
             self._map_payload(chunk, research_interest, extraction_pricing)
             for chunk in chunks
@@ -1155,8 +1269,20 @@ class DocumentChunk:
     evidence: tuple[ChunkEvidence, ...]
 
 
-def build_document_chunks(document: dict[str, Any], *, max_chars: int) -> list[DocumentChunk]:
-    """Build section-local chunks while treating structured blocks as atoms."""
+def build_document_chunks(
+    document: dict[str, Any],
+    *,
+    max_chars: int,
+    fits: Callable[[DocumentChunk], bool] | None = None,
+    fit_error_label: str = "configured chunk",
+) -> list[DocumentChunk]:
+    """Build section-local chunks under text and complete-payload ceilings.
+
+    Renderer ordinals are authoritative. Geometry is used only for older
+    documents that have no ordinal. Narrative paragraphs may be split at
+    deterministic sentence, line, or word boundaries; structured blocks stay
+    atomic and fail closed.
+    """
     if max_chars < 1:
         raise ValueError("max_chars must be positive")
     section_titles = {
@@ -1174,26 +1300,35 @@ def build_document_chunks(document: dict[str, Any], *, max_chars: int) -> list[D
         for index, block in enumerate(document.get(collection, [])):
             if isinstance(block, dict) and str(block.get(content_key, "")).strip():
                 blocks.append((kind, block | {"_index": index}, content_key))
-    blocks.sort(key=lambda item: (
-        int(item[1].get("page") or item[1].get("source_position", {}).get("page") or 1),
-        item[1].get("source_position", {}).get("line", 10**9),
-        item[1].get("source_position", {}).get("bbox", [10**9, 0])[0],
-        {"paragraph": 0, "table": 1, "equation": 2, "caption": 3}[item[0]],
-        item[1]["_index"],
-    ))
+    def order_key(item: tuple[str, dict[str, Any], str]) -> tuple[Any, ...]:
+        kind, block, _ = item
+        ordinal = block.get("ordinal")
+        if isinstance(ordinal, int):
+            return (0, ordinal, block["_index"])
+        position = block.get("source_position")
+        position = position if isinstance(position, dict) else {}
+        bbox = position.get("bbox")
+        bbox = bbox if isinstance(bbox, list) and len(bbox) >= 2 else None
+        page = int(block.get("page") or position.get("page") or 1)
+        y = bbox[1] if bbox is not None else position.get("line", 10**9)
+        x = bbox[0] if bbox is not None else 10**9
+        return (
+            1, page, y, x,
+            {"paragraph": 0, "table": 1, "equation": 2, "caption": 3}[kind],
+            block["_index"],
+        )
 
-    chunks: list[DocumentChunk] = []
-    pending: list[tuple[str, dict[str, Any], str]] = []
+    blocks.sort(key=order_key)
 
-    def flush() -> None:
-        if not pending:
-            return
-        pages = [int(block.get("page") or block.get("source_position", {}).get("page") or 1)
-                 for _, block, _ in pending]
-        section_id = pending[0][1].get("section_id")
-        chunks.append(DocumentChunk(
-            text="\n\n".join(str(block[key]).strip() for _, block, key in pending),
-            kind=pending[0][0] if len(pending) == 1 else "mixed",
+    def make_chunk(items: list[tuple[str, dict[str, Any], str]]) -> DocumentChunk:
+        pages = [
+            int(block.get("page") or block.get("source_position", {}).get("page") or 1)
+            for _, block, _ in items
+        ]
+        section_id = items[0][1].get("section_id")
+        return DocumentChunk(
+            text="\n\n".join(str(block[key]).strip() for _, block, key in items),
+            kind=items[0][0] if len(items) == 1 else "mixed",
             section=str(section_titles.get(section_id) or "Unsectioned"),
             start_page=min(pages),
             end_page=max(pages),
@@ -1203,22 +1338,102 @@ def build_document_chunks(document: dict[str, Any], *, max_chars: int) -> list[D
                 section_id=block.get("section_id"),
                 source_text=str(block[key]).strip(),
                 source_position=dict(block.get("source_position") or {"page": pages[index]}),
-            ) for index, (kind, block, key) in enumerate(pending)),
-        ))
-        pending.clear()
+            ) for index, (kind, block, key) in enumerate(items)),
+        )
 
-    for item in blocks:
+    def chunk_fits(items: list[tuple[str, dict[str, Any], str]]) -> bool:
+        chunk = make_chunk(items)
+        return len(chunk.text) <= max_chars and (fits is None or fits(chunk))
+
+    def split_paragraph(
+        item: tuple[str, dict[str, Any], str],
+    ) -> list[tuple[str, dict[str, Any], str]]:
         kind, block, content_key = item
         text = str(block[content_key]).strip()
-        if kind in {"table", "equation", "caption"} and len(text) > max_chars:
+        if chunk_fits([item]):
+            return [item]
+        sentence_ends = {
+            match.end()
+            for match in re.finditer(r"(?<=[.!?。！？])(?:\s+|$)", text)
+        }
+        line_ends = {match.end() for match in re.finditer(r"\n+", text)}
+        word_ends = {match.end() for match in re.finditer(r"\s+", text)}
+        sentence_ends.add(len(text))
+        parts: list[str] = []
+        offset = 0
+        while offset < len(text):
+            ceiling = min(len(text), offset + max_chars)
+            candidates: list[int] = []
+            for boundaries in (sentence_ends, line_ends, word_ends):
+                candidates.extend(sorted(
+                    (end for end in boundaries if offset < end <= ceiling),
+                    reverse=True,
+                ))
+            chosen: tuple[int, str] | None = None
+            for end in dict.fromkeys(candidates):
+                fragment = text[offset:end].strip()
+                if not fragment:
+                    continue
+                fragment_block = dict(block)
+                fragment_block[content_key] = fragment
+                candidate_position = dict(fragment_block.get("source_position") or {})
+                candidate_position.update({
+                    "fragment": len(parts) + 1,
+                    # A conservative upper bound keeps the final provenance
+                    # from making a previously fitted request overflow.
+                    "fragment_count": len(text),
+                })
+                fragment_block["source_position"] = candidate_position
+                if chunk_fits([(kind, fragment_block, content_key)]):
+                    chosen = end, fragment
+                    break
+            if chosen is None:
+                raise InputLimitExceededError(
+                    f"indivisible paragraph token cannot fit the {fit_error_label} ceiling"
+                )
+            offset, fragment = chosen
+            while offset < len(text) and text[offset].isspace():
+                offset += 1
+            parts.append(fragment)
+        result: list[tuple[str, dict[str, Any], str]] = []
+        for index, fragment in enumerate(parts, start=1):
+            fragment_block = dict(block)
+            fragment_block[content_key] = fragment
+            source_position = dict(fragment_block.get("source_position") or {})
+            source_position.update({"fragment": index, "fragment_count": len(parts)})
+            fragment_block["source_position"] = source_position
+            result.append((kind, fragment_block, content_key))
+        return result
+
+    expanded: list[tuple[str, dict[str, Any], str]] = []
+    for item in blocks:
+        if item[0] == "paragraph":
+            expanded.extend(split_paragraph(item))
+            continue
+        if not chunk_fits([item]):
             raise InputLimitExceededError(
-                f"indivisible {kind} block exceeds the configured chunk ceiling"
+                f"indivisible {item[0]} block exceeds the {fit_error_label} ceiling"
             )
+        expanded.append(item)
+
+    chunks: list[DocumentChunk] = []
+    pending: list[tuple[str, dict[str, Any], str]] = []
+
+    def flush() -> None:
+        if not pending:
+            return
+        chunks.append(make_chunk(pending))
+        pending.clear()
+
+    for item in expanded:
+        kind, block, content_key = item
         section_id = block.get("section_id")
         pending_section = pending[0][1].get("section_id") if pending else section_id
-        prospective_length = sum(len(str(existing[key]).strip()) for _, existing, key in pending)
-        prospective_length += (2 * len(pending)) + len(text)
-        if pending and (section_id != pending_section or prospective_length > max_chars or kind != "paragraph"):
+        if pending and (
+            section_id != pending_section
+            or kind != "paragraph"
+            or not chunk_fits([*pending, item])
+        ):
             flush()
         if kind != "paragraph":
             pending.append(item)

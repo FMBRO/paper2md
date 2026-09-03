@@ -20,7 +20,7 @@ def run_ocrmypdf(
     lang: str = "eng",
     deskew: bool = True,
     clean: bool = True,
-    mode: Literal["skip_text", "force"] = "skip_text",
+    mode: Literal["auto", "skip_text", "redo", "force"] = "skip_text",
     on_output: OutputCallback | None = None,
 ) -> Path:
     """Run ``ocrmypdf`` and return the output path on success.
@@ -31,8 +31,12 @@ def run_ocrmypdf(
     instead of letting ``ocrmypdf`` abort with exit 3.
     """
     cmd: list[str] = ["ocrmypdf", "-l", lang]
-    if mode == "skip_text":
+    if mode == "auto":
+        pass
+    elif mode == "skip_text":
         cmd.append("--skip-text")
+    elif mode == "redo":
+        cmd.append("--redo-ocr")
     elif mode == "force":
         cmd.append("--force-ocr")
     else:
