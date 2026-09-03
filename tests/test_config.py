@@ -3,6 +3,54 @@ from pathlib import Path
 from src.config import Settings, load_settings
 
 
+def test_load_settings_adds_research_pipeline_defaults_without_breaking_legacy_yaml(tmp_path: Path) -> None:
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("input_dir: in\noutput_dir: out\n", encoding="utf-8")
+
+    settings = load_settings(cfg)
+
+    assert settings.state_path == Path("out") / "paper2md.sqlite3"
+    assert settings.research_interest == ""
+    assert settings.zotero.base_url == "http://localhost:23119/api/"
+    assert settings.zotero.user_id == 0
+    assert settings.openrouter.endpoint == "https://openrouter.ai/api/v1/chat/completions"
+    assert settings.openrouter.extraction_model == "google/gemini-3.8-flash"
+    assert settings.openrouter.synthesis_model == "openai/gpt-5.6-sol"
+    assert settings.openrouter.paper_budget_usd == 0.50
+    assert settings.notion.properties["title"] == "Title"
+
+
+def test_load_settings_reads_pipeline_sections_but_rejects_secret_values(tmp_path: Path) -> None:
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "output_dir: research-output\n"
+        "research_interest: information retrieval\n"
+        "zotero: {base_url: http://zotero.test/api/, user_id: 12}\n"
+        "openrouter: {paper_budget_usd: 1.25, extraction_model: custom/extract}\n"
+        "notion:\n  data_source_id: data-source\n  properties: {doi: DOI Property}\n",
+        encoding="utf-8",
+    )
+
+    settings = load_settings(cfg)
+
+    assert settings.state_path == Path("research-output") / "paper2md.sqlite3"
+    assert settings.research_interest == "information retrieval"
+    assert settings.zotero.user_id == 12
+    assert settings.openrouter.paper_budget_usd == 1.25
+    assert settings.openrouter.extraction_model == "custom/extract"
+    assert settings.notion.data_source_id == "data-source"
+    assert settings.notion.properties["doi"] == "DOI Property"
+
+
+def test_output_override_also_moves_default_state_database(tmp_path: Path) -> None:
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("output_dir: yaml-out\n", encoding="utf-8")
+
+    settings = load_settings(cfg, overrides={"output_dir": Path("cli-out")})
+
+    assert settings.state_path == Path("cli-out") / "paper2md.sqlite3"
+
+
 def test_load_settings_from_yaml(tmp_path: Path) -> None:
     cfg = tmp_path / "config.yaml"
     cfg.write_text(
