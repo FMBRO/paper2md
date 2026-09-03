@@ -146,8 +146,6 @@ class PipelineService:
         research_interest: str | None = None,
     ) -> JobRecord:
         job = self.store.get_job(job_id)
-        if job.state is JobState.COMPLETED:
-            return job
         if attachment_key is not None or research_interest is not None:
             next_attachment = (
                 attachment_key
@@ -176,10 +174,12 @@ class PipelineService:
             )
         if max_cost_usd is not None:
             job = self.store.update_job_budget(job_id, max_cost_usd)
-        if job.state in {
+        if job.state is JobState.COMPLETED:
+            job = self.store.reopen_completed_job(job_id)
+        elif job.state in {
             JobState.NEEDS_INPUT, JobState.BUDGET_EXCEEDED, JobState.FAILED,
         }:
-            self.store.transition(job_id, JobState.QUEUED)
+            job = self.store.transition(job_id, JobState.QUEUED)
         return self._run(
             job_id,
             max_cost_usd=job.max_cost_usd,

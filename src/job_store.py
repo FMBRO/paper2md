@@ -268,6 +268,22 @@ class JobStore:
             raise KeyError(f"Unknown job: {job_id}")
         return self.get_job(job_id)
 
+    def reopen_completed_job(self, job_id: str) -> JobRecord:
+        """Return a completed job to queued so resume can validate its checkpoints."""
+        with self._connect() as connection:
+            updated = connection.execute(
+                "UPDATE jobs SET state = ?, error = NULL, updated_at = ? "
+                "WHERE id = ? AND state = ?",
+                (
+                    JobState.QUEUED.value, self._now(), job_id,
+                    JobState.COMPLETED.value,
+                ),
+            )
+        if not updated.rowcount:
+            job = self.get_job(job_id)
+            raise ValueError(f"Job is not completed: {job.state.value}")
+        return self.get_job(job_id)
+
     def save_checkpoint(
         self, job_id: str, stage: JobState, payload: Any,
     ) -> None:

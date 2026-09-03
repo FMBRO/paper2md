@@ -317,6 +317,106 @@ def test_a_later_ingest_reuses_the_persisted_notion_page_id(tmp_path: Path) -> N
     assert dependencies["notion"].calls == [None, "notion-page-1"]
 
 
+def test_completed_resume_with_valid_inputs_is_side_effect_free(tmp_path: Path) -> None:
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF-1.4\nfixture\n%%EOF")
+    service, dependencies = _service(tmp_path)
+    completed = service.ingest(InputSpec(InputKind.LOCAL_PDF, str(source)))
+
+    resumed = service.resume(completed.id)
+
+    assert resumed.state is JobState.COMPLETED
+    assert dependencies["acquirer"].calls == 1
+    assert dependencies["zotero"].upsert_calls == 1
+    assert dependencies["converter"].calls == 1
+    assert dependencies["summarizer"].calls == 1
+    assert dependencies["notion"].calls == [None]
+
+
+def test_completed_resume_applies_research_interest_override(tmp_path: Path) -> None:
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF-1.4\nfixture\n%%EOF")
+    service, dependencies = _service(tmp_path)
+    completed = service.ingest(
+        InputSpec(InputKind.LOCAL_PDF, str(source), research_interest="old interest")
+    )
+
+    resumed = service.resume(completed.id, research_interest="new interest")
+
+    assert resumed.state is JobState.COMPLETED
+    assert resumed.input_spec.research_interest == "new interest"
+    assert dependencies["acquirer"].calls == 1
+    assert dependencies["converter"].calls == 1
+    assert dependencies["summarizer"].calls == 2
+    assert dependencies["summarizer"].interests == ["old interest", "new interest"]
+    assert dependencies["notion"].calls == [None, "notion-page-1"]
+
+
+def test_completed_resume_applies_attachment_override_from_acquisition(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "zotero.pdf"
+    source.write_bytes(b"%PDF-1.4\nfixture\n%%EOF")
+    service, dependencies = _service(tmp_path)
+    zotero = AttachmentSelectingZotero(source)
+    service.zotero = zotero
+    completed = service.ingest(
+        InputSpec(InputKind.ZOTERO_ITEM, "PARENT01", attachment_key="ATTACH01")
+    )
+
+    resumed = service.resume(completed.id, attachment_key="ATTACH02")
+
+    assert resumed.state is JobState.COMPLETED
+    assert resumed.input_spec.attachment_key == "ATTACH02"
+    assert zotero.selections == ["ATTACH01", "ATTACH02"]
+    assert dependencies["converter"].calls == 2
+    assert dependencies["summarizer"].calls == 2
+    assert dependencies["notion"].calls == [None, "notion-page-1"]
+
+
+def test_completed_resume_rebuilds_changed_source_and_all_dependents(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF-1.4\nfixture\n%%EOF")
+    service, dependencies = _service(tmp_path)
+    service.acquirer = ChangingAcquirer()
+    completed = service.ingest(InputSpec(InputKind.LOCAL_PDF, str(source)))
+    assert completed.artifact_dir is not None
+    (completed.artifact_dir / "source.pdf").write_bytes(b"corrupted")
+
+    resumed = service.resume(completed.id)
+
+    assert resumed.state is JobState.COMPLETED
+    assert service.acquirer.calls == 2
+    assert dependencies["zotero"].upsert_calls == 2
+    assert dependencies["converter"].calls == 2
+    assert dependencies["summarizer"].calls == 2
+    assert dependencies["notion"].calls == [None, "notion-page-1"]
+
+
+def test_completed_resume_rebuilds_corrupted_conversion_and_dependents(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF-1.4\nfixture\n%%EOF")
+    service, dependencies = _service(tmp_path)
+    completed = service.ingest(InputSpec(InputKind.LOCAL_PDF, str(source)))
+    assert completed.artifact_dir is not None
+    (completed.artifact_dir / "document.json").write_text(
+        '{"pages": [], "changed": true}\n', encoding="utf-8",
+    )
+
+    resumed = service.resume(completed.id)
+
+    assert resumed.state is JobState.COMPLETED
+    assert dependencies["acquirer"].calls == 1
+    assert dependencies["zotero"].upsert_calls == 1
+    assert dependencies["converter"].calls == 2
+    assert dependencies["summarizer"].calls == 2
+    assert dependencies["notion"].calls == [None, "notion-page-1"]
+
+
 def test_resume_reuses_durable_outputs_and_retries_only_incomplete_notion_sync(
     tmp_path: Path,
 ) -> None:

@@ -550,3 +550,85 @@ Task 7 review imports OK
 ```
 
 No live or paid external call was made. All pipeline and client tests use injected fakes or deterministic transports.
+
+---
+
+## Completed-job resume remediation (round 2, 2026-09-03)
+
+### Findings resolved
+
+1. `PipelineService.resume()` now applies explicit attachment and research-interest overrides before deciding how to run a completed job. It reopens the completed job to `queued`, allowing the existing checkpoint invalidation boundaries to rerun acquisition for a changed attachment or summary/Notion for a changed research interest.
+2. Completed jobs now traverse the same checkpoint validation path as interrupted jobs. A valid completed resume performs no external side effects; a changed source hash reacquires and invalidates every dependent stage, while a changed conversion artifact hash reconverts and recomputes quality, summary, and Notion.
+3. A dedicated `JobStore.reopen_completed_job()` operation preserves the normal transition rules while ensuring failures discovered during completed-job revalidation can be persisted as `needs_input`, `budget_exceeded`, or `failed` instead of leaving a stale `completed` state.
+
+### Focused RED/GREEN evidence
+
+#### Completed overrides and changed source artifact
+
+RED:
+
+```text
+uv run pytest -q tests/test_pipeline.py -k 'completed_resume'
+.FFF                                                                     [100%]
+E       AssertionError: assert 'old interest' == 'new interest'
+E       AssertionError: assert 'ATTACH01' == 'ATTACH02'
+E       assert 1 == 2
+3 failed, 1 passed, 19 deselected in 0.81s
+```
+
+GREEN:
+
+```text
+uv run pytest -q tests/test_pipeline.py -k 'completed_resume'
+....                                                                     [100%]
+4 passed, 19 deselected in 0.87s
+```
+
+#### Completed conversion-artifact hash validation
+
+RED, with the original completed-job early return restored to prove the regression test detects the defect:
+
+```text
+uv run pytest -q tests/test_pipeline.py -k 'completed_resume_rebuilds_corrupted_conversion'
+F                                                                        [100%]
+E       assert 1 == 2
+E        +  where 1 = <tests.test_pipeline.FakeConverter object ...>.calls
+1 failed, 23 deselected in 0.40s
+```
+
+GREEN after restoring the fix:
+
+```text
+uv run pytest -q tests/test_pipeline.py -k 'completed_resume_rebuilds_corrupted_conversion'
+.                                                                        [100%]
+1 passed, 23 deselected in 0.35s
+```
+
+The final completed-job regression set covers: valid no-change resume with no duplicate external side effects, research-interest override, attachment override, changed source content, and corrupted conversion output.
+
+### Round 2 verification
+
+```text
+uv run pytest -q tests/test_pipeline.py tests/test_cli.py tests/test_job_store.py tests/test_acquisition.py tests/test_zotero.py
+........................................................................ [ 77%]
+.....................                                                    [100%]
+93 passed in 4.78s
+
+uv run pytest -q
+........................................................................ [ 30%]
+........................................................................ [ 60%]
+........................................................................ [ 90%]
+.......................                                                  [100%]
+239 passed in 9.62s
+
+uv run python -m compileall -q src tests
+[exit 0, no output]
+
+uv run python -c "from src.pipeline import PipelineService; from src.job_store import JobStore; print('Task 7 completed-resume imports OK')"
+Task 7 completed-resume imports OK
+
+git diff --check
+[exit 0; only the repository's existing Windows LF-to-CRLF notices]
+```
+
+No live or paid external call was made. `src/gui.py` and `src/batch_convert.py` remain unchanged.
