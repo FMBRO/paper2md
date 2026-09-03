@@ -80,3 +80,18 @@ def test_quality_gate_detects_garbling_in_tables_and_figure_text() -> None:
     )
 
     assert [issue["code"] for issue in result["issues"]] == ["garbled_characters"]
+
+
+def test_quality_gate_detects_garbling_in_caption_text_only() -> None:
+    result = evaluate_document_quality(
+        {
+            "pages": [{"number": 1}],
+            "sections": [{"title": "Title", "level": 1, "page": 1}],
+            "paragraphs": [], "tables": [], "equations": [],
+            "figures": [{"path": "fig.png", "alt_text": "clean", "caption": "Figure 1.", "page": 1}],
+            "captions": [{"text": "Figure \ufffd caption", "page": 1}],
+        },
+        page_text=[{"page": 1, "character_count": 50, "has_text": True}],
+    )
+
+    assert [issue["code"] for issue in result["issues"]] == ["garbled_characters"]
