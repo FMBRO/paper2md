@@ -414,6 +414,17 @@ class PipelineService:
                 self.store.complete_notion_sync(
                     job_id, paper_id, page_id, {"page_id": page_id},
                 )
+            else:
+                page_id = str(notion_checkpoint["page_id"])
+            self._write_manifest(
+                manager,
+                bundle,
+                metadata=metadata,
+                source_sha256=acquisition.pdf_sha256,
+                job=self.store.get_job(job_id),
+                notion_page_id=page_id,
+                zotero_attachment_key=resolution.attachment_key,
+            )
             self._enter(job_id, JobState.COMPLETED)
             return self.store.get_job(job_id)
         except BudgetExceededError as error:
@@ -453,6 +464,55 @@ class PipelineService:
                 resolution.attachment_key,
             ),
         )
+
+    def _write_manifest(
+        self,
+        manager: ArtifactManager,
+        bundle: ArtifactBundle,
+        *,
+        metadata: PaperMetadata,
+        source_sha256: str | None,
+        job: JobRecord,
+        notion_page_id: str,
+        zotero_attachment_key: str | None,
+    ) -> None:
+        model_prompt_version = (
+            f"{self.settings.openrouter.extraction_model} / "
+            f"{self.settings.openrouter.synthesis_model}"
+        )
+        artifact_paths = {
+            path.relative_to(bundle.root).as_posix(): path
+            for path in sorted(bundle.root.rglob("*"))
+            if path.is_file() and path != bundle.manifest_json
+        }
+        manager.write_manifest({
+            "version": 1,
+            "canonical_identity": metadata.canonical_identity(source_sha256),
+            "source_sha256": source_sha256,
+            "artifact_sha256": {
+                name: _file_sha256(path) for name, path in artifact_paths.items()
+            },
+            "job": {
+                "id": job.id,
+                "stage": JobState.COMPLETED.value,
+                "status": JobState.COMPLETED.value,
+                "total_cost_usd": job.total_cost_usd,
+                "max_cost_usd": job.max_cost_usd,
+            },
+            "models": {
+                "extraction": self.settings.openrouter.extraction_model,
+                "synthesis": self.settings.openrouter.synthesis_model,
+                "model_prompt_version": model_prompt_version,
+            },
+            "external_ids": {
+                "doi": metadata.doi,
+                "arxiv_id": metadata.arxiv_id,
+                "zotero_library_id": metadata.zotero_library_id,
+                "zotero_item_key": metadata.zotero_item_key,
+                "zotero_attachment_key": zotero_attachment_key,
+                "notion_page_id": notion_page_id,
+            },
+        })
 
     @staticmethod
     def _restored_acquisition(payload: Any) -> AcquisitionResult | None:

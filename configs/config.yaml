@@ -53,6 +53,25 @@ openrouter:
 notion:
   data_source_id:
   api_version: "2026-03-11"
+  # These names must already exist with the documented Notion types. The
+  # Processing Status status/select must contain Completed; every Topics
+  # multi-select value the pipeline will send must also exist in advance.
+  properties:
+    title: Title
+    authors: Authors
+    published_date: Published Date
+    doi: DOI
+    arxiv_id: arXiv ID
+    source_url: Source URL
+    zotero_link: Zotero Link
+    zotero_item_key: Zotero Item Key
+    processing_status: Processing Status
+    relevance_score: Relevance Score
+    score_rationale: Score Rationale
+    topics: Topics
+    ai_keywords: AI Keywords
+    imported_at: Imported At
+    model_prompt_version: Model / Prompt Version
 
 quality:
   enabled: true

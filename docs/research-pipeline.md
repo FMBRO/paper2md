@@ -43,12 +43,31 @@ integration, and put the integration secret in `NOTION_API_KEY`. Set
 The API version is `2026-03-11`.
 
 paper2md validates the configured property names and types, but never modifies
-the schema. The default names are listed in `configs/config.yaml`. In Notion,
-create matching properties for title, authors, dates, identifiers, links,
-status, relevance, topics, keywords, import time, and model/prompt version.
-The controlled status/select and topic options must already exist. Only the
-validated Japanese summary is written to the page body; full Markdown and the
-structured document remain local.
+the schema. Create this exact default schema, or change the property-name
+mappings under `notion.properties` in `configs/config.yaml`:
+
+| Property name | Required Notion type | Additional requirement |
+|---|---|---|
+| `Title` | Title | — |
+| `Authors` | Rich text | — |
+| `Published Date` | Date | — |
+| `DOI` | Rich text | — |
+| `arXiv ID` | Rich text | — |
+| `Source URL` | URL | — |
+| `Zotero Link` | URL | — |
+| `Zotero Item Key` | Rich text | — |
+| `Processing Status` | Status or Select | Predefine the controlled option `Completed`. |
+| `Relevance Score` | Number | — |
+| `Score Rationale` | Rich text | — |
+| `Topics` | Multi-select | Predefine every controlled topic option the pipeline will send. |
+| `AI Keywords` | Rich text | — |
+| `Imported At` | Date | — |
+| `Model / Prompt Version` | Rich text | — |
+
+Property names are case-sensitive. The status/select and multi-select options
+are resolved to their existing Notion option IDs; paper2md does not create
+options. Only the validated Japanese summary is written to the page body; full
+Markdown and the structured document remain local.
 
 ### Zotero local API
 
@@ -145,7 +164,13 @@ Per-paper files live under `output/papers/{stable-id}/`:
 
 - `source.pdf`, `metadata.json`, `document.json`, and `paper.md`
 - `figures/` and `logs/`, including the quality result
-- `summary.json` and pipeline-produced metadata/checkpoints
+- `summary.json`
+- `manifest.json`, atomically written at successful completion with canonical
+  identity, source and artifact SHA-256 hashes, job/stage/status and cost,
+  configured model/prompt version, and DOI/arXiv/Zotero/Notion identifiers
+
+The manifest contains no API keys or other secrets. Job checkpoints themselves
+are stored in SQLite, not in `manifest.json`.
 
 Job, paper, Notion-page, checkpoint, LLM-cache, and cost state is in
 `output/paper2md.sqlite3` unless `state_path` is configured. Preserve both the

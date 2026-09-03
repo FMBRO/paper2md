@@ -21,6 +21,7 @@ from src.gui import (
     RunFinished,
     build_pipeline_input,
     build_settings,
+    drain_gui_events,
     list_input_pdfs,
     open_output_folder,
     run_pipeline_diagnostics,
@@ -311,7 +312,9 @@ def test_pipeline_controller_supports_collection_status_and_resume(tmp_path: Pat
     )
 
 
-def test_pipeline_diagnostics_are_read_only_and_report_each_boundary(tmp_path: Path) -> None:
+def test_pipeline_diagnostics_report_storage_and_read_only_external_checks(
+    tmp_path: Path,
+) -> None:
     settings = Settings(tmp_path, tmp_path / "out")
     service = _FakePipelineService(_job(tmp_path))
 
@@ -327,6 +330,60 @@ def test_pipeline_diagnostics_are_read_only_and_report_each_boundary(tmp_path: P
         DiagnosticCheck("Zotero local API", True, settings.zotero.base_url),
         DiagnosticCheck("Notion data source", True, "Schema valid; no content written"),
     )
+    assert settings.state_path.is_file()
+
+
+def test_pipeline_diagnostics_block_downstream_checks_for_invalid_storage(
+    tmp_path: Path,
+) -> None:
+    output_file = tmp_path / "not-a-directory"
+    output_file.write_text("occupied", encoding="utf-8")
+    settings = Settings(tmp_path / "input", output_file)
+    factory_called = False
+
+    def factory(_settings, _on_event):
+        nonlocal factory_called
+        factory_called = True
+        return _FakePipelineService(_job(tmp_path))
+
+    checks = run_pipeline_diagnostics(
+        settings,
+        service_factory=factory,
+        environ={"OPENROUTER_API_KEY": "configured"},
+    )
+
+    assert factory_called is False
+    assert checks[0].name == "Local storage"
+    assert checks[0].ok is False
+    assert checks[2:] == (
+        DiagnosticCheck(
+            "Zotero local API", False, "Not checked: local storage unavailable",
+        ),
+        DiagnosticCheck(
+            "Notion data source", False, "Not checked: local storage unavailable",
+        ),
+    )
+
+
+def test_pipeline_initialization_failure_is_reported_as_local_storage(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(tmp_path / "input", tmp_path / "output")
+
+    checks = run_pipeline_diagnostics(
+        settings,
+        service_factory=lambda _settings, _on_event: (_ for _ in ()).throw(
+            PermissionError("database denied")
+        ),
+        environ={},
+    )
+
+    assert checks[0] == DiagnosticCheck("Local storage", False, "database denied")
+    assert checks[1] == DiagnosticCheck(
+        "OpenRouter", False, "OPENROUTER_API_KEY is not configured",
+    )
+    assert checks[2].detail == "Not checked: local storage unavailable"
+    assert checks[3].detail == "Not checked: local storage unavailable"
 
 
 def test_pipeline_controller_runs_diagnostics_on_worker(tmp_path: Path) -> None:
@@ -393,3 +450,58 @@ def test_research_view_model_logs_stage_events_without_messages() -> None:
     model.apply(PipelineEvent(kind="stage_changed", stage="quality_check"))
 
     assert model.logs == ["[quality_check] Started"]
+
+
+def test_concurrent_controllers_keep_identical_event_types_source_routed(
+    tmp_path: Path,
+) -> None:
+    batch_messages = queue.Queue()
+    research_messages = queue.Queue()
+    release_batch = threading.Event()
+
+    def batch_runner(_settings, on_event):
+        on_event(PipelineEvent(
+            kind="stage_changed", pdf_name="legacy.pdf", stage="conversion",
+        ))
+        release_batch.wait(2)
+        return {"total": 1, "success": 1, "failed": 0, "failed_files": []}
+
+    service = _FakePipelineService(_job(tmp_path))
+
+    def pipeline_factory(_settings, on_event):
+        on_event(PipelineEvent(
+            kind="stage_changed", pdf_name="job-1", stage="acquiring",
+        ))
+        return service
+
+    batch = BatchRunController(batch_messages, batch_runner)
+    research = PipelineRunController(
+        research_messages, service_factory=pipeline_factory,
+    )
+    settings = Settings(tmp_path, tmp_path / "out")
+
+    batch.start(settings)
+    assert batch.running is True
+    research.start_ingest(settings, InputSpec(InputKind.ARXIV, "2401.01234"), 0.5)
+    research.wait(2)
+    assert batch.running is True
+    release_batch.set()
+    batch.wait(2)
+
+    batch_items: list[object] = []
+    research_items: list[object] = []
+    drain_gui_events(
+        batch_messages,
+        research_messages,
+        batch_items.append,
+        research_items.append,
+    )
+
+    assert [item.pdf_name for item in batch_items if isinstance(item, PipelineEvent)] == [
+        "legacy.pdf"
+    ]
+    assert isinstance(batch_items[-1], RunFinished)
+    assert [item.pdf_name for item in research_items if isinstance(item, PipelineEvent)] == [
+        "job-1"
+    ]
+    assert isinstance(research_items[-1], PipelineRunFinished)

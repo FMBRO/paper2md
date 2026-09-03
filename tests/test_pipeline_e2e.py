@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 import hashlib
+import json
 from pathlib import Path
 
 from src.acquisition import AcquisitionResult
@@ -102,6 +103,7 @@ class DeterministicConverter:
             "paragraphs": [{"text": "Deterministic evidence", "page": 1}],
         })
         artifacts.write_paper("# Deterministic paper\n\nDeterministic evidence.\n")
+        (bundle.figures_dir / "figure_001.png").write_bytes(b"figure fixture")
         artifacts.write_json(bundle.logs_dir / "quality_result.json", {
             "passed": True, "llm_allowed": True, "issues": [],
         })
@@ -160,7 +162,7 @@ def _assert_one_complete_artifact_set(output_dir: Path) -> Path:
     root = roots[0]
     assert {
         "source.pdf", "metadata.json", "document.json", "paper.md",
-        "figures", "summary.json", "logs",
+        "figures", "summary.json", "manifest.json", "logs",
     } <= {path.name for path in root.iterdir()}
     return root
 
@@ -185,6 +187,33 @@ def test_arxiv_style_flow_produces_one_artifact_set_and_one_notion_upsert(
     assert (acquirer.calls, zotero.upsert_calls, converter.calls) == (1, 1, 1)
     assert summarizer.calls == 1
     assert notion.upserts == 1
+    manifest = json.loads(job.artifact_dir.joinpath("manifest.json").read_text(
+        encoding="utf-8"
+    ))
+    assert manifest["canonical_identity"] == "arxiv:2401.01234"
+    assert manifest["source_sha256"] == hashlib.sha256(PDF_BYTES).hexdigest()
+    assert manifest["job"] == {
+        "id": job.id,
+        "stage": "completed",
+        "status": "completed",
+        "total_cost_usd": 0.0,
+        "max_cost_usd": 0.5,
+    }
+    assert manifest["external_ids"] == {
+        "doi": None,
+        "arxiv_id": "2401.01234",
+        "zotero_library_id": "0",
+        "zotero_item_key": "ARXIV-PARENT",
+        "zotero_attachment_key": "ARXIV-PDF",
+        "notion_page_id": "notion-page-acceptance",
+    }
+    assert manifest["artifact_sha256"]["source.pdf"] == hashlib.sha256(
+        PDF_BYTES
+    ).hexdigest()
+    assert set(manifest["artifact_sha256"]) == {
+        "source.pdf", "metadata.json", "document.json", "paper.md",
+        "summary.json", "figures/figure_001.png", "logs/quality_result.json",
+    }
 
 
 def test_existing_zotero_multiple_attachments_cost_nothing_then_resume_is_idempotent(
@@ -218,3 +247,9 @@ def test_existing_zotero_multiple_attachments_cost_nothing_then_resume_is_idempo
     assert converter.calls == 1
     assert summarizer.calls == 1
     assert notion.upserts == 1
+    manifest = json.loads(completed.artifact_dir.joinpath("manifest.json").read_text(
+        encoding="utf-8"
+    ))
+    assert manifest["canonical_identity"] == "zotero:0:PARENT-1"
+    assert manifest["external_ids"]["zotero_item_key"] == "PARENT-1"
+    assert manifest["external_ids"]["notion_page_id"] == "notion-page-acceptance"

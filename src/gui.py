@@ -4,8 +4,10 @@ from __future__ import annotations
 import math
 import os
 import queue
+import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -14,6 +16,7 @@ from typing import Callable, Mapping
 from src.acquisition import parse_input
 from src.batch_convert import run_batch
 from src.config import Settings, load_settings
+from src.job_store import JobStore
 from src.pipeline_events import PipelineEvent
 from src.pipeline import PipelineService
 from src.research_models import InputKind, InputSpec, JobRecord
@@ -182,6 +185,24 @@ PipelineFactory = Callable[
 ]
 
 
+def drain_gui_events(
+    batch_queue: "queue.Queue[QueueItem]",
+    research_queue: "queue.Queue[QueueItem]",
+    on_batch: Callable[[QueueItem], None],
+    on_research: Callable[[QueueItem], None],
+) -> None:
+    """Drain source-owned queues without guessing an event's producer."""
+    for source, handler in (
+        (batch_queue, on_batch),
+        (research_queue, on_research),
+    ):
+        while True:
+            try:
+                handler(source.get_nowait())
+            except queue.Empty:
+                break
+
+
 def create_pipeline_service(
     settings: Settings,
     on_event: Callable[[PipelineEvent], None] | None = None,
@@ -251,8 +272,7 @@ def run_pipeline_diagnostics(
     environ: Mapping[str, str] = os.environ,
 ) -> tuple[DiagnosticCheck, ...]:
     """Probe configured boundaries without conversion, writes, or paid requests."""
-    checks = [DiagnosticCheck("Local storage", True, str(settings.state_path))]
-    checks.append(DiagnosticCheck(
+    openrouter_check = DiagnosticCheck(
         "OpenRouter",
         bool(environ.get("OPENROUTER_API_KEY")),
         (
@@ -260,16 +280,22 @@ def run_pipeline_diagnostics(
             if environ.get("OPENROUTER_API_KEY")
             else "OPENROUTER_API_KEY is not configured"
         ),
-    ))
+    )
     try:
+        _verify_local_storage(settings)
         service = service_factory(settings, None)
     except Exception as error:
-        detail = str(error)
-        checks.extend((
-            DiagnosticCheck("Zotero local API", False, detail),
-            DiagnosticCheck("Notion data source", False, detail),
-        ))
-        return tuple(checks)
+        blocked = "Not checked: local storage unavailable"
+        return (
+            DiagnosticCheck("Local storage", False, str(error)),
+            openrouter_check,
+            DiagnosticCheck("Zotero local API", False, blocked),
+            DiagnosticCheck("Notion data source", False, blocked),
+        )
+    checks = [
+        DiagnosticCheck("Local storage", True, str(settings.state_path)),
+        openrouter_check,
+    ]
     try:
         zotero_ok = bool(service.zotero.is_available())
         checks.append(DiagnosticCheck(
@@ -286,6 +312,29 @@ def run_pipeline_diagnostics(
     except Exception as error:
         checks.append(DiagnosticCheck("Notion data source", False, str(error)))
     return tuple(checks)
+
+
+def _verify_local_storage(settings: Settings) -> None:
+    """Create/write/read local output and create/open/check the SQLite store."""
+    settings.output_dir.mkdir(parents=True, exist_ok=True)
+    handle, probe_name = tempfile.mkstemp(
+        prefix=".paper2md-diagnostic-", dir=settings.output_dir,
+    )
+    probe = Path(probe_name)
+    try:
+        with os.fdopen(handle, "wb") as stream:
+            stream.write(b"paper2md storage diagnostic")
+            stream.flush()
+            os.fsync(stream.fileno())
+        if probe.read_bytes() != b"paper2md storage diagnostic":
+            raise OSError("Local output storage failed its write/read check")
+    finally:
+        probe.unlink(missing_ok=True)
+    JobStore(settings.state_path)
+    with sqlite3.connect(settings.state_path) as connection:
+        result = connection.execute("PRAGMA quick_check").fetchone()
+    if result is None or result[0] != "ok":
+        raise OSError("Local SQLite state failed its integrity check")
 
 
 def list_input_pdfs(input_dir: Path | str) -> list[Path]:
@@ -526,9 +575,10 @@ class Paper2MdApp:
         self.root = root
         self.root.title("paper2md")
         self.root.minsize(960, 720)
-        self.events: "queue.Queue[QueueItem]" = queue.Queue()
-        self.controller = BatchRunController(self.events)
-        self.pipeline_controller = PipelineRunController(self.events)
+        self.batch_events: "queue.Queue[QueueItem]" = queue.Queue()
+        self.research_events: "queue.Queue[QueueItem]" = queue.Queue()
+        self.controller = BatchRunController(self.batch_events)
+        self.pipeline_controller = PipelineRunController(self.research_events)
         self.research_model = ResearchViewModel()
         self._is_running = False
         self._pipeline_running = False
@@ -987,26 +1037,27 @@ class Paper2MdApp:
         self.start_button.configure(state=state)
 
     def _drain_queue(self) -> None:
-        try:
-            while True:
-                item = self.events.get_nowait()
-                if isinstance(item, PipelineEvent):
-                    if self._pipeline_running:
-                        self.research_model.apply(item)
-                        self._render_research_model()
-                    else:
-                        self._handle_event(item)
-                elif isinstance(item, RunFinished):
-                    self._handle_finished(item.summary)
-                elif isinstance(item, RunFailed):
-                    self._handle_worker_failure(item.error)
-                else:
-                    self.research_model.apply(item)
-                    self._set_pipeline_running(False)
-                    self._render_research_model()
-        except queue.Empty:
-            pass
+        drain_gui_events(
+            self.batch_events,
+            self.research_events,
+            self._handle_batch_queue_item,
+            self._handle_research_queue_item,
+        )
         self.root.after(100, self._drain_queue)
+
+    def _handle_batch_queue_item(self, item: QueueItem) -> None:
+        if isinstance(item, PipelineEvent):
+            self._handle_event(item)
+        elif isinstance(item, RunFinished):
+            self._handle_finished(item.summary)
+        elif isinstance(item, RunFailed):
+            self._handle_worker_failure(item.error)
+
+    def _handle_research_queue_item(self, item: QueueItem) -> None:
+        self.research_model.apply(item)
+        if not isinstance(item, PipelineEvent):
+            self._set_pipeline_running(False)
+        self._render_research_model()
 
     def _handle_event(self, event: PipelineEvent) -> None:
         if event.kind == "batch_started":
