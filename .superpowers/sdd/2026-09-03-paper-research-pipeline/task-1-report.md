@@ -72,3 +72,61 @@ successfully.
 - The repository's committed virtual environment is stale; use the recorded
   isolated Python 3.12 command until it is repaired. No project dependency or
   lockfile was changed for this task.
+
+## Review fix round 1
+
+### Implemented fixes
+
+- Secret detection now recursively walks all YAML maps/lists, normalizes key
+  spelling by removing punctuation and case, and rejects a denylist of API-key,
+  access-key, secret, token, authorization, password, private-key, and bearer-
+  token aliases. Composite aliases ending in a sensitive key name are also
+  rejected. Secret values are never interpolated into the error.
+- Every SQLite connection executes `PRAGMA foreign_keys = ON` immediately
+  after opening, so `jobs.paper_id` and `llm_calls.job_id` references are
+  enforced by SQLite.
+- Paper upserts now find existing records by canonical identity and every
+  available normalized identifier. They retain the original row, merge missing
+  identifiers, promote canonical identity according to DOI/arXiv/Zotero/SHA
+  priority, remap jobs if duplicate records must be consolidated, and allow
+  lookup by a former SHA identity after DOI promotion.
+
+### Files changed
+
+- Modified: `src/config.py`, `src/job_store.py`, `tests/test_config.py`,
+  `tests/test_job_store.py`
+
+### RED/GREEN evidence
+
+| Finding | RED command and output | GREEN command and output |
+|---|---|---|
+| Recursive YAML secret guard | `uv run --isolated --python 3.12 --with pytest python -m pytest tests\test_config.py::test_load_settings_rejects_common_yaml_secret_key_variants -q` → `4 failed`, each `Failed: DID NOT RAISE ValueError` for `apiKey`, `token`, `authorization`, and `password` | Same command → `4 passed in 0.12s` |
+| Composite API-key alias | Same focused command after adding `openrouterApiKey` → `1 failed, 4 passed`, `Failed: DID NOT RAISE ValueError` | Same command → `5 passed in 0.08s` |
+| SQLite foreign keys | `uv run --isolated --python 3.12 --with pytest python -m pytest tests\test_job_store.py::test_job_store_rejects_job_for_nonexistent_paper tests\test_job_store.py::test_job_store_rejects_llm_call_for_nonexistent_job -q` → `2 failed`, both `Failed: DID NOT RAISE Exception` | Same command → `2 passed in 0.06s` |
+| Identifier reconciliation | `uv run --isolated --python 3.12 --with pytest python -m pytest tests\test_job_store.py::test_job_store_promotes_sha_identity_to_doi_and_merges_identifiers -q` → `1 failed`, expected original row ID `1`, got duplicate ID `2` | Same command → `1 passed in 0.05s` |
+
+The first focused job/config aggregate run exposed an existing identity-
+preservation expectation: a repeated DOI must not replace its already-known
+SHA-256 with a conflicting value. The implementation was adjusted to merge
+only missing identifier values; rerunning the focused suites produced `19
+passed in 0.25s`.
+
+### Final verification
+
+```powershell
+uv run --isolated --python 3.12 --with pytest python -m pytest -q
+uv run --isolated --python 3.12 --with pytest python -m compileall -q src
+git diff --check
+```
+
+Result: `76 passed in 0.83s`; compile and whitespace checks completed without
+errors.
+
+### Self-review
+
+- The sensitive-key guard checks structure rather than values, so no secret is
+  copied into an exception, log, artifact, or database.
+- Foreign-key enforcement is configured per connection, as SQLite requires.
+- Reconciliation is transactional under the existing connection context;
+  duplicate paper jobs are reassigned before deleting the duplicate row.
+- The deferred arXiv-prefix issue was not changed.

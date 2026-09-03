@@ -27,6 +27,7 @@ class JobStore:
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path)
+        connection.execute("PRAGMA foreign_keys = ON")
         connection.row_factory = sqlite3.Row
         return connection
 
@@ -115,6 +116,7 @@ class JobStore:
 
     def upsert_paper(self, metadata: PaperMetadata, pdf_sha256: str | None = None,
                      artifact_dir: Path | str | None = None) -> int:
+        pdf_sha256 = pdf_sha256.strip().lower() if pdf_sha256 else None
         identity = metadata.canonical_identity(pdf_sha256)
         if identity is None:
             raise ValueError("A paper needs DOI, arXiv ID, Zotero identity, or PDF SHA-256")
@@ -125,18 +127,75 @@ class JobStore:
                               "zotero_library_id": metadata.zotero_library_id,
                               "zotero_item_key": metadata.zotero_item_key})
         with self._connect() as connection:
-            connection.execute("""INSERT INTO papers
-                (canonical_identity, doi, arxiv_id, zotero_library_id, zotero_item_key, pdf_sha256, metadata_json, artifact_dir, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(canonical_identity) DO UPDATE SET metadata_json = excluded.metadata_json,
-                artifact_dir = COALESCE(excluded.artifact_dir, papers.artifact_dir), updated_at = excluded.updated_at""",
-                (identity, metadata.doi, metadata.arxiv_id, metadata.zotero_library_id,
-                 metadata.zotero_item_key, pdf_sha256, payload, str(artifact_dir) if artifact_dir else None, now, now))
-            return int(connection.execute("SELECT id FROM papers WHERE canonical_identity = ?", (identity,)).fetchone()["id"])
+            rows = self._find_matching_papers(connection, metadata, pdf_sha256, identity)
+            if not rows:
+                cursor = connection.execute("""INSERT INTO papers
+                    (canonical_identity, doi, arxiv_id, zotero_library_id, zotero_item_key, pdf_sha256, metadata_json, artifact_dir, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (identity, metadata.doi, metadata.arxiv_id, metadata.zotero_library_id,
+                     metadata.zotero_item_key, pdf_sha256, payload,
+                     str(artifact_dir) if artifact_dir else None, now, now))
+                return int(cursor.lastrowid)
+
+            primary, *duplicates = rows
+            doi = self._first_value(rows, "doi") or metadata.doi
+            arxiv_id = self._first_value(rows, "arxiv_id") or metadata.arxiv_id
+            zotero_library_id = self._first_value(rows, "zotero_library_id") or metadata.zotero_library_id
+            zotero_item_key = self._first_value(rows, "zotero_item_key") or metadata.zotero_item_key
+            sha256 = self._first_value(rows, "pdf_sha256") or pdf_sha256
+            canonical_identity = PaperMetadata(
+                doi=doi, arxiv_id=arxiv_id, zotero_library_id=zotero_library_id,
+                zotero_item_key=zotero_item_key,
+            ).canonical_identity(sha256)
+            for duplicate in duplicates:
+                connection.execute("UPDATE jobs SET paper_id = ? WHERE paper_id = ?", (primary["id"], duplicate["id"]))
+                connection.execute("DELETE FROM papers WHERE id = ?", (duplicate["id"],))
+            connection.execute("""UPDATE papers SET canonical_identity = ?, doi = ?, arxiv_id = ?,
+                zotero_library_id = ?, zotero_item_key = ?, pdf_sha256 = ?, metadata_json = ?,
+                artifact_dir = COALESCE(?, artifact_dir), updated_at = ? WHERE id = ?""",
+                (canonical_identity, doi, arxiv_id, zotero_library_id, zotero_item_key, sha256,
+                 payload, str(artifact_dir) if artifact_dir else None, now, primary["id"]))
+            return int(primary["id"])
+
+    @staticmethod
+    def _first_value(rows: list[sqlite3.Row], column: str) -> str | None:
+        return next((row[column] for row in rows if row[column] is not None), None)
+
+    @staticmethod
+    def _find_matching_papers(connection: sqlite3.Connection, metadata: PaperMetadata,
+                              pdf_sha256: str | None, identity: str) -> list[sqlite3.Row]:
+        clauses, values = ["canonical_identity = ?"], [identity]
+        for column, value in (("doi", metadata.doi), ("arxiv_id", metadata.arxiv_id),
+                              ("pdf_sha256", pdf_sha256)):
+            if value:
+                clauses.append(f"{column} = ?")
+                values.append(value)
+        if metadata.zotero_library_id and metadata.zotero_item_key:
+            clauses.append("(zotero_library_id = ? AND zotero_item_key = ?)")
+            values.extend((metadata.zotero_library_id, metadata.zotero_item_key))
+        return connection.execute(
+            f"SELECT * FROM papers WHERE {' OR '.join(clauses)} ORDER BY id", values
+        ).fetchall()
 
     def find_paper(self, canonical_identity: str) -> sqlite3.Row | None:
         with self._connect() as connection:
-            return connection.execute("SELECT * FROM papers WHERE canonical_identity = ?", (canonical_identity,)).fetchone()
+            clauses, values = ["canonical_identity = ?"], [canonical_identity]
+            prefix, _, value = canonical_identity.partition(":")
+            if prefix == "doi":
+                clauses.append("doi = ?")
+                values.append(value)
+            elif prefix == "arxiv":
+                clauses.append("arxiv_id = ?")
+                values.append(value)
+            elif prefix == "sha256":
+                clauses.append("pdf_sha256 = ?")
+                values.append(value)
+            elif prefix == "zotero":
+                library_id, separator, item_key = value.partition(":")
+                if separator:
+                    clauses.append("(zotero_library_id = ? AND zotero_item_key = ?)")
+                    values.extend((library_id, item_key))
+            return connection.execute(f"SELECT * FROM papers WHERE {' OR '.join(clauses)}", values).fetchone()
 
     def find_resumable_job(self, paper_id: int) -> JobRecord | None:
         with self._connect() as connection:

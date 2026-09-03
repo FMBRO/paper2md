@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from src.config import Settings, load_settings
+import pytest
 
 
 def test_load_settings_adds_research_pipeline_defaults_without_breaking_legacy_yaml(tmp_path: Path) -> None:
@@ -49,6 +50,15 @@ def test_output_override_also_moves_default_state_database(tmp_path: Path) -> No
     settings = load_settings(cfg, overrides={"output_dir": Path("cli-out")})
 
     assert settings.state_path == Path("cli-out") / "paper2md.sqlite3"
+
+
+@pytest.mark.parametrize("yaml_key", ["apiKey", "token", "authorization", "password", "openrouterApiKey"])
+def test_load_settings_rejects_common_yaml_secret_key_variants(tmp_path: Path, yaml_key: str) -> None:
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(f"openrouter:\n  credentials:\n    {yaml_key}: do-not-persist\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="environment variables"):
+        load_settings(cfg)
 
 
 def test_load_settings_from_yaml(tmp_path: Path) -> None:

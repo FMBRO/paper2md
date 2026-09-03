@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+import re
 
 import yaml
 
@@ -25,6 +26,24 @@ DEFAULT_NOTION_PROPERTIES = {
     "imported_at": "Imported At",
     "model_prompt_version": "Model / Prompt Version",
 }
+
+_SENSITIVE_CONFIG_KEYS = {
+    "apikey", "accesskey", "secret", "clientsecret", "token", "accesstoken",
+    "authorization", "password", "passwd", "privatekey", "bearertoken",
+}
+
+
+def _has_sensitive_key(value: Any) -> bool:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            normalized_key = re.sub(r"[^a-z0-9]", "", str(key).lower())
+            if (normalized_key in _SENSITIVE_CONFIG_KEYS
+                    or any(normalized_key.endswith(key) for key in _SENSITIVE_CONFIG_KEYS)
+                    or _has_sensitive_key(child)):
+                return True
+    elif isinstance(value, list):
+        return any(_has_sensitive_key(child) for child in value)
+    return False
 
 
 @dataclass
@@ -96,9 +115,8 @@ def load_settings(config_path: Path | str, overrides: dict[str, Any] | None = No
     zotero = raw.get("zotero") or {}
     openrouter = raw.get("openrouter") or {}
     notion = raw.get("notion") or {}
-    for section_name, section in (("openrouter", openrouter), ("notion", notion)):
-        if any("api_key" in str(key).lower() or "secret" in str(key).lower() for key in section):
-            raise ValueError(f"{section_name} secrets must be supplied through environment variables")
+    if _has_sensitive_key(raw):
+        raise ValueError("Secrets must be supplied through environment variables")
 
     s = Settings(
         input_dir=Path(raw.get("input_dir", "input")),

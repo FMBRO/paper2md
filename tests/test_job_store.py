@@ -71,3 +71,47 @@ def test_a_job_needing_input_can_be_queued_again_for_resume(tmp_path: Path) -> N
 
     assert resumed.state is JobState.QUEUED
     assert resumed.error is None
+
+
+def test_job_store_rejects_job_for_nonexistent_paper(tmp_path: Path) -> None:
+    from src.job_store import JobStore
+    from src.research_models import InputKind, InputSpec
+
+    store = JobStore(tmp_path / "paper2md.sqlite3")
+
+    with pytest.raises(Exception, match="FOREIGN KEY"):
+        store.create_job(InputSpec(InputKind.DOI, "10.1/missing"), paper_id=999)
+
+
+def test_job_store_rejects_llm_call_for_nonexistent_job(tmp_path: Path) -> None:
+    from src.job_store import JobStore
+
+    store = JobStore(tmp_path / "paper2md.sqlite3")
+
+    with pytest.raises(Exception, match="FOREIGN KEY"):
+        store.cache_llm_call("missing-job", "request", "example/model", {"ok": True}, 0.01)
+
+
+def test_job_store_promotes_sha_identity_to_doi_and_merges_identifiers(tmp_path: Path) -> None:
+    from src.job_store import JobStore
+    from src.research_models import PaperMetadata
+
+    store = JobStore(tmp_path / "paper2md.sqlite3")
+    digest = "a" * 64
+    original_id = store.upsert_paper(PaperMetadata(title="PDF only"), digest)
+    promoted_id = store.upsert_paper(
+        PaperMetadata(
+            title="Enriched", doi="10.1/Promoted", arxiv_id="2401.12345",
+            zotero_library_id="0", zotero_item_key="ABCD1234",
+        ),
+        digest,
+    )
+
+    promoted = store.find_paper("doi:10.1/promoted")
+    assert promoted_id == original_id
+    assert promoted["id"] == original_id
+    assert promoted["canonical_identity"] == "doi:10.1/promoted"
+    assert promoted["arxiv_id"] == "2401.12345"
+    assert promoted["zotero_library_id"] == "0"
+    assert promoted["zotero_item_key"] == "ABCD1234"
+    assert store.find_paper(f"sha256:{digest}")["id"] == original_id
