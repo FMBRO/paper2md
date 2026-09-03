@@ -145,15 +145,19 @@ def normalize_markdown_document(markdown: str, *, page_count: int = 1) -> dict[s
     document = _document("markdown_fallback", range(1, page_count + 1))
     current_section: str | None = None
     page = 1
-    lines = markdown.splitlines()
+    # str.splitlines() treats form-feed as a line boundary and discards it.
+    # Keep it as a sentinel so Markdown exported with PDF page breaks retains
+    # deterministic page/source positions.
+    lines = markdown.replace("\f", "\n\f\n").split("\n")
     index = 0
     pending_figure: dict[str, Any] | None = None
     while index < len(lines):
-        line = lines[index].strip()
-        if line == "\f":
+        raw_line = lines[index]
+        if raw_line == "\f":
             page = min(page + 1, page_count)
             index += 1
             continue
+        line = raw_line.strip()
         page_marker = _PAGE_MARKER.match(line)
         if page_marker:
             page = min(max(1, int(page_marker.group(1))), page_count)

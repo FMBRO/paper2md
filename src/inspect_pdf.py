@@ -2,9 +2,13 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import fitz
+
+
+_GARBLED_TEXT = re.compile(r"\ufffd|[\u0000-\u0008\u000b\u000c\u000e-\u001f]")
 
 
 def inspect_page_text(pdf_path: Path | str) -> list[dict]:
@@ -18,6 +22,7 @@ def inspect_page_text(pdf_path: Path | str) -> list[dict]:
                 "page": index + 1,
                 "character_count": len(text),
                 "has_text": bool(text),
+                "has_garbled_text": bool(_GARBLED_TEXT.search(text)),
             })
         return result
     finally:
@@ -50,6 +55,7 @@ def inspect_pdf(pdf_path: Path | str, min_chars: int = 100, max_pages: int = 3) 
                 "page": index + 1,
                 "character_count": len(page_text),
                 "has_text": bool(page_text),
+                "has_garbled_text": bool(_GARBLED_TEXT.search(page_text)),
             })
         text = ""
         checked = 0

@@ -93,6 +93,27 @@ def test_convert_one_passes_ocr_options_to_run_ocrmypdf(mocker, image_pdf: Path,
     assert kwargs["clean"] is False
 
 
+def test_convert_one_uses_force_ocr_mode_when_forced(mocker, text_pdf: Path, tmp_path: Path) -> None:
+    settings = _settings(text_pdf.parent, tmp_path / "output", force_ocr=True)
+
+    def fake_ocr(_src, dst, **_kwargs):
+        Path(dst).write_bytes(b"%PDF-1.4-FAKE-OCR")
+        return Path(dst)
+
+    def fake_marker(_pdf, out_dir: Path, *, on_output=None):
+        out_dir.mkdir(parents=True, exist_ok=True)
+        md = out_dir / "paper.md"
+        md.write_text("# Title\n\n## Abstract\n\nbody", encoding="utf-8")
+        return md
+
+    ocr_spy = mocker.patch("src.convert_one.run_ocrmypdf", side_effect=fake_ocr)
+    mocker.patch("src.convert_one.run_marker", side_effect=fake_marker)
+
+    convert_one(text_pdf, settings)
+
+    assert ocr_spy.call_args.kwargs["mode"] == "force"
+
+
 def test_convert_one_emits_stage_events(mocker, image_pdf: Path, tmp_path: Path) -> None:
     output_dir = tmp_path / "output"
     settings = _settings(image_pdf.parent, output_dir, enable_ocr=True)

@@ -75,3 +75,58 @@ def test_converter_uses_ocr_only_for_empty_pages_then_gates_post_ocr_text(
     assert calls[0][1] == bundle.root / "paper_ocr.pdf"
     quality = json.loads((bundle.logs_dir / "quality_result.json").read_text(encoding="utf-8"))
     assert quality["passed"] is True
+
+
+def test_converter_recovers_sparse_nonempty_text_with_skip_text_ocr(tmp_path: Path) -> None:
+    source = tmp_path / "sparse.pdf"
+    doc = fitz.open()
+    doc.new_page().insert_text((72, 72), "tiny")
+    doc.save(source)
+    doc.close()
+    ocr_kwargs: dict = {}
+
+    def fake_ocr(_src: Path, dst: Path, **kwargs) -> Path:
+        ocr_kwargs.update(kwargs)
+        ocr_doc = fitz.open()
+        ocr_doc.new_page().insert_text((72, 72), "Recovered text that is long enough for the quality gate.")
+        ocr_doc.save(dst)
+        ocr_doc.close()
+        return dst
+
+    def fake_marker(_pdf: Path, output_dir: Path) -> Path:
+        output_dir.mkdir(parents=True)
+        markdown = output_dir / "paper.md"
+        markdown.write_text("# Paper\n", encoding="utf-8")
+        (output_dir / "document.json").write_text(json.dumps({"pages": [{"page": 1, "blocks": [
+            {"type": "SectionHeader", "text": "Paper", "level": 1},
+        ]}]}), encoding="utf-8")
+        return markdown
+
+    Converter(marker_runner=fake_marker, ocr_runner=fake_ocr).convert(source, tmp_path / "artifact")
+
+    assert ocr_kwargs["mode"] == "skip_text"
+
+
+def test_converter_uses_force_ocr_mode_when_explicitly_requested(text_pdf: Path, tmp_path: Path) -> None:
+    ocr_kwargs: dict = {}
+
+    def fake_ocr(_src: Path, dst: Path, **kwargs) -> Path:
+        ocr_kwargs.update(kwargs)
+        ocr_doc = fitz.open()
+        ocr_doc.new_page().insert_text((72, 72), "Forced OCR text that is long enough for the quality gate.")
+        ocr_doc.save(dst)
+        ocr_doc.close()
+        return dst
+
+    def fake_marker(_pdf: Path, output_dir: Path) -> Path:
+        output_dir.mkdir(parents=True)
+        markdown = output_dir / "paper.md"
+        markdown.write_text("# Paper\n", encoding="utf-8")
+        (output_dir / "document.json").write_text(json.dumps({"pages": [{"page": 1, "blocks": [
+            {"type": "SectionHeader", "text": "Paper", "level": 1},
+        ]}]}), encoding="utf-8")
+        return markdown
+
+    Converter(marker_runner=fake_marker, ocr_runner=fake_ocr, force_ocr=True).convert(text_pdf, tmp_path / "artifact")
+
+    assert ocr_kwargs["mode"] == "force"

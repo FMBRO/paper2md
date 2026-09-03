@@ -68,6 +68,7 @@ def convert_one(
                     lang=settings.language,
                     deskew=settings.ocr_deskew,
                     clean=settings.ocr_clean,
+                    mode="force" if settings.force_ocr else "skip_text",
                     on_output=log,
                 )
                 target_pdf = ocr_pdf

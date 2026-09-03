@@ -43,6 +43,7 @@ class Converter:
         language: str = "eng",
         ocr_deskew: bool = True,
         ocr_clean: bool = True,
+        minimum_page_characters: int = 20,
     ) -> None:
         self.marker_runner = marker_runner
         self.ocr_runner = ocr_runner
@@ -51,6 +52,7 @@ class Converter:
         self.language = language
         self.ocr_deskew = ocr_deskew
         self.ocr_clean = ocr_clean
+        self.minimum_page_characters = minimum_page_characters
 
     def convert(self, pdf_path: Path | str, artifact_dir: Path | str) -> ArtifactBundle:
         pdf_path = Path(pdf_path)
@@ -64,13 +66,18 @@ class Converter:
 
         target_pdf = source_pdf
         ocr_used = self.force_ocr or (
-            self.enable_ocr and any(not page["has_text"] for page in source_page_text)
+            self.enable_ocr and any(
+                not page["has_text"]
+                or page["character_count"] < self.minimum_page_characters
+                or page["has_garbled_text"]
+                for page in source_page_text
+            )
         )
         if ocr_used:
             target_pdf = bundle.root / "paper_ocr.pdf"
             self.ocr_runner(
                 source_pdf, target_pdf, lang=self.language, deskew=self.ocr_deskew,
-                clean=self.ocr_clean,
+                clean=self.ocr_clean, mode="force" if self.force_ocr else "skip_text",
             )
 
         page_text = inspect_page_text(target_pdf)

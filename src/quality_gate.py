@@ -30,6 +30,28 @@ def _sections_are_ordered(sections: list[dict[str, Any]]) -> bool:
     return True
 
 
+def _normalized_text(document: dict[str, Any]) -> list[tuple[int | None, str]]:
+    fields = {
+        "sections": ("title",),
+        "paragraphs": ("text",),
+        "tables": ("markdown",),
+        "equations": ("text",),
+        "figures": ("path", "alt_text", "caption"),
+        "captions": ("text",),
+    }
+    values: list[tuple[int | None, str]] = []
+    for collection, names in fields.items():
+        for item in document.get(collection, []):
+            if not isinstance(item, dict):
+                continue
+            page = item.get("page")
+            for name in names:
+                value = item.get(name)
+                if isinstance(value, str) and value.strip():
+                    values.append((page if isinstance(page, int) else None, value))
+    return values
+
+
 def evaluate_document_quality(
     document: dict[str, Any],
     *,
@@ -39,21 +61,20 @@ def evaluate_document_quality(
     """Evaluate deterministic artifacts and return an LLM authorization result."""
     issues: list[dict[str, str]] = []
     pages = document.get("pages", [])
-    expected_pages = {page.get("number") for page in pages if isinstance(page, dict)}
-    inspected_pages = {page.get("page") for page in page_text}
-    if expected_pages - inspected_pages:
-        issues.append(_issue("page_coverage", "Some document pages have no text inspection result."))
+    expected_pages = {page.get("number") for page in pages if isinstance(page, dict) and isinstance(page.get("number"), int)}
+    inspected_pages = {page.get("page") for page in page_text if isinstance(page.get("page"), int)}
+    if expected_pages != inspected_pages:
+        issues.append(_issue("page_coverage", "Structured document pages do not exactly match inspected PDF pages."))
     if any(not page.get("has_text") for page in page_text):
         issues.append(_issue("empty_page_text", "At least one PDF page has no extractable text."))
     if any(page.get("character_count", 0) < minimum_characters_per_page for page in page_text):
         issues.append(_issue("low_character_density", "At least one PDF page has too little text."))
 
-    text = "\n".join(
-        str(item.get("title") if collection == "sections" else item.get("text", ""))
-        for collection in ("paragraphs", "sections", "captions", "equations")
-        for item in document.get(collection, [])
-        if isinstance(item, dict)
-    )
+    normalized_text = _normalized_text(document)
+    populated_pages = {page for page, value in normalized_text if page in expected_pages and value.strip()}
+    if expected_pages - populated_pages:
+        issues.append(_issue("empty_document_page", "At least one structured document page has no normalized content."))
+    text = "\n".join(value for _, value in normalized_text)
     if _GARBLED.search(text):
         issues.append(_issue("garbled_characters", "Replacement or control characters were found."))
     sections = [item for item in document.get("sections", []) if isinstance(item, dict)]

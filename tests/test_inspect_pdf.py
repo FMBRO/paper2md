@@ -63,6 +63,6 @@ def test_inspect_page_text_reports_every_page_in_mixed_pdf(tmp_path: Path) -> No
     pages = inspect_page_text(pdf)
 
     assert pages == [
-        {"page": 1, "character_count": 18, "has_text": True},
-        {"page": 2, "character_count": 0, "has_text": False},
+        {"page": 1, "character_count": 18, "has_text": True, "has_garbled_text": False},
+        {"page": 2, "character_count": 0, "has_text": False, "has_garbled_text": False},
     ]

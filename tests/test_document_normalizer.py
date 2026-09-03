@@ -58,3 +58,14 @@ def test_marker_normalization_defaults_an_invalid_heading_level() -> None:
     ]}]})
 
     assert document["sections"][0]["level"] == 1
+
+
+def test_markdown_fallback_keeps_form_feed_page_positions() -> None:
+    document = normalize_markdown_document(
+        "# First\nFirst body.\f# Second\nSecond body.", page_count=2,
+    )
+
+    assert [(section["title"], section["page"]) for section in document["sections"]] == [
+        ("First", 1), ("Second", 2),
+    ]
+    assert document["paragraphs"][1]["source_position"]["page"] == 2

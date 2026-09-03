@@ -21,6 +21,30 @@ def test_run_ocrmypdf_builds_expected_command(mocker, tmp_path: Path) -> None:
     assert args[-2:] == [str(src_pdf), str(dst_pdf)]
 
 
+def test_run_ocrmypdf_uses_skip_text_mode_for_mixed_page_recovery(mocker, tmp_path: Path) -> None:
+    src_pdf = tmp_path / "in.pdf"
+    dst_pdf = tmp_path / "out.pdf"
+    fake_run = mocker.patch("src.run_ocr.run_streaming_command", return_value=0)
+
+    run_ocrmypdf(src_pdf, dst_pdf, clean=False)
+
+    args = fake_run.call_args.args[0]
+    assert "--skip-text" in args
+    assert "--force-ocr" not in args
+
+
+def test_run_ocrmypdf_uses_force_mode_for_explicit_preprocessing(mocker, tmp_path: Path) -> None:
+    src_pdf = tmp_path / "in.pdf"
+    dst_pdf = tmp_path / "out.pdf"
+    fake_run = mocker.patch("src.run_ocr.run_streaming_command", return_value=0)
+
+    run_ocrmypdf(src_pdf, dst_pdf, clean=False, mode="force")
+
+    args = fake_run.call_args.args[0]
+    assert "--force-ocr" in args
+    assert "--skip-text" not in args
+
+
 def test_run_ocrmypdf_omits_flags_when_disabled(mocker, tmp_path: Path) -> None:
     src_pdf = tmp_path / "in.pdf"
     src_pdf.write_bytes(b"%PDF-1.4")
