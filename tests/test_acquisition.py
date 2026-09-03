@@ -63,6 +63,22 @@ def test_parse_input_rejects_malformed_values(source: str) -> None:
         parse_input(source)
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        "10.5555/example<>[]",
+        "https://doi.org/10.5555/example%3C%3E%5B%5D",
+    ],
+)
+def test_parse_input_accepts_standard_doi_suffix_characters(source: str) -> None:
+    from src.acquisition import parse_input
+
+    spec = parse_input(source)
+
+    assert spec.kind.value == "doi"
+    assert spec.source == "10.5555/example<>[]"
+
+
 def test_acquire_copies_a_local_pdf_and_computes_its_digest(tmp_path: Path) -> None:
     from src.acquisition import DocumentAcquirer, parse_input
     from src.artifacts import ArtifactManager
@@ -155,6 +171,39 @@ def test_acquire_doi_without_an_explicit_pdf_link_needs_input(tmp_path: Path) ->
     assert result.state is JobState.NEEDS_INPUT
     assert result.source_pdf is None
     assert result.metadata.title == "Closed"
+
+
+@pytest.mark.parametrize(
+    ("status_code", "content"),
+    [
+        (401, PDF_BYTES),
+        (403, PDF_BYTES),
+        (200, b"<html>paywall</html>"),
+    ],
+)
+def test_acquire_doi_with_an_inaccessible_explicit_pdf_link_needs_input(
+    tmp_path: Path, status_code: int, content: bytes,
+) -> None:
+    from src.acquisition import DocumentAcquirer, HttpResponse, parse_input
+    from src.artifacts import ArtifactManager
+    from src.research_models import JobState
+
+    metadata_url = "https://api.crossref.org/works/10.1000%2Fclosed"
+    pdf_url = "https://publisher.example/closed.pdf"
+    client = MappingHttpClient({
+        metadata_url: HttpResponse(
+            200,
+            {"content-type": "application/json"},
+            b'{"message":{"title":["Closed"],"link":[{"URL":"https://publisher.example/closed.pdf","content-type":"application/pdf"}]}}',
+        ),
+        pdf_url: HttpResponse(status_code, {"content-type": "application/pdf"}, content),
+    })
+
+    result = DocumentAcquirer(client).acquire(parse_input("10.1000/closed"), ArtifactManager(tmp_path, str(status_code)))
+
+    assert result.state is JobState.NEEDS_INPUT
+    assert result.source_pdf is None
+    assert result.pdf_sha256 is None
 
 
 @pytest.mark.parametrize(

@@ -10,15 +10,14 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Protocol
-from urllib.parse import urlparse
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlparse
 
 from src.artifacts import ArtifactManager
 from src.research_models import InputKind, InputSpec, JobState, PaperMetadata
 
 
 _ARXIV_ID = re.compile(r"^(?:\d{4}\.\d{4,5}|[a-z-]+(?:\.[a-z-]+)?/\d{7})(?:v\d+)?$", re.IGNORECASE)
-_DOI = re.compile(r"^10\.\d{4,9}/[-._;()/:a-z0-9]+$", re.IGNORECASE)
+_DOI = re.compile(r"^10\.\d{4,9}/\S+$", re.IGNORECASE)
 _ZOTERO_KEY = re.compile(r"^[A-Z0-9]{8}$", re.IGNORECASE)
 
 
@@ -76,6 +75,7 @@ def _normalized_doi(value: str) -> str | None:
     value = value.strip()
     value = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", value, flags=re.IGNORECASE)
     value = re.sub(r"^doi:\s*", "", value, flags=re.IGNORECASE)
+    value = unquote(value)
     if not _DOI.fullmatch(value):
         return None
     return value.lower()
@@ -152,7 +152,10 @@ class DocumentAcquirer:
         metadata, pdf_url = self._parse_crossref(message, doi)
         if not pdf_url:
             return AcquisitionResult(metadata, None, None, JobState.NEEDS_INPUT)
-        content = self._get_pdf(pdf_url)
+        try:
+            content = self._get_pdf(pdf_url)
+        except AcquisitionError:
+            return AcquisitionResult(metadata, None, None, JobState.NEEDS_INPUT)
         return self._result(metadata, artifacts.write_source_pdf(content), content)
 
     def _get(self, url: str) -> bytes:
