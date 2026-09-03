@@ -7,15 +7,18 @@ import hashlib
 import json
 import os
 import re
+import time
+import unicodedata
+import uuid
 from collections.abc import Callable
-from typing import Any, TypeVar
+from typing import Any, Protocol, TypeVar
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic import ValidationError
 
 from src.artifacts import ArtifactManager
-from src.config import OpenRouterSettings
+from src.config import OPENROUTER_CHAT_COMPLETIONS_ENDPOINT, OpenRouterSettings
 from src.job_store import JobStore
 from src.research_models import ArtifactBundle, EvidenceAnchor, PaperSummary
 
@@ -47,11 +50,23 @@ class OpenRouterConfigurationError(RuntimeError):
     """Raised when required environment configuration is absent."""
 
 
+class InputLimitExceededError(RuntimeError):
+    """Raised before sending content that cannot fit a configured input ceiling."""
+
+
+class UnresolvedUsageError(RuntimeError):
+    """Raised when a successful HTTP response has no trustworthy billable cost."""
+
+
+class RequestInFlightError(RuntimeError):
+    """Raised when another caller holds a request lease beyond the wait bound."""
+
+
 class EvidenceResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    page: int | None = Field(default=None, ge=1)
-    section: str | None = None
+    page: int = Field(ge=1)
+    section: str = Field(min_length=1)
     quote: str = Field(min_length=1)
 
 
@@ -73,7 +88,7 @@ class PaperSummaryResponse(BaseModel):
     relevance_score: int = Field(ge=1, le=5)
     score_rationale: str = Field(min_length=1)
     keywords: list[str]
-    evidence: list[EvidenceResponse]
+    evidence: list[EvidenceResponse] = Field(min_length=1)
 
     @field_validator(
         "background", "question", "novelty", "methods", "results", "strengths",
@@ -93,7 +108,7 @@ class ChunkExtractionResponse(BaseModel):
     datasets: list[str]
     metrics: list[str]
     keywords: list[str]
-    evidence: list[EvidenceResponse]
+    evidence: list[EvidenceResponse] = Field(min_length=1)
 
     @field_validator("summary")
     @classmethod
@@ -110,6 +125,24 @@ class _UsageResponse(BaseModel):
     completion_tokens: int = Field(ge=0)
     total_tokens: int = Field(ge=0)
     cost: Decimal = Field(ge=0)
+
+
+class _AuditUsageResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    prompt_tokens: int | None = Field(default=None, ge=0)
+    completion_tokens: int | None = Field(default=None, ge=0)
+    total_tokens: int | None = Field(default=None, ge=0)
+    cost: Decimal | None = Field(default=None, ge=0)
+
+
+class _BillableResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    generation_id: str | None = Field(default=None, alias="id")
+    model: str | None = None
+    provider: str | None = None
+    usage: _AuditUsageResponse | None = None
 
 
 class _MessageResponse(BaseModel):
@@ -139,12 +172,76 @@ class ModelPricing:
     output_per_million: Decimal
 
 
-# OpenRouter model-card list prices checked 2026-09-03. Unknown/overridden
-# models intentionally have no fallback price and are rejected before a call.
-CURRENT_MODEL_PRICING = {
-    "google/gemini-3.8-flash": ModelPricing(Decimal("0.75"), Decimal("3.75")),
-    "openai/gpt-5.6-sol": ModelPricing(Decimal("2.00"), Decimal("10.00")),
-}
+@dataclass(frozen=True, slots=True)
+class PricingSnapshot(ModelPricing):
+    model: str
+    version: str
+
+    def as_record(self) -> dict[str, str]:
+        return {
+            "model": self.model,
+            "input_per_million": str(self.input_per_million),
+            "output_per_million": str(self.output_per_million),
+            "version": self.version,
+        }
+
+
+class ModelCatalog(Protocol):
+    def pricing_for(self, model: str) -> PricingSnapshot: ...
+
+
+class OpenRouterModelCatalog:
+    """Load current per-token prices from OpenRouter's official model catalog."""
+
+    endpoint = "https://openrouter.ai/api/v1/models"
+
+    def __init__(self, client: httpx.Client) -> None:
+        self.client = client
+
+    def pricing_for(self, model: str) -> PricingSnapshot:
+        api_key = os.environ.get("OPENROUTER_API_KEY")
+        if not api_key:
+            raise OpenRouterConfigurationError("OPENROUTER_API_KEY is required")
+        try:
+            response = self.client.get(
+                self.endpoint,
+                params={
+                    "q": model,
+                    "supported_parameters": "structured_outputs",
+                    "zdr": "true",
+                },
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+        except httpx.HTTPError as error:
+            raise PricingUnavailableError(f"Pricing unavailable for {model}") from error
+        if response.status_code < 200 or response.status_code >= 300:
+            raise PricingUnavailableError(f"Pricing unavailable for {model}")
+        try:
+            payload = response.json()
+            matches = [item for item in payload["data"] if item.get("id") == model]
+            if len(matches) != 1:
+                raise ValueError("model missing or ambiguous")
+            item = matches[0]
+            supported = set(item.get("supported_parameters") or [])
+            if not {"structured_outputs", "response_format"} & supported:
+                raise ValueError("structured output unavailable")
+            prompt = Decimal(str(item["pricing"]["prompt"])) * Decimal(1_000_000)
+            completion = Decimal(str(item["pricing"]["completion"])) * Decimal(1_000_000)
+            if prompt < 0 or completion < 0:
+                raise ValueError("negative price")
+            version = (
+                response.headers.get("etag")
+                or response.headers.get("last-modified")
+                or f"created:{item['created']}"
+            )
+        except (KeyError, TypeError, ValueError, ArithmeticError) as error:
+            raise PricingUnavailableError(f"Pricing unavailable for {model}") from error
+        return PricingSnapshot(
+            model=model,
+            input_per_million=prompt,
+            output_per_million=completion,
+            version=version,
+        )
 
 
 def estimate_worst_case_cost(
@@ -157,6 +254,14 @@ def estimate_worst_case_cost(
         Decimal(max_input_tokens) * pricing.input_per_million
         + Decimal(max_output_tokens) * pricing.output_per_million
     ) / million
+
+
+def estimate_serialized_tokens(payload: dict[str, Any]) -> int:
+    """Conservative tokenizer-independent upper bound for a JSON request."""
+    serialized = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return len(serialized.encode("utf-8"))
 
 
 @dataclass(slots=True)
@@ -195,6 +300,7 @@ def build_structured_payload(
     *,
     settings: OpenRouterSettings,
     model: str,
+    pricing: PricingSnapshot,
     messages: list[dict[str, str]],
     response_model: type[BaseModel],
     max_output_tokens: int,
@@ -204,6 +310,8 @@ def build_structured_payload(
         raise PrivacyRequirementsError(
             "Structured output, ZDR, and disabled provider data collection are mandatory"
         )
+    if pricing.model != model:
+        raise PricingUnavailableError(f"Pricing snapshot does not match {model}")
     return {
         "model": model,
         "messages": messages,
@@ -222,6 +330,10 @@ def build_structured_payload(
             "require_parameters": True,
             "zdr": True,
             "data_collection": "deny",
+            "max_price": {
+                "prompt": float(pricing.input_per_million),
+                "completion": float(pricing.output_per_million),
+            },
         },
     }
 
@@ -235,12 +347,12 @@ class OpenRouterSummarizer:
         *,
         settings: OpenRouterSettings | None = None,
         client: httpx.Client | None = None,
-        pricing: dict[str, ModelPricing] | None = None,
+        catalog: ModelCatalog | None = None,
     ) -> None:
         self.store = store
         self.settings = settings or OpenRouterSettings()
         self.client = client or httpx.Client(timeout=60.0)
-        self.pricing = dict(CURRENT_MODEL_PRICING if pricing is None else pricing)
+        self.catalog = catalog or OpenRouterModelCatalog(self.client)
 
     @staticmethod
     def _request_hash(payload: dict[str, Any]) -> str:
@@ -276,11 +388,65 @@ class OpenRouterSummarizer:
         response_model: type[ResponseModel],
         job_id: str,
         cache_key: str,
+        pricing: PricingSnapshot,
+        max_input_tokens: int,
+        stage: str,
+        validate: Callable[[ResponseModel], None] | None = None,
+    ) -> ResponseModel:
+        owner_token = str(uuid.uuid4())
+        deadline = time.monotonic() + 30.0
+        attempts = self.settings.max_validation_retries + 1
+        while True:
+            cached = self._cached(cache_key, response_model, validate)
+            if cached is not None:
+                return cached
+            if self.store.has_unresolved_llm_call(cache_key):
+                raise UnresolvedUsageError(
+                    "OpenRouter cost remains unresolved for this request"
+                )
+            if self.store.llm_attempt_count(cache_key) >= attempts:
+                raise StructuredOutputError(
+                    f"Structured output retries already exhausted after {attempts} attempts"
+                )
+            if self.store.claim_llm_request(
+                cache_key, owner_token, now=time.time(), lease_seconds=300.0,
+            ):
+                break
+            if time.monotonic() >= deadline:
+                raise RequestInFlightError("Timed out waiting for an identical LLM request")
+            time.sleep(0.01)
+        try:
+            return self._claimed_structured_call(
+                payload=payload,
+                response_model=response_model,
+                job_id=job_id,
+                cache_key=cache_key,
+                pricing=pricing,
+                max_input_tokens=max_input_tokens,
+                stage=stage,
+                validate=validate,
+            )
+        finally:
+            self.store.release_llm_request(cache_key, owner_token)
+
+    def _claimed_structured_call(
+        self,
+        *,
+        payload: dict[str, Any],
+        response_model: type[ResponseModel],
+        job_id: str,
+        cache_key: str,
+        pricing: PricingSnapshot,
+        max_input_tokens: int,
+        stage: str,
         validate: Callable[[ResponseModel], None] | None = None,
     ) -> ResponseModel:
         cached = self._cached(cache_key, response_model, validate)
         if cached is not None:
             return cached
+        if self.store.has_unresolved_llm_call(cache_key):
+            raise UnresolvedUsageError("OpenRouter cost remains unresolved for this request")
+        self._validate_endpoint()
         api_key = os.environ.get("OPENROUTER_API_KEY")
         if not api_key:
             raise OpenRouterConfigurationError("OPENROUTER_API_KEY is required")
@@ -304,6 +470,7 @@ class OpenRouterSummarizer:
                         ),
                     },
                 ]
+            self._ensure_input_limit(attempt_payload, max_input_tokens, stage)
             request_hash = self._request_hash(attempt_payload)
             try:
                 response = self.client.post(
@@ -319,24 +486,94 @@ class OpenRouterSummarizer:
             if response.status_code < 200 or response.status_code >= 300:
                 raise OpenRouterAPIError(f"OpenRouter returned HTTP {response.status_code}")
             try:
-                envelope = _CompletionResponse.model_validate(response.json())
-            except (ValueError, ValidationError) as error:
-                last_error = error
-                continue
-            usage = envelope.usage.model_dump(mode="json")
-            if envelope.model != attempt_payload["model"]:
+                raw_response = response.json()
+            except ValueError as error:
                 self.store.record_llm_call(
                     job_id,
                     request_hash=request_hash,
                     cache_key=cache_key,
-                    model=envelope.model,
-                    provider=envelope.provider,
-                    response={"content": envelope.choices[0].message.content},
-                    usage=usage,
-                    cost_usd=float(envelope.usage.cost),
+                    model=str(attempt_payload["model"]),
+                    provider=None,
+                    generation_id=None,
+                    response={"body_sha256": hashlib.sha256(response.content).hexdigest()},
+                    usage={},
+                    cost_usd=0.0,
+                    cost_resolved=False,
                     validated=False,
+                    pricing=pricing.as_record(),
+                )
+                raise UnresolvedUsageError(
+                    "OpenRouter returned 2xx without parseable cost metadata"
+                ) from error
+            try:
+                audit = _BillableResponse.model_validate(raw_response)
+            except ValidationError as error:
+                audit = _BillableResponse()
+                last_error = error
+            resolved = (
+                audit.generation_id is not None
+                and audit.model is not None
+                and audit.provider is not None
+                and audit.usage is not None
+                and audit.usage.prompt_tokens is not None
+                and audit.usage.completion_tokens is not None
+                and audit.usage.total_tokens is not None
+                and audit.usage.cost is not None
+            )
+            if not resolved:
+                usage = audit.usage.model_dump(mode="json") if audit.usage else {}
+                self.store.record_llm_call(
+                    job_id,
+                    request_hash=request_hash,
+                    cache_key=cache_key,
+                    model=audit.model or str(attempt_payload["model"]),
+                    provider=audit.provider,
+                    generation_id=audit.generation_id,
+                    response=raw_response,
+                    usage=usage,
+                    cost_usd=0.0,
+                    cost_resolved=False,
+                    validated=False,
+                    pricing=pricing.as_record(),
+                )
+                raise UnresolvedUsageError(
+                    "OpenRouter returned 2xx but usage cost is unavailable"
+                ) from last_error
+            usage = audit.usage.model_dump(mode="json")
+            cost_usd = float(audit.usage.cost)
+            if audit.model != attempt_payload["model"]:
+                self.store.record_llm_call(
+                    job_id,
+                    request_hash=request_hash,
+                    cache_key=cache_key,
+                    model=audit.model,
+                    provider=audit.provider,
+                    generation_id=audit.generation_id,
+                    response=raw_response,
+                    usage=usage,
+                    cost_usd=cost_usd,
+                    validated=False,
+                    pricing=pricing.as_record(),
                 )
                 raise OpenRouterAPIError("OpenRouter returned an unexpected model")
+            try:
+                envelope = _CompletionResponse.model_validate(raw_response)
+            except ValidationError as error:
+                self.store.record_llm_call(
+                    job_id,
+                    request_hash=request_hash,
+                    cache_key=cache_key,
+                    model=audit.model,
+                    provider=audit.provider,
+                    generation_id=audit.generation_id,
+                    response=raw_response,
+                    usage=usage,
+                    cost_usd=cost_usd,
+                    validated=False,
+                    pricing=pricing.as_record(),
+                )
+                last_error = error
+                continue
             content = envelope.choices[0].message.content
             try:
                 candidate = json.loads(content)
@@ -350,10 +587,12 @@ class OpenRouterSummarizer:
                     cache_key=cache_key,
                     model=envelope.model,
                     provider=envelope.provider,
+                    generation_id=audit.generation_id,
                     response={"content": content},
                     usage=usage,
-                    cost_usd=float(envelope.usage.cost),
+                    cost_usd=cost_usd,
                     validated=False,
+                    pricing=pricing.as_record(),
                 )
                 last_error = error
                 continue
@@ -363,17 +602,21 @@ class OpenRouterSummarizer:
                 cache_key=cache_key,
                 model=envelope.model,
                 provider=envelope.provider,
+                generation_id=audit.generation_id,
                 response=parsed.model_dump(mode="json"),
                 usage=usage,
-                cost_usd=float(envelope.usage.cost),
+                cost_usd=cost_usd,
                 validated=True,
+                pricing=pricing.as_record(),
             )
             return parsed
         raise StructuredOutputError(
             f"Structured output remained invalid after {attempts} attempts"
         ) from last_error
 
-    def _map_payload(self, chunk: DocumentChunk, research_interest: str) -> dict[str, Any]:
+    def _map_payload(
+        self, chunk: DocumentChunk, research_interest: str, pricing: PricingSnapshot,
+    ) -> dict[str, Any]:
         chunk_data = {
             "section": chunk.section,
             "start_page": chunk.start_page,
@@ -393,6 +636,7 @@ class OpenRouterSummarizer:
         return build_structured_payload(
             settings=self.settings,
             model=self.settings.extraction_model,
+            pricing=pricing,
             messages=[
                 {
                     "role": "system",
@@ -413,11 +657,15 @@ class OpenRouterSummarizer:
         )
 
     def _synthesis_payload(
-        self, extractions: list[ChunkExtractionResponse], research_interest: str,
+        self,
+        extractions: list[ChunkExtractionResponse],
+        research_interest: str,
+        pricing: PricingSnapshot,
     ) -> dict[str, Any]:
         return build_structured_payload(
             settings=self.settings,
             model=self.settings.synthesis_model,
+            pricing=pricing,
             messages=[
                 {
                     "role": "system",
@@ -443,32 +691,122 @@ class OpenRouterSummarizer:
             max_output_tokens=self.settings.synthesis_max_output_tokens,
         )
 
-    def _call_cost(self, model: str, input_tokens: int, output_tokens: int) -> Decimal:
-        pricing = self.pricing.get(model)
-        if pricing is None:
-            raise PricingUnavailableError(f"Pricing unavailable for {model}")
+    def _reduction_payload(
+        self,
+        extractions: list[ChunkExtractionResponse],
+        research_interest: str,
+        pricing: PricingSnapshot,
+    ) -> dict[str, Any]:
+        return build_structured_payload(
+            settings=self.settings,
+            model=self.settings.extraction_model,
+            pricing=pricing,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "検証済み抽出結果を、根拠を失わず重複を除いて日本語で圧縮してください。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "research_interest": research_interest,
+                            "validated_extractions": [
+                                item.model_dump(mode="json") for item in extractions
+                            ],
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
+            response_model=ChunkExtractionResponse,
+            max_output_tokens=self.settings.extraction_max_output_tokens,
+        )
+
+    @staticmethod
+    def _ensure_input_limit(
+        payload: dict[str, Any], max_input_tokens: int, stage: str,
+    ) -> None:
+        estimated = estimate_serialized_tokens(payload)
+        if estimated > max_input_tokens:
+            raise InputLimitExceededError(
+                f"{stage} request requires at most {estimated} conservative tokens, "
+                f"above configured ceiling {max_input_tokens}"
+            )
+
+    def _reduction_groups(
+        self,
+        extractions: list[ChunkExtractionResponse],
+        research_interest: str,
+        pricing: PricingSnapshot,
+    ) -> list[tuple[list[ChunkExtractionResponse], dict[str, Any]]]:
+        groups: list[tuple[list[ChunkExtractionResponse], dict[str, Any]]] = []
+        pending: list[ChunkExtractionResponse] = []
+        pending_payload: dict[str, Any] | None = None
+        for extraction in extractions:
+            candidate = [*pending, extraction]
+            payload = self._reduction_payload(candidate, research_interest, pricing)
+            if estimate_serialized_tokens(payload) <= self.settings.extraction_max_input_tokens:
+                pending = candidate
+                pending_payload = payload
+                continue
+            if not pending or pending_payload is None:
+                raise InputLimitExceededError(
+                    "one validated extraction cannot fit the reduction input ceiling"
+                )
+            groups.append((pending, pending_payload))
+            pending = [extraction]
+            pending_payload = self._reduction_payload(pending, research_interest, pricing)
+            self._ensure_input_limit(
+                pending_payload, self.settings.extraction_max_input_tokens, "reduction",
+            )
+        if pending and pending_payload is not None:
+            groups.append((pending, pending_payload))
+        if len(groups) >= len(extractions):
+            raise InputLimitExceededError(
+                "reduction ceiling cannot combine two extraction results"
+            )
+        return groups
+
+    @staticmethod
+    def _call_cost(pricing: PricingSnapshot, input_tokens: int, output_tokens: int) -> Decimal:
         return estimate_worst_case_cost(
             pricing,
             max_input_tokens=input_tokens,
             max_output_tokens=output_tokens,
         )
 
+    def _validate_endpoint(self) -> None:
+        if self.settings.endpoint != OPENROUTER_CHAT_COMPLETIONS_ENDPOINT:
+            raise ValueError(
+                f"openrouter endpoint must be exactly {OPENROUTER_CHAT_COMPLETIONS_ENDPOINT}"
+            )
+
     @staticmethod
     def _evidence_validator(
         chunks: list[DocumentChunk],
     ) -> Callable[[BaseModel], None]:
-        pages = {
-            evidence.page for chunk in chunks for evidence in chunk.evidence
-        }
-        sections = {chunk.section for chunk in chunks if chunk.section}
+        def normalize(value: str) -> str:
+            return " ".join(unicodedata.normalize("NFKC", value).casefold().split())
+
+        spans: dict[tuple[int, str], list[str]] = {}
+        for chunk in chunks:
+            for evidence in chunk.evidence:
+                spans.setdefault((evidence.page, chunk.section), []).append(
+                    normalize(evidence.source_text)
+                )
 
         def validate(response: BaseModel) -> None:
             evidence_items = getattr(response, "evidence", [])
             for anchor in evidence_items:
-                if anchor.page is not None and anchor.page not in pages:
-                    raise ValueError("evidence page is outside the source document")
-                if anchor.section is not None and anchor.section not in sections:
-                    raise ValueError("evidence section is outside the source document")
+                matching_spans = spans.get((anchor.page, anchor.section))
+                if not matching_spans:
+                    raise ValueError("evidence page and section do not identify a source span")
+                quote = normalize(anchor.quote)
+                if not any(quote in source for source in matching_spans):
+                    raise ValueError("evidence quote is absent from its source span")
 
         return validate
 
@@ -480,10 +818,20 @@ class OpenRouterSummarizer:
         artifacts: ArtifactManager,
         research_interest: str = "",
     ) -> PaperSummary:
+        self._validate_endpoint()
         chunks = build_document_chunks(document, max_chars=self.settings.chunk_max_chars)
         if not chunks:
             raise ValueError("document contains no summarizable content")
-        map_payloads = [self._map_payload(chunk, research_interest) for chunk in chunks]
+        extraction_pricing = self.catalog.pricing_for(self.settings.extraction_model)
+        synthesis_pricing = self.catalog.pricing_for(self.settings.synthesis_model)
+        map_payloads = [
+            self._map_payload(chunk, research_interest, extraction_pricing)
+            for chunk in chunks
+        ]
+        for payload in map_payloads:
+            self._ensure_input_limit(
+                payload, self.settings.extraction_max_input_tokens, "extraction",
+            )
         map_cache_keys = [self._cache_key(payload) for payload in map_payloads]
         cached_maps = [
             self._cached(key, ChunkExtractionResponse, self._evidence_validator([chunk]))
@@ -491,20 +839,23 @@ class OpenRouterSummarizer:
         ]
         uncached_count = sum(item is None for item in cached_maps)
         guard = BudgetGuard(
-            pricing=self.pricing,
+            pricing={
+                extraction_pricing.model: extraction_pricing,
+                synthesis_pricing.model: synthesis_pricing,
+            },
             budget_usd=Decimal(str(self.settings.paper_budget_usd)),
-            spent_usd=Decimal(str(self.store.total_cost(job_id))),
+            spent_usd=Decimal(str(self.store.paper_total_cost(job_id))),
         )
         attempts = self.settings.max_validation_retries + 1
         if uncached_count:
             planned_cost = (
                 self._call_cost(
-                    self.settings.extraction_model,
+                    extraction_pricing,
                     self.settings.extraction_max_input_tokens,
                     self.settings.extraction_max_output_tokens,
                 ) * uncached_count * attempts
                 + self._call_cost(
-                    self.settings.synthesis_model,
+                    synthesis_pricing,
                     self.settings.synthesis_max_input_tokens,
                     self.settings.synthesis_max_output_tokens,
                 ) * attempts
@@ -520,11 +871,54 @@ class OpenRouterSummarizer:
                 response_model=ChunkExtractionResponse,
                 job_id=job_id,
                 cache_key=cache_key,
+                pricing=extraction_pricing,
+                max_input_tokens=self.settings.extraction_max_input_tokens,
+                stage="extraction",
                 validate=self._evidence_validator([chunk]),
             )
             extractions.append(ChunkExtractionResponse.model_validate(result))
 
-        synthesis_payload = self._synthesis_payload(extractions, research_interest)
+        synthesis_payload = self._synthesis_payload(
+            extractions, research_interest, synthesis_pricing,
+        )
+        for level in range(self.settings.max_reduction_levels + 1):
+            if estimate_serialized_tokens(synthesis_payload) <= self.settings.synthesis_max_input_tokens:
+                break
+            if level == self.settings.max_reduction_levels:
+                raise InputLimitExceededError(
+                    f"synthesis request still exceeds its ceiling after {level} reduction levels"
+                )
+            groups = self._reduction_groups(
+                extractions, research_interest, extraction_pricing,
+            )
+            reduction_cost = self._call_cost(
+                extraction_pricing,
+                self.settings.extraction_max_input_tokens,
+                self.settings.extraction_max_output_tokens,
+            ) * len(groups) * attempts
+            BudgetGuard(
+                pricing={extraction_pricing.model: extraction_pricing},
+                budget_usd=Decimal(str(self.settings.paper_budget_usd)),
+                spent_usd=Decimal(str(self.store.paper_total_cost(job_id))),
+            ).authorize_amount(reduction_cost)
+            reduced: list[ChunkExtractionResponse] = []
+            for _, payload in groups:
+                cache_key = self._cache_key(payload)
+                response = self._structured_call(
+                    payload=payload,
+                    response_model=ChunkExtractionResponse,
+                    job_id=job_id,
+                    cache_key=cache_key,
+                    pricing=extraction_pricing,
+                    max_input_tokens=self.settings.extraction_max_input_tokens,
+                    stage="reduction",
+                    validate=self._evidence_validator(chunks),
+                )
+                reduced.append(ChunkExtractionResponse.model_validate(response))
+            extractions = reduced
+            synthesis_payload = self._synthesis_payload(
+                extractions, research_interest, synthesis_pricing,
+            )
         synthesis_cache_key = self._cache_key(synthesis_payload)
         evidence_validator = self._evidence_validator(chunks)
         cached_summary = self._cached(
@@ -543,6 +937,9 @@ class OpenRouterSummarizer:
                 response_model=PaperSummaryResponse,
                 job_id=job_id,
                 cache_key=synthesis_cache_key,
+                pricing=synthesis_pricing,
+                max_input_tokens=self.settings.synthesis_max_input_tokens,
+                stage="synthesis",
                 validate=evidence_validator,
             )
         else:
@@ -591,6 +988,7 @@ class ChunkEvidence:
     kind: str
     page: int
     section_id: str | None
+    source_text: str
     source_position: dict[str, Any] = field(default_factory=dict)
 
 
@@ -598,7 +996,7 @@ class ChunkEvidence:
 class DocumentChunk:
     text: str
     kind: str
-    section: str | None
+    section: str
     start_page: int
     end_page: int
     evidence: tuple[ChunkEvidence, ...]
@@ -643,21 +1041,26 @@ def build_document_chunks(document: dict[str, Any], *, max_chars: int) -> list[D
         chunks.append(DocumentChunk(
             text="\n\n".join(str(block[key]).strip() for _, block, key in pending),
             kind=pending[0][0] if len(pending) == 1 else "mixed",
-            section=section_titles.get(section_id),
+            section=str(section_titles.get(section_id) or "Unsectioned"),
             start_page=min(pages),
             end_page=max(pages),
             evidence=tuple(ChunkEvidence(
                 kind=kind,
                 page=int(block.get("page") or block.get("source_position", {}).get("page") or 1),
                 section_id=block.get("section_id"),
+                source_text=str(block[key]).strip(),
                 source_position=dict(block.get("source_position") or {"page": pages[index]}),
-            ) for index, (kind, block, _) in enumerate(pending)),
+            ) for index, (kind, block, key) in enumerate(pending)),
         ))
         pending.clear()
 
     for item in blocks:
         kind, block, content_key = item
         text = str(block[content_key]).strip()
+        if kind in {"table", "equation", "caption"} and len(text) > max_chars:
+            raise InputLimitExceededError(
+                f"indivisible {kind} block exceeds the configured chunk ceiling"
+            )
         section_id = block.get("section_id")
         pending_section = pending[0][1].get("section_id") if pending else section_id
         prospective_length = sum(len(str(existing[key]).strip()) for _, existing, key in pending)

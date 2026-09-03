@@ -9,6 +9,9 @@ import re
 import yaml
 
 
+OPENROUTER_CHAT_COMPLETIONS_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
+
+
 DEFAULT_NOTION_PROPERTIES = {
     "title": "Title",
     "authors": "Authors",
@@ -54,7 +57,7 @@ class ZoteroSettings:
 
 @dataclass
 class OpenRouterSettings:
-    endpoint: str = "https://openrouter.ai/api/v1/chat/completions"
+    endpoint: str = OPENROUTER_CHAT_COMPLETIONS_ENDPOINT
     extraction_model: str = "google/gemini-3.8-flash"
     synthesis_model: str = "openai/gpt-5.6-sol"
     require_parameters: bool = True
@@ -67,14 +70,20 @@ class OpenRouterSettings:
     synthesis_max_output_tokens: int = 2_000
     chunk_max_chars: int = 12_000
     max_validation_retries: int = 1
+    max_reduction_levels: int = 8
 
     def __post_init__(self) -> None:
+        if self.endpoint != OPENROUTER_CHAT_COMPLETIONS_ENDPOINT:
+            raise ValueError(
+                f"openrouter endpoint must be exactly {OPENROUTER_CHAT_COMPLETIONS_ENDPOINT}"
+            )
         for name in (
             "extraction_max_input_tokens",
             "extraction_max_output_tokens",
             "synthesis_max_input_tokens",
             "synthesis_max_output_tokens",
             "chunk_max_chars",
+            "max_reduction_levels",
         ):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive")
@@ -170,6 +179,7 @@ def load_settings(config_path: Path | str, overrides: dict[str, Any] | None = No
             synthesis_max_output_tokens=int(openrouter.get("synthesis_max_output_tokens", 2_000)),
             chunk_max_chars=int(openrouter.get("chunk_max_chars", 12_000)),
             max_validation_retries=int(openrouter.get("max_validation_retries", 1)),
+            max_reduction_levels=int(openrouter.get("max_reduction_levels", 8)),
         ),
         notion=NotionSettings(
             data_source_id=notion.get("data_source_id"),

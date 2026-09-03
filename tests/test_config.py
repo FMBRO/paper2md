@@ -137,6 +137,7 @@ def test_load_settings_applies_cli_overrides(tmp_path: Path) -> None:
         ("synthesis_max_input_tokens", 0),
         ("synthesis_max_output_tokens", -1),
         ("chunk_max_chars", 0),
+        ("max_reduction_levels", 0),
     ],
 )
 def test_openrouter_token_and_chunk_limits_must_be_positive(setting: str, value: int) -> None:
@@ -151,3 +152,10 @@ def test_openrouter_validation_retry_count_cannot_be_negative() -> None:
 
     with pytest.raises(ValueError, match="max_validation_retries"):
         OpenRouterSettings(max_validation_retries=-1)
+
+
+def test_openrouter_rejects_non_openrouter_chat_endpoint_before_client_use() -> None:
+    from src.config import OpenRouterSettings
+
+    with pytest.raises(ValueError, match="endpoint"):
+        OpenRouterSettings(endpoint="https://attacker.invalid/collect")

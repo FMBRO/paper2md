@@ -50,11 +50,18 @@ class JobStore:
                 CREATE TABLE IF NOT EXISTS llm_calls (
                     id INTEGER PRIMARY KEY, job_id TEXT, request_hash TEXT NOT NULL UNIQUE,
                     cache_key TEXT, model TEXT NOT NULL, provider TEXT,
+                    generation_id TEXT,
                     response_json TEXT NOT NULL, usage_json TEXT NOT NULL DEFAULT '{}',
-                    cost_usd REAL NOT NULL, validated INTEGER NOT NULL DEFAULT 1,
+                    pricing_json TEXT NOT NULL DEFAULT '{}',
+                    cost_usd REAL NOT NULL, cost_resolved INTEGER NOT NULL DEFAULT 1,
+                    validated INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL, FOREIGN KEY(job_id) REFERENCES jobs(id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_jobs_paper_state ON jobs(paper_id, state);
+                CREATE TABLE IF NOT EXISTS llm_request_claims (
+                    cache_key TEXT PRIMARY KEY, owner_token TEXT NOT NULL,
+                    lease_expires_at REAL NOT NULL, created_at TEXT NOT NULL
+                );
             """)
             self._migrate_llm_calls(connection)
 
@@ -66,7 +73,10 @@ class JobStore:
         additions = {
             "cache_key": "TEXT",
             "provider": "TEXT",
+            "generation_id": "TEXT",
             "usage_json": "TEXT NOT NULL DEFAULT '{}'",
+            "pricing_json": "TEXT NOT NULL DEFAULT '{}'",
+            "cost_resolved": "INTEGER NOT NULL DEFAULT 1",
             "validated": "INTEGER NOT NULL DEFAULT 1",
         }
         for name, declaration in additions.items():
@@ -254,16 +264,22 @@ class JobStore:
         usage: dict[str, Any],
         cost_usd: float,
         validated: bool,
+        pricing: dict[str, Any] | None = None,
+        generation_id: str | None = None,
+        cost_resolved: bool = True,
     ) -> None:
         with self._connect() as connection:
             inserted = connection.execute(
                 """INSERT OR IGNORE INTO llm_calls
-                   (job_id, request_hash, cache_key, model, provider, response_json,
-                    usage_json, cost_usd, validated, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (job_id, request_hash, cache_key, model, provider,
+                   (job_id, request_hash, cache_key, model, provider, generation_id,
+                    response_json, usage_json, pricing_json, cost_usd, cost_resolved,
+                    validated, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (job_id, request_hash, cache_key, model, provider, generation_id,
                  json.dumps(response, ensure_ascii=False),
-                 json.dumps(usage, ensure_ascii=False), cost_usd, int(validated), self._now()),
+                 json.dumps(usage, ensure_ascii=False),
+                 json.dumps(pricing or {}, ensure_ascii=False),
+                 cost_usd, int(cost_resolved), int(validated), self._now()),
             )
             if inserted.rowcount:
                 connection.execute("UPDATE jobs SET total_cost_usd = total_cost_usd + ?, updated_at = ? WHERE id = ?",
@@ -295,6 +311,38 @@ class JobStore:
             ).fetchone()
         return int(row["count"])
 
+    def has_unresolved_llm_call(self, cache_key: str) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM llm_calls WHERE cache_key = ? AND cost_resolved = 0 LIMIT 1",
+                (cache_key,),
+            ).fetchone()
+        return row is not None
+
+    def claim_llm_request(
+        self, cache_key: str, owner_token: str, *, now: float, lease_seconds: float,
+    ) -> bool:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "DELETE FROM llm_request_claims WHERE cache_key = ? AND lease_expires_at <= ?",
+                (cache_key, now),
+            )
+            inserted = connection.execute(
+                """INSERT OR IGNORE INTO llm_request_claims
+                   (cache_key, owner_token, lease_expires_at, created_at)
+                   VALUES (?, ?, ?, ?)""",
+                (cache_key, owner_token, now + lease_seconds, self._now()),
+            )
+        return bool(inserted.rowcount)
+
+    def release_llm_request(self, cache_key: str, owner_token: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM llm_request_claims WHERE cache_key = ? AND owner_token = ?",
+                (cache_key, owner_token),
+            )
+
     def get_cached_llm_call(self, request_hash: str) -> dict[str, Any] | None:
         with self._connect() as connection:
             row = connection.execute("SELECT * FROM llm_calls WHERE request_hash = ?", (request_hash,)).fetchone()
@@ -304,3 +352,15 @@ class JobStore:
 
     def total_cost(self, job_id: str) -> float:
         return self.get_job(job_id).total_cost_usd
+
+    def paper_total_cost(self, job_id: str) -> float:
+        job = self.get_job(job_id)
+        if job.paper_id is None:
+            return job.total_cost_usd
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT COALESCE(SUM(total_cost_usd), 0) AS total "
+                "FROM jobs WHERE paper_id = ?",
+                (job.paper_id,),
+            ).fetchone()
+        return float(row["total"])
