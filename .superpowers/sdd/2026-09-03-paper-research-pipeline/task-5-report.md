@@ -299,3 +299,253 @@ Observed output:
 
 - The trusted price allowlist is intentionally a dated snapshot. OpenRouter pricing can change; callers must update the two audited constants when model-card prices change. Unknown/custom model IDs fail closed, and pricing remains injectable for deterministic tests and controlled deployments.
 - The conservative guard budgets every permitted malformed-output retry and configured token maximum. It may reject work whose likely cost is lower, by design, rather than risk exceeding the paper budget.
+
+---
+
+## Review remediation (2026-09-03)
+
+Status: complete in implementation commit `a570ec7` (`fix: harden OpenRouter summarization`). This section supersedes the earlier static-pricing concern above: hardcoded model prices were removed.
+
+### Review findings resolved
+
+1. The chat endpoint is now validated as exactly `https://openrouter.ai/api/v1/chat/completions` both in configuration construction and again at summarization entry/request time. Revalidation occurs before catalog/auth access. Extraction and synthesis model IDs remain configurable and may be swapped; each request contains only the selected `model`, and a response naming another model is rejected.
+2. A conservative tokenizer-independent ceiling counts UTF-8 bytes for the complete canonical serialized request, including messages and JSON Schema, before every extraction, repair, reduction, and synthesis call. Oversized atomic tables/equations/captions fail closed. Large extraction sets are greedily combined through bounded hierarchical reduction levels until final synthesis fits; inability to combine two results or exhaustion of the configured level bound fails closed.
+3. Static pricing was replaced by `OpenRouterModelCatalog`, which fetches current configured-model pricing from the official `/api/v1/models` catalog with structured-output and ZDR filters. The catalog client is injectable. Every completion payload pins `provider.max_price.prompt` and `.completion` to the authorized catalog rates. The exact model/rates/catalog version are persisted with every attempt. Missing, ambiguous, malformed, unsupported, or mismatched pricing fails closed without an LLM call.
+4. Every 2xx response is first parsed into billable metadata (`id`, model, provider, usage, cost) before content-envelope or structured-output validation. Malformed content/envelopes with resolved cost are persisted and charged before bounded retry. Missing/unparseable cost creates a durable unresolved audit row and stops immediately; resume remains stopped rather than risking a duplicate unknown charge.
+5. Budget consumption now sums all job costs belonging to the current job's `paper_id`; jobs without a canonical paper retain job-local accounting.
+6. Both extraction and final schemas require at least one evidence item. Page and section are mandatory. NFKC/case/whitespace-normalized quotes must be substrings of a retained source block whose page and section match the same real source span.
+7. SQLite now provides transactional cache-key claims with expiring leases. An owner rechecks cache state under the lease before dispatch, and concurrent contenders wait for the cached result or terminal attempt state. The lease covers the complete bounded repair sequence, preventing duplicate identical paid requests while retaining every real charge.
+
+The two Minor review findings were intentionally not changed in this round, per the task instruction.
+
+### Review-fix TDD evidence
+
+#### Cycle 7: endpoint, configurable role models, catalog prices, max_price, pricing audit
+
+RED:
+
+```text
+uv run pytest -q tests/test_openrouter.py tests/test_config.py -k "structured_payload or persists_usage or configured_role_model or unknown or non_openrouter"
+```
+
+```text
+FFFFFFFF                                                                 [100%]
+ImportError: cannot import name 'PricingSnapshot' from 'src.openrouter'
+TypeError: OpenRouterSummarizer.__init__() got an unexpected keyword argument 'catalog'
+Failed: DID NOT RAISE ValueError
+8 failed, 30 deselected in 0.37s
+```
+
+GREEN:
+
+```text
+uv run pytest -q tests/test_openrouter.py tests/test_config.py -k "structured_payload or persists_usage or configured_role_model or unknown or non_openrouter"
+```
+
+```text
+........                                                                 [100%]
+8 passed, 30 deselected in 0.42s
+```
+
+#### Cycle 8: serialized input ceilings, oversized atoms, hierarchical reduction
+
+RED:
+
+```text
+uv run pytest -q tests/test_openrouter.py tests/test_config.py -k "oversized_indivisible or serialized_map or hierarchically or max_reduction_levels"
+```
+
+```text
+FFFF                                                                     [100%]
+ImportError: cannot import name 'InputLimitExceededError' from 'src.openrouter'
+ImportError: cannot import name 'estimate_serialized_tokens' from 'src.openrouter'
+TypeError: OpenRouterSettings.__init__() got an unexpected keyword argument 'max_reduction_levels'
+4 failed, 38 deselected in 0.40s
+```
+
+GREEN:
+
+```text
+uv run pytest -q tests/test_openrouter.py tests/test_config.py -k "oversized_indivisible or serialized_map or hierarchically or max_reduction_levels"
+```
+
+```text
+....                                                                     [100%]
+4 passed, 38 deselected in 0.31s
+```
+
+#### Cycle 9: malformed 2xx billing metadata and unresolved cost
+
+Corrected RED (after increasing the test fixture's otherwise unrelated request ceiling so the tests reached the intended behavior):
+
+```text
+uv run pytest -q tests/test_openrouter.py -k "billable_malformed or missing_cost"
+```
+
+```text
+FF                                                                       [100%]
+assert 0.02 == 0.03 ± 3.0e-08
+ImportError: cannot import name 'UnresolvedUsageError' from 'src.openrouter'
+2 failed, 22 deselected in 0.32s
+```
+
+GREEN:
+
+```text
+uv run pytest -q tests/test_openrouter.py -k "billable_malformed or missing_cost"
+```
+
+```text
+..                                                                       [100%]
+2 passed, 22 deselected in 0.23s
+```
+
+#### Cycle 10: canonical-paper budget aggregation
+
+RED:
+
+```text
+uv run pytest -q tests/test_openrouter.py -k "aggregates_cost"
+```
+
+```text
+F                                                                        [100%]
+Failed: no HTTP
+1 failed, 24 deselected in 0.32s
+```
+
+The deliberate `no HTTP` fake proved the old job-local check allowed a call despite USD 0.49 already charged to another job for the same paper.
+
+GREEN:
+
+```text
+uv run pytest -q tests/test_openrouter.py -k "aggregates_cost"
+```
+
+```text
+.                                                                        [100%]
+1 passed, 24 deselected in 0.19s
+```
+
+#### Cycle 11: required source-backed evidence and real page/section pairs
+
+RED:
+
+```text
+uv run pytest -q tests/test_openrouter.py -k "requires_evidence or fabricated_evidence or mismatched_real"
+```
+
+```text
+FFF                                                                      [100%]
+Failed: DID NOT RAISE ValidationError
+assert 2 == 3
+assert 3 == 4
+3 failed, 25 deselected in 0.36s
+```
+
+The first GREEN attempt exposed a `NameError` in the new source-text binding (`2 failed, 1 passed, 25 deselected in 0.31s`). After correcting that implementation defect, the required GREEN run was:
+
+```text
+uv run pytest -q tests/test_openrouter.py -k "requires_evidence or fabricated_evidence or mismatched_real"
+```
+
+```text
+...                                                                      [100%]
+3 passed, 25 deselected in 0.24s
+```
+
+#### Cycle 12: transactional concurrent request claim
+
+RED:
+
+```text
+uv run pytest -q tests/test_openrouter.py -k "concurrent_identical"
+```
+
+```text
+F                                                                        [100%]
+AssertionError: duplicate extraction and synthesis model calls were observed
+1 failed, 28 deselected in 0.50s
+```
+
+GREEN:
+
+```text
+uv run pytest -q tests/test_openrouter.py -k "concurrent_identical"
+```
+
+```text
+.                                                                        [100%]
+1 passed, 28 deselected in 0.46s
+```
+
+#### Cycle 13: mutable endpoint revalidation
+
+RED:
+
+```text
+uv run pytest -q tests/test_openrouter.py -k "revalidates_mutated"
+```
+
+```text
+F                                                                        [100%]
+src.openrouter.OpenRouterConfigurationError: OPENROUTER_API_KEY is required
+1 failed, 29 deselected in 0.30s
+```
+
+This showed catalog work occurred and credential lookup was reached before the mutated endpoint was rejected.
+
+GREEN:
+
+```text
+uv run pytest -q tests/test_openrouter.py -k "revalidates_mutated"
+```
+
+```text
+.                                                                        [100%]
+1 passed, 29 deselected in 0.18s
+```
+
+### Review-fix final verification
+
+Command:
+
+```text
+uv run pytest -q tests/test_openrouter.py tests/test_job_store.py tests/test_config.py
+uv run pytest -q
+uv run python -m compileall -q src tests
+uv run python -c "from src.openrouter import OpenRouterModelCatalog, OpenRouterSummarizer, PricingSnapshot; print('Task 5 imports OK')"
+git diff --check
+```
+
+Observed output before commit:
+
+```text
+............................................................             [100%]
+60 passed in 1.65s
+........................................................................ [ 40%]
+........................................................................ [ 80%]
+..................................                                       [100%]
+178 passed in 2.65s
+Task 5 imports OK
+```
+
+`compileall` and `git diff --check` exited 0. Git emitted only Windows LF-to-CRLF notices.
+
+### Review-fix files
+
+- `src/config.py` — exact endpoint invariant and bounded reduction configuration.
+- `src/openrouter.py` — dynamic catalog pricing, provider max-price pinning, full-payload input estimates, hierarchical reduction, billable metadata audit, source-backed evidence, and request claims.
+- `src/job_store.py` — additive billing/pricing audit migration, paper-level cost query, unresolved-call lookup, and transactional leases.
+- `tests/test_config.py` — endpoint and reduction-bound validation.
+- `tests/test_openrouter.py` — all seven review findings, using injected catalogs/transports only.
+
+### Review-fix self-review and concerns
+
+- Rechecked all seven load-bearing findings against the committed diff; each has a direct behavior test.
+- Confirmed model IDs remain role-configurable and response equality prevents cross-model substitution.
+- Confirmed the API key is absent from request hashes, persisted responses, pricing snapshots, and errors.
+- Confirmed every actual test completion response uses an injected `httpx.MockTransport`; no live OpenRouter request ran.
+- Confirmed legacy Task 1 cache methods retain their original return shape and charging behavior.
+- Conservative UTF-8-byte token estimates can reject requests that a model tokenizer might accept; this is intentional fail-closed behavior.
+- Uncached production work now depends on availability of the official OpenRouter model catalog. Catalog failure blocks paid completion requests instead of using stale prices.
