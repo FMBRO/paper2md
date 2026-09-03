@@ -830,6 +830,26 @@ class JobStore:
             )
         return bool(inserted.rowcount)
 
+    def renew_paper_processing(
+        self,
+        paper_id: int,
+        owner_token: str,
+        *,
+        now: float,
+        lease_seconds: float,
+    ) -> bool:
+        """Extend a live paper lease only for its current, unexpired owner."""
+        if lease_seconds <= 0:
+            raise ValueError("paper lock lease must be positive")
+        with self._connect() as connection:
+            renewed = connection.execute(
+                """UPDATE paper_processing_locks SET lease_expires_at = ?
+                   WHERE paper_id = ? AND owner_token = ?
+                     AND lease_expires_at > ?""",
+                (now + lease_seconds, paper_id, owner_token, now),
+            )
+        return bool(renewed.rowcount)
+
     def release_paper_processing(self, paper_id: int, owner_token: str) -> bool:
         with self._connect() as connection:
             released = connection.execute(

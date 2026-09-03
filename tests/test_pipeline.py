@@ -201,6 +201,18 @@ class FailingConverter(FakeConverter):
         raise RuntimeError("conversion failed")
 
 
+class BlockingConverter(FakeConverter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def convert(self, pdf_path: Path, artifact_dir: Path) -> ArtifactBundle:
+        self.started.set()
+        assert self.release.wait(2)
+        return super().convert(pdf_path, artifact_dir)
+
+
 class FakeSummarizer:
     def __init__(self) -> None:
         self.calls = 0
@@ -417,6 +429,70 @@ def test_concurrent_equivalent_ingests_share_paper_lock_and_one_generation(
     assert dependencies["converter"].calls == 1
     assert dependencies["summarizer"].calls == 1
     assert dependencies["notion"].calls == [None]
+
+
+def test_long_pipeline_run_renews_the_paper_processing_lease(
+    tmp_path: Path,
+) -> None:
+    service, dependencies = _service(tmp_path)
+    converter = BlockingConverter()
+    service.converter = converter
+    store = dependencies["store"]
+    assert isinstance(store, JobStore)
+    original_claim = store.claim_paper_processing
+    original_renew = store.renew_paper_processing
+    claim_times: list[float] = []
+    heartbeat_renewed = threading.Event()
+
+    def claim_with_short_test_lease(
+        paper_id: int,
+        owner_token: str,
+        *,
+        now: float,
+        lease_seconds: float,
+    ) -> bool:
+        claim_times.append(now)
+        return original_claim(
+            paper_id, owner_token, now=now, lease_seconds=0.50,
+        )
+
+    def renew_with_short_test_lease(
+        paper_id: int,
+        owner_token: str,
+        *,
+        now: float,
+        lease_seconds: float,
+    ) -> bool:
+        renewed = original_renew(
+            paper_id, owner_token, now=now, lease_seconds=0.50,
+        )
+        if renewed and threading.current_thread().name.startswith("paper2md-lease-"):
+            heartbeat_renewed.set()
+        return renewed
+
+    store.claim_paper_processing = claim_with_short_test_lease  # type: ignore[method-assign]
+    store.renew_paper_processing = renew_with_short_test_lease  # type: ignore[method-assign]
+    service._paper_lease_seconds = 0.50
+    service._paper_lease_refresh_seconds = 0.05
+    spec = InputSpec(InputKind.PDF_URL, "https://example.test/download")
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(service.ingest, spec)
+        assert converter.started.wait(2)
+        assert heartbeat_renewed.wait(2)
+        paper = store.find_paper("doi:10.1000/fixture")
+        assert paper is not None
+        intruder_claimed = original_claim(
+            int(paper["id"]),
+            "intruder",
+            now=claim_times[0] + 0.500001,
+            lease_seconds=0.50,
+        )
+        converter.release.set()
+        job = future.result(timeout=2)
+
+    assert not intruder_claimed
+    assert job.state is JobState.COMPLETED
 
 
 def test_concurrent_equivalent_ingests_share_one_terminal_failure(

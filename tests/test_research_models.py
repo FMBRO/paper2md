@@ -46,3 +46,18 @@ def test_input_spec_centrally_normalizes_valid_zotero_keys() -> None:
 
     assert (item.source, item.attachment_key) == ("ABCD1234", "PDF00001")
     assert collection.source == "WXYZ5678"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "これは This Is A Completely English Narrative About Methods Results Limitations And Conclusions",
+        "これは Method2 Reports Result3 With Extensive English Explanations And Conclusions",
+    ],
+)
+def test_japanese_narrative_rejects_title_case_and_alphanumeric_english(
+    value: str,
+) -> None:
+    from src.research_models import has_sufficient_japanese_narrative
+
+    assert not has_sufficient_japanese_narrative(value)

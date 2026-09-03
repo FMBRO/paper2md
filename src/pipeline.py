@@ -6,6 +6,7 @@ import hashlib
 import json
 from pathlib import Path
 import tempfile
+import threading
 import time
 from typing import Any, Callable
 import uuid
@@ -45,6 +46,10 @@ from src.research_models import (
     PaperSummary,
 )
 from src.zotero import ZoteroClient, ZoteroInputError, ZoteroResolution
+
+
+class PaperProcessingLeaseLostError(RuntimeError):
+    """Raised before a stale paper worker can publish more state."""
 
 
 class NeedsInputError(RuntimeError):
@@ -109,6 +114,9 @@ class PipelineService:
         )
         self._notion = notion
         self._on_event = on_event
+        self._paper_lease_seconds = 3600.0
+        self._paper_lease_refresh_seconds = 30.0
+        self._lease_context = threading.local()
 
     @property
     def notion(self) -> Any:
@@ -350,6 +358,7 @@ class PipelineService:
             ))
 
     def _enter(self, job_id: str, stage: JobState) -> None:
+        self._assert_active_paper_lease()
         job = self.store.get_job(job_id)
         if job.state is stage:
             return
@@ -359,14 +368,17 @@ class PipelineService:
             JobState.SYNTHESIZING, JobState.NOTION_SYNC, JobState.COMPLETED,
         ]
         while order.index(job.state) < order.index(stage):
+            self._assert_active_paper_lease()
             next_state = order[order.index(job.state) + 1]
             job = self.store.transition(job_id, next_state)
             self._emit(job_id, next_state)
 
     def _checkpoint(self, job_id: str, stage: JobState, payload: Any) -> None:
+        self._assert_active_paper_lease()
         self.store.save_checkpoint(job_id, stage, payload)
 
     def _stop(self, job_id: str, state: JobState, error: Exception) -> JobRecord:
+        self._assert_active_paper_lease()
         job = self.store.transition(job_id, state, str(error))
         self._emit(job_id, state, str(error))
         return job
@@ -396,12 +408,19 @@ class PipelineService:
             JobState.FAILED,
         }
         owner_token = str(uuid.uuid4())
+        lease_seconds = self._paper_lease_seconds
+        refresh_seconds = min(
+            self._paper_lease_refresh_seconds,
+            max(lease_seconds / 3.0, 0.001),
+        )
+        if lease_seconds <= 0 or refresh_seconds <= 0:
+            raise ValueError("paper processing lease intervals must be positive")
         deadline = time.monotonic() + 30.0
         while not self.store.claim_paper_processing(
             job.paper_id,
             owner_token,
             now=time.time(),
-            lease_seconds=3600.0,
+            lease_seconds=lease_seconds,
         ):
             current = self.store.get_job(job_id)
             if current.state in settled_states:
@@ -409,7 +428,46 @@ class PipelineService:
             if time.monotonic() >= deadline:
                 raise RuntimeError("Timed out waiting for canonical paper processing lock")
             time.sleep(0.01)
+        stop_heartbeat = threading.Event()
+        lease_lost = threading.Event()
+
+        def renew_lease() -> bool:
+            if lease_lost.is_set():
+                return False
+            try:
+                renewed = self.store.renew_paper_processing(
+                    job.paper_id,
+                    owner_token,
+                    now=time.time(),
+                    lease_seconds=lease_seconds,
+                )
+            except Exception:
+                renewed = False
+            if not renewed:
+                lease_lost.set()
+            return renewed
+
+        def require_lease() -> None:
+            if not renew_lease():
+                raise PaperProcessingLeaseLostError(
+                    "Canonical paper processing lease ownership was lost"
+                )
+
+        def heartbeat() -> None:
+            while not stop_heartbeat.wait(refresh_seconds):
+                if not renew_lease():
+                    return
+
+        previous_guard = getattr(self._lease_context, "guard", None)
+        self._lease_context.guard = require_lease
+        heartbeat_thread = threading.Thread(
+            target=heartbeat,
+            name=f"paper2md-lease-{job.paper_id}",
+            daemon=True,
+        )
+        heartbeat_thread.start()
         try:
+            require_lease()
             current = self.store.get_job(job_id)
             if current.state in settled_states:
                 return current
@@ -419,7 +477,18 @@ class PipelineService:
                 staged_acquisition=staged_acquisition,
             )
         finally:
+            stop_heartbeat.set()
+            heartbeat_thread.join(timeout=1.0)
+            if previous_guard is None:
+                del self._lease_context.guard
+            else:
+                self._lease_context.guard = previous_guard
             self.store.release_paper_processing(job.paper_id, owner_token)
+
+    def _assert_active_paper_lease(self) -> None:
+        guard = getattr(self._lease_context, "guard", None)
+        if guard is not None:
+            guard()
 
     def _run_unlocked(
         self,
@@ -650,6 +719,8 @@ class PipelineService:
             )
             self._enter(job_id, JobState.COMPLETED)
             return self.store.get_job(job_id)
+        except PaperProcessingLeaseLostError:
+            raise
         except BudgetExceededError as error:
             return self._stop(job_id, JobState.BUDGET_EXCEEDED, error)
         except (

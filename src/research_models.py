@@ -117,8 +117,10 @@ def has_sufficient_japanese_narrative(value: str) -> bool:
     """Require meaningful Japanese prose while discounting technical notation.
 
     The check is deliberately deterministic.  URLs, citations, measurements and
-    identifier-like or capitalized technical tokens do not dilute otherwise
-    Japanese prose, while a single Japanese character cannot bless English text.
+    identifiers and measurements do not dilute otherwise Japanese prose, while
+    a token Japanese phrase cannot bless mostly-English text.  Latin letters in
+    capitalized and alphanumeric terms still count: broad exemptions for those
+    forms would also exclude ordinary English Title Case prose.
     """
     normalized = unicodedata.normalize("NFKC", value).strip()
     if not normalized:
@@ -127,14 +129,10 @@ def has_sufficient_japanese_narrative(value: str) -> bool:
     japanese_count = len(_JAPANESE_SCRIPT.findall(narrative))
     if japanese_count < 2:
         return False
-    ordinary_latin_count = 0
-    for match in _LATIN_WORD.finditer(narrative):
-        token = match.group(0)
-        if any(char.isdigit() for char in token):
-            continue
-        if any(char.isupper() for char in token):
-            continue
-        ordinary_latin_count += sum(char.isalpha() for char in token)
+    ordinary_latin_count = sum(
+        sum(char.isalpha() for char in match.group(0))
+        for match in _LATIN_WORD.finditer(narrative)
+    )
     return japanese_count / (japanese_count + ordinary_latin_count) >= 0.20
 
 

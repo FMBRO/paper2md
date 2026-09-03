@@ -340,3 +340,35 @@ def test_budget_reservation_renewal_and_release_are_owner_fenced(tmp_path: Path)
         lease_seconds=10.0,
     )
     assert store.release_llm_budget("reservation", "owner")
+
+
+def test_paper_processing_lease_renewal_is_owner_and_expiry_fenced(
+    tmp_path: Path,
+) -> None:
+    from src.job_store import JobStore
+    from src.research_models import PaperMetadata
+
+    store = JobStore(tmp_path / "paper2md.sqlite3")
+    paper_id = store.upsert_paper(PaperMetadata(doi="10.1000/lease"))
+
+    assert store.claim_paper_processing(
+        paper_id, "owner-a", now=100.0, lease_seconds=10.0,
+    )
+    assert not store.renew_paper_processing(
+        paper_id, "owner-b", now=105.0, lease_seconds=10.0,
+    )
+    assert store.renew_paper_processing(
+        paper_id, "owner-a", now=105.0, lease_seconds=10.0,
+    )
+    assert not store.claim_paper_processing(
+        paper_id, "owner-b", now=111.0, lease_seconds=10.0,
+    )
+    assert not store.renew_paper_processing(
+        paper_id, "owner-a", now=116.0, lease_seconds=10.0,
+    )
+    assert store.claim_paper_processing(
+        paper_id, "owner-b", now=116.0, lease_seconds=10.0,
+    )
+    assert not store.renew_paper_processing(
+        paper_id, "owner-a", now=117.0, lease_seconds=10.0,
+    )
