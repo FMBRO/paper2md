@@ -342,3 +342,211 @@ usage: python -m src.cli [-h] {ingest,resume,status} ...
 - `--only-unprocessed` is intentionally collection-scoped. A single source with this flag exits 2 with an explicit diagnostic instead of silently ignoring it.
 - Pipeline-level orchestration assumes one active worker per job. The OpenRouter paid-call layer has its own claim/budget fencing, but non-paid stage checkpoints do not add a whole-job distributed lease.
 - Extraction and synthesis are exposed together by the existing `OpenRouterSummarizer.summarize_artifacts` interface. Their individual paid calls are still cached transactionally by Task 5, but pipeline-level `extracting` and `synthesizing` checkpoints are written after the combined validated result returns.
+
+---
+
+## Critical review remediation (2026-09-03)
+
+The GUI finding remains assigned to Task 8 by the approved plan. No change was made to `src/gui.py` in this remediation.
+
+### Findings resolved
+
+1. Resume input overrides now update the job and invalidate dependent checkpoints in one SQLite transaction. A changed research interest invalidates extraction, synthesis, and Notion; a changed attachment invalidates acquisition and every later checkpoint. Later-stage-failure tests prove both restart boundaries.
+2. Recomputed stages transactionally invalidate every downstream checkpoint. Acquisition compares the newly acquired PDF SHA-256 with its prior checkpoint; changed bytes invalidate Zotero through Notion, while reacquiring the same bytes preserves valid later work. Conversion checkpoints now include a version plus source, document, Markdown, and quality-result hashes, so a valid-JSON but modified `document.json` forces conversion, quality, summary, and Notion to rerun.
+3. Added `AcquisitionInputError` and `ZoteroInputError`. Missing/unreadable/non-PDF sources and invalid/missing attachment selections map to `needs_input`; network, 5xx, 408/429, and unexpected Zotero service errors remain `failed` paths. Removing preflight availability probes preserves the concrete Zotero transport error classification.
+4. Zotero metadata resolution now propagates `ZoteroSettings.user_id` instead of hard-coding library `0`. Both canonical identity and collection `only_unprocessed` use the same configured library ID, with client and pipeline tests for user ID 42.
+
+### Focused RED/GREEN evidence
+
+#### Resume override invalidation
+
+RED:
+
+```text
+uv run pytest -q tests/test_pipeline.py -k 'research_interest_override_after or attachment_override_after'
+FF                                                                       [100%]
+E       assert 1 == 2
+E       AssertionError: assert ['ATTACH01'] == ['ATTACH01', 'ATTACH02']
+2 failed, 11 deselected in 0.61s
+```
+
+GREEN:
+
+```text
+uv run pytest -q tests/test_pipeline.py -k 'research_interest_override_after or attachment_override_after'
+..                                                                       [100%]
+2 passed, 11 deselected in 0.53s
+```
+
+#### Changed reacquired PDF invalidates downstream work
+
+RED:
+
+```text
+uv run pytest -q tests/test_pipeline.py -k changed_reacquired
+F                                                                        [100%]
+E       assert 1 == 2
+E        +  where 1 = <tests.test_pipeline.FakeZotero object ...>.upsert_calls
+1 failed, 13 deselected in 0.67s
+```
+
+GREEN:
+
+```text
+uv run pytest -q tests/test_pipeline.py -k 'changed_reacquired or source_pdf_no_longer'
+..                                                                       [100%]
+2 passed, 12 deselected in 0.51s
+```
+
+#### Conversion artifact hashes invalidate stale dependents
+
+RED:
+
+```text
+uv run pytest -q tests/test_pipeline.py -k recomputed_conversion
+F                                                                        [100%]
+E       assert 1 == 2
+E        +  where 1 = <tests.test_pipeline.FakeConverter object ...>.calls
+1 failed, 18 deselected in 0.41s
+```
+
+GREEN:
+
+```text
+uv run pytest -q tests/test_pipeline.py -k 'recomputed_conversion or changed_reacquired or resume_reuses or source_pdf_no_longer'
+....                                                                     [100%]
+4 passed, 15 deselected in 0.84s
+```
+
+#### Explicit user-correctable input exception classes
+
+RED:
+
+```text
+uv run pytest -q tests/test_acquisition.py -k user_correctable tests/test_zotero.py -k user_correctable
+FF                                                                       [100%]
+E       ImportError: cannot import name 'AcquisitionInputError' from 'src.acquisition'
+E       ImportError: cannot import name 'ZoteroInputError' from 'src.zotero'
+2 failed, 42 deselected in 0.14s
+```
+
+GREEN:
+
+```text
+uv run pytest -q tests/test_acquisition.py tests/test_zotero.py
+............................................                             [100%]
+44 passed in 0.15s
+```
+
+Pipeline mapping verification:
+
+```text
+uv run pytest -q tests/test_pipeline.py -k 'user_correctable_source or transient_acquisition'
+..                                                                       [100%]
+2 passed, 15 deselected in 0.32s
+```
+
+#### Missing local source creates a resumable job
+
+RED:
+
+```text
+uv run pytest -q tests/test_pipeline.py -k missing_local_source
+F                                                                        [100%]
+E       FileNotFoundError: [Errno 2] No such file or directory: '<temp>/missing.pdf'
+1 failed, 17 deselected in 0.30s
+```
+
+GREEN:
+
+```text
+uv run pytest -q tests/test_pipeline.py -k missing_local_source
+.                                                                        [100%]
+1 passed, 17 deselected in 0.22s
+```
+
+#### Rate limits remain transient failures
+
+RED:
+
+```text
+uv run pytest -q tests/test_acquisition.py -k rate_limit_remains
+F                                                                        [100%]
+E       AssertionError: assert not True
+E        +  where True = isinstance(AcquisitionInputError('HTTP 429 ...'), AcquisitionInputError)
+1 failed, 29 deselected in 0.11s
+```
+
+GREEN:
+
+```text
+uv run pytest -q tests/test_acquisition.py
+..............................                                           [100%]
+30 passed in 0.11s
+```
+
+#### Zotero transport failures remain failed
+
+RED:
+
+```text
+uv run pytest -q tests/test_pipeline.py -k transient_acquisition
+F                                                                        [100%]
+E       AssertionError: assert <JobState.NEEDS_INPUT: 'needs_input'> is <JobState.FAILED: 'failed'>
+1 failed, 18 deselected in 0.37s
+```
+
+GREEN:
+
+```text
+uv run pytest -q tests/test_pipeline.py -k 'transient_acquisition or user_correctable_source'
+..                                                                       [100%]
+2 passed, 17 deselected in 0.32s
+```
+
+#### Configured Zotero user ID
+
+RED:
+
+```text
+uv run pytest -q tests/test_zotero.py -k configured_zotero_user_id
+F                                                                        [100%]
+E       AssertionError: assert '0' == '42'
+1 failed, 15 deselected in 0.14s
+```
+
+GREEN:
+
+```text
+uv run pytest -q tests/test_zotero.py
+................                                                         [100%]
+16 passed in 0.06s
+```
+
+The collection-level non-default identity regression is included in the focused suite:
+
+```text
+uv run pytest -q tests/test_pipeline.py tests/test_cli.py tests/test_job_store.py tests/test_acquisition.py tests/test_zotero.py
+........................................................................ [ 81%]
+................                                                         [100%]
+88 passed in 3.25s
+```
+
+### Remediation verification
+
+```text
+uv run pytest -q
+........................................................................ [ 30%]
+........................................................................ [ 61%]
+........................................................................ [ 92%]
+..................                                                       [100%]
+234 passed in 7.40s
+
+uv run python -m compileall -q src tests
+[exit 0, no output]
+
+uv run python -c "from src.acquisition import AcquisitionInputError; from src.zotero import ZoteroInputError; from src.pipeline import PipelineService; print('Task 7 review imports OK')"
+Task 7 review imports OK
+```
+
+No live or paid external call was made. All pipeline and client tests use injected fakes or deterministic transports.

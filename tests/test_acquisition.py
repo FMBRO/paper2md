@@ -225,3 +225,32 @@ def test_acquire_rejects_invalid_pdf_responses_and_http_failures(
 
     with pytest.raises(AcquisitionError, match=error):
         DocumentAcquirer(client).acquire(parse_input(url), ArtifactManager(tmp_path, response))
+
+
+def test_non_pdf_source_uses_the_user_correctable_acquisition_error(tmp_path: Path) -> None:
+    from src.acquisition import AcquisitionInputError, DocumentAcquirer, HttpResponse, parse_input
+    from src.artifacts import ArtifactManager
+
+    url = "https://papers.example/not-a-paper.pdf"
+    client = MappingHttpClient({url: HttpResponse(200, {}, b"<html>not a PDF</html>")})
+
+    with pytest.raises(AcquisitionInputError, match="not a PDF"):
+        DocumentAcquirer(client).acquire(parse_input(url), ArtifactManager(tmp_path, "bad"))
+
+
+def test_rate_limit_remains_a_transient_acquisition_error(tmp_path: Path) -> None:
+    from src.acquisition import (
+        AcquisitionError,
+        AcquisitionInputError,
+        DocumentAcquirer,
+        HttpResponse,
+        parse_input,
+    )
+    from src.artifacts import ArtifactManager
+
+    url = "https://papers.example/rate-limited.pdf"
+    client = MappingHttpClient({url: HttpResponse(429, {}, b"")})
+
+    with pytest.raises(AcquisitionError, match="HTTP 429") as caught:
+        DocumentAcquirer(client).acquire(parse_input(url), ArtifactManager(tmp_path, "429"))
+    assert not isinstance(caught.value, AcquisitionInputError)

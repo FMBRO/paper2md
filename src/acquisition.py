@@ -36,6 +36,10 @@ class AcquisitionError(RuntimeError):
     """An input could not be lawfully acquired into a source PDF."""
 
 
+class AcquisitionInputError(AcquisitionError):
+    """The supplied source is missing, inaccessible, or not a usable PDF."""
+
+
 @dataclass(frozen=True, slots=True)
 class AcquisitionResult:
     metadata: PaperMetadata
@@ -126,7 +130,12 @@ class DocumentAcquirer:
     def acquire(self, spec: InputSpec, artifacts: ArtifactManager) -> AcquisitionResult:
         if spec.kind is InputKind.LOCAL_PDF:
             source = Path(spec.source)
-            content = source.read_bytes()
+            if not source.is_file():
+                raise AcquisitionInputError(f"Local PDF does not exist: {source}")
+            try:
+                content = source.read_bytes()
+            except OSError as exc:
+                raise AcquisitionInputError(f"Local PDF is not readable: {source}") from exc
             self._validate_pdf(content, str(source))
             source_pdf = artifacts.copy_source(source)
             return self._result(PaperMetadata(source_url=source.resolve().as_uri()), source_pdf, content)
@@ -154,7 +163,7 @@ class DocumentAcquirer:
             return AcquisitionResult(metadata, None, None, JobState.NEEDS_INPUT)
         try:
             content = self._get_pdf(pdf_url)
-        except AcquisitionError:
+        except AcquisitionInputError:
             return AcquisitionResult(metadata, None, None, JobState.NEEDS_INPUT)
         return self._result(metadata, artifacts.write_source_pdf(content), content)
 
@@ -166,7 +175,12 @@ class DocumentAcquirer:
         except Exception as exc:
             raise AcquisitionError(f"HTTP request failed for {url}: {exc}") from exc
         if not 200 <= response.status_code < 300:
-            raise AcquisitionError(f"HTTP {response.status_code} while requesting {url}")
+            error_type = (
+                AcquisitionInputError
+                if response.status_code in {400, 401, 403, 404, 410}
+                else AcquisitionError
+            )
+            raise error_type(f"HTTP {response.status_code} while requesting {url}")
         return response.content
 
     def _get_pdf(self, url: str) -> bytes:
@@ -177,7 +191,7 @@ class DocumentAcquirer:
     @staticmethod
     def _validate_pdf(content: bytes, source: str) -> None:
         if not content.lstrip().startswith(b"%PDF-"):
-            raise AcquisitionError(f"Downloaded response from {source} is not a PDF")
+            raise AcquisitionInputError(f"Downloaded response from {source} is not a PDF")
 
     @staticmethod
     def _result(metadata: PaperMetadata, source_pdf: Path, content: bytes) -> AcquisitionResult:

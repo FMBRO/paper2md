@@ -29,6 +29,14 @@ class ZoteroHttpClient(Protocol):
     ) -> ZoteroHttpResponse: ...
 
 
+class ZoteroError(RuntimeError):
+    """The local Zotero API could not fulfill an unambiguous request."""
+
+
+class ZoteroInputError(ZoteroError):
+    """The requested Zotero item or attachment needs user correction."""
+
+
 class UrlLibZoteroHttpClient:
     """Small production transport; ``httpx.Client`` is also accepted by the client."""
 
@@ -75,17 +83,17 @@ class ZoteroClient:
         if spec.attachment_key:
             attachment = self._get_json(f"users/{self.user_id}/items/{spec.attachment_key}")
             if not _is_pdf_attachment(attachment) or _item_data(attachment).get("parentItem") != parent_key:
-                raise ZoteroError("Selected attachment is not a PDF child of the requested Zotero item")
+                raise ZoteroInputError("Selected attachment is not a PDF child of the requested Zotero item")
             return self._resolve_attachment(attachment, parent=item)
         children = self._get_json(f"users/{self.user_id}/items/{parent_key}/children")
         attachments = [child for child in _item_list(children) if _is_pdf_attachment(child)]
         if len(attachments) != 1:
-            return self._needs_input(parent_key, _metadata(item), None, "No PDF attachment found" if not attachments else "Multiple PDF attachments found; select one")
+            return self._needs_input(parent_key, _metadata(item, str(self.user_id)), None, "No PDF attachment found" if not attachments else "Multiple PDF attachments found; select one")
         attachment_key = _item_key(attachments[0])
         path = self._attachment_path(attachment_key)
         if path is None:
-            return self._needs_input(parent_key, _metadata(item), attachment_key, "Zotero PDF file is missing or inaccessible")
-        return ZoteroResolution(_metadata(item), path, parent_key, attachment_key)
+            return self._needs_input(parent_key, _metadata(item, str(self.user_id)), attachment_key, "Zotero PDF file is missing or inaccessible")
+        return ZoteroResolution(_metadata(item, str(self.user_id)), path, parent_key, attachment_key)
 
     def expand_collection(self, spec: InputSpec) -> list[InputSpec]:
         if spec.kind is not InputKind.ZOTERO_COLLECTION:
@@ -109,7 +117,7 @@ class ZoteroClient:
                 candidate = PaperMetadata(doi=_as_string(item_data.get("DOI")), arxiv_id=_as_string(item_data.get("archiveID")))
                 if ((metadata.doi is not None and candidate.doi == metadata.doi)
                         or (metadata.arxiv_id is not None and candidate.arxiv_id == metadata.arxiv_id)):
-                    return ZoteroResolution(_metadata(item), source, _item_key(item), None)
+                    return ZoteroResolution(_metadata(item, str(self.user_id)), source, _item_key(item), None)
         probe = self._request("GET", "")
         server_id = probe.headers.get("Zotero-Server-ID")
         if not server_id:
@@ -155,14 +163,14 @@ class ZoteroClient:
 
     def _resolve_attachment(self, attachment: object, *, parent: object | None = None) -> "ZoteroResolution":
         if not _is_pdf_attachment(attachment):
-            raise ZoteroError("Requested Zotero attachment is not a PDF")
+            raise ZoteroInputError("Requested Zotero attachment is not a PDF")
         attachment_key = _item_key(attachment)
         parent_key = _item_data(attachment).get("parentItem")
         if not isinstance(parent_key, str) or not parent_key:
             parent_key = attachment_key
         if parent is None and parent_key != attachment_key:
             parent = self._get_json(f"users/{self.user_id}/items/{parent_key}")
-        metadata = _metadata(parent or attachment)
+        metadata = _metadata(parent or attachment, str(self.user_id))
         path = self._attachment_path(attachment_key)
         if path is None:
             return self._needs_input(parent_key, metadata, attachment_key, "Zotero PDF file is missing or inaccessible")
@@ -171,6 +179,8 @@ class ZoteroClient:
     def _get_json(self, path: str) -> object:
         response = self._request("GET", path)
         if not 200 <= response.status_code < 300:
+            if response.status_code == 404:
+                raise ZoteroInputError(f"Zotero item was not found for {path}")
             raise ZoteroError(f"Zotero API returned HTTP {response.status_code} for {path}")
         try:
             return json.loads(response.content)
@@ -188,10 +198,14 @@ class ZoteroClient:
     def _attachment_path(self, attachment_key: str) -> Path | None:
         response = self._request("GET", f"users/{self.user_id}/items/{attachment_key}/file")
         if response.status_code != 302:
+            if response.status_code == 404:
+                raise ZoteroInputError(f"Zotero attachment {attachment_key} is missing")
             raise ZoteroError(f"Zotero API returned HTTP {response.status_code} for attachment file {attachment_key}")
         location = response.headers.get("location") or response.headers.get("Location")
         if not location or urlparse(location).scheme != "file":
-            raise ZoteroError(f"Zotero attachment {attachment_key} did not return a local file redirect")
+            raise ZoteroInputError(
+                f"Zotero attachment {attachment_key} did not return an accessible local file"
+            )
         path = Path(unquote(urlparse(location).path).lstrip("/"))
         return path if path.is_file() else None
 
@@ -199,10 +213,6 @@ class ZoteroClient:
     def _needs_input(parent_key: str, metadata: PaperMetadata, attachment_key: str | None,
                      diagnostic: str) -> "ZoteroResolution":
         return ZoteroResolution(metadata, None, parent_key, attachment_key, JobState.NEEDS_INPUT, diagnostic)
-
-
-class ZoteroError(RuntimeError):
-    """The local Zotero API could not fulfill an unambiguous request."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,7 +255,7 @@ def _is_pdf_attachment(item: object) -> bool:
     return data.get("itemType") == "attachment" and str(data.get("contentType", "")).lower() == "application/pdf"
 
 
-def _metadata(item: object) -> PaperMetadata:
+def _metadata(item: object, library_id: str = "0") -> PaperMetadata:
     data = _item_data(item)
     creators = data.get("creators")
     authors: list[str] = []
@@ -258,7 +268,7 @@ def _metadata(item: object) -> PaperMetadata:
         title=_as_string(data.get("title")), authors=[author for author in authors if author],
         published_date=_as_string(data.get("date")), doi=_as_string(data.get("DOI")),
         arxiv_id=_as_string(data.get("archiveID")), source_url=_as_string(data.get("url")),
-        zotero_library_id="0", zotero_item_key=_item_key(item),
+        zotero_library_id=library_id, zotero_item_key=_item_key(item),
     )
 
 

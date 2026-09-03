@@ -62,6 +62,35 @@ def test_resolve_parent_with_one_pdf_child_returns_metadata_and_local_file(tmp_p
     assert result.zotero_uri == "zotero://select/library/items/PARENT01"
 
 
+def test_resolved_metadata_uses_the_configured_zotero_user_id(tmp_path: Path) -> None:
+    from src.config import ZoteroSettings
+    from src.zotero import ZoteroClient
+
+    file_path = tmp_path / "paper.pdf"
+    file_path.write_bytes(b"%PDF-1.7\n")
+    base = "http://localhost:23119/api/users/42/items/"
+    parent = {"key": "PARENT01", "data": {"itemType": "journalArticle", "title": "A Paper"}}
+    attachment = {
+        "key": "PDF00001",
+        "data": {
+            "itemType": "attachment", "contentType": "application/pdf",
+            "parentItem": "PARENT01",
+        },
+    }
+    http = RecordingHttpClient({
+        ("GET", f"{base}PARENT01"): FakeResponse(200, {}, json.dumps(parent).encode()),
+        ("GET", f"{base}PARENT01/children"): FakeResponse(200, {}, json.dumps([attachment]).encode()),
+        ("GET", f"{base}PDF00001/file"): FakeResponse(302, {"location": file_path.as_uri()}),
+    })
+
+    result = ZoteroClient(
+        ZoteroSettings(user_id=42), http_client=http,
+    ).resolve(InputSpec(InputKind.ZOTERO_ITEM, "PARENT01"))
+
+    assert result.metadata.zotero_library_id == "42"
+    assert result.metadata.canonical_identity() == "zotero:42:PARENT01"
+
+
 def test_resolve_attachment_key_directly_uses_its_parent_and_file_redirect(tmp_path: Path) -> None:
     from src.zotero import ZoteroClient
 
@@ -101,6 +130,29 @@ def test_explicit_attachment_key_on_a_parent_avoids_ambiguous_child_selection(tm
 
     assert result.attachment_key == "PDF00002"
     assert all("/children" not in url for _, url, _, _ in http.requests)
+
+
+def test_invalid_explicit_attachment_selection_uses_user_correctable_error() -> None:
+    from src.zotero import ZoteroClient, ZoteroInputError
+
+    base = "http://localhost:23119/api/users/0/items/"
+    parent = {"key": "PARENT01", "data": {"itemType": "journalArticle"}}
+    attachment = {
+        "key": "PDF00002",
+        "data": {
+            "itemType": "attachment", "contentType": "application/pdf",
+            "parentItem": "OTHER001",
+        },
+    }
+    http = RecordingHttpClient({
+        ("GET", f"{base}PARENT01"): FakeResponse(200, {}, json.dumps(parent).encode()),
+        ("GET", f"{base}PDF00002"): FakeResponse(200, {}, json.dumps(attachment).encode()),
+    })
+
+    with pytest.raises(ZoteroInputError, match="not a PDF child"):
+        ZoteroClient(http_client=http).resolve(
+            InputSpec(InputKind.ZOTERO_ITEM, "PARENT01", attachment_key="PDF00002")
+        )
 
 
 def test_multiple_parent_pdf_candidates_need_explicit_attachment_selection() -> None:

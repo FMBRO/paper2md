@@ -6,7 +6,12 @@ from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 
-from src.acquisition import AcquisitionResult
+from src.acquisition import (
+    AcquisitionError,
+    AcquisitionInputError,
+    AcquisitionResult,
+    DocumentAcquirer,
+)
 from src.artifacts import ArtifactManager
 from src.config import Settings
 from src.job_store import JobStore
@@ -21,7 +26,7 @@ from src.research_models import (
     PaperMetadata,
     PaperSummary,
 )
-from src.zotero import ZoteroResolution
+from src.zotero import ZoteroError, ZoteroInputError, ZoteroResolution
 
 
 class FakeAcquirer:
@@ -38,6 +43,30 @@ class FakeAcquirer:
             source_pdf=artifacts.write_source_pdf(content),
             pdf_sha256=hashlib.sha256(content).hexdigest(),
         )
+
+
+class ChangingAcquirer(FakeAcquirer):
+    def acquire(self, spec: InputSpec, artifacts: ArtifactManager) -> AcquisitionResult:
+        self.calls += 1
+        self.specs.append(spec)
+        content = (
+            b"%PDF-1.4\nfirst version\n%%EOF"
+            if self.calls == 1
+            else b"%PDF-1.4\nchanged version\n%%EOF"
+        )
+        return AcquisitionResult(
+            metadata=PaperMetadata(title="Fixture", doi="10.1000/fixture"),
+            source_pdf=artifacts.write_source_pdf(content),
+            pdf_sha256=hashlib.sha256(content).hexdigest(),
+        )
+
+
+class ErrorAcquirer:
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    def acquire(self, spec: InputSpec, artifacts: ArtifactManager) -> AcquisitionResult:
+        raise self.error
 
 
 class FakeZotero:
@@ -90,9 +119,10 @@ class AttachmentSelectingZotero(FakeZotero):
 
 
 class CollectionZotero(FakeZotero):
-    def __init__(self, source_pdfs: dict[str, Path]) -> None:
+    def __init__(self, source_pdfs: dict[str, Path], library_id: str = "0") -> None:
         super().__init__()
         self.source_pdfs = source_pdfs
+        self.library_id = library_id
         self.collection_calls = 0
 
     def expand_collection(self, spec: InputSpec) -> list[InputSpec]:
@@ -106,11 +136,26 @@ class CollectionZotero(FakeZotero):
     def resolve(self, spec: InputSpec) -> ZoteroResolution:
         self.resolve_calls += 1
         metadata = PaperMetadata(
-            title=spec.source, zotero_library_id="0", zotero_item_key=spec.source,
+            title=spec.source, zotero_library_id=self.library_id,
+            zotero_item_key=spec.source,
         )
         return ZoteroResolution(
             metadata, self.source_pdfs[spec.source], spec.source, "ATTACH01",
         )
+
+
+class ErrorZotero(FakeZotero):
+    def __init__(self, error: Exception) -> None:
+        super().__init__()
+        self.error = error
+
+    def resolve(self, spec: InputSpec) -> ZoteroResolution:
+        raise self.error
+
+
+class UnavailableZotero(ErrorZotero):
+    def is_available(self) -> bool:
+        return False
 
 
 class FakeConverter:
@@ -134,11 +179,13 @@ class FakeSummarizer:
     def __init__(self) -> None:
         self.calls = 0
         self.budgets: list[float] = []
+        self.interests: list[str] = []
 
     def summarize_artifacts(
         self, bundle: ArtifactBundle, *, job_id: str, research_interest: str = "",
     ) -> PaperSummary:
         self.calls += 1
+        self.interests.append(research_interest)
         summary = PaperSummary(
             background="背景です", question="課題です", novelty="新規性です",
             methods="手法です", datasets=["データ"], results="結果です",
@@ -334,6 +381,49 @@ def test_resume_reacquires_when_the_source_pdf_no_longer_matches_its_checkpoint(
     assert dependencies["summarizer"].calls == 1
 
 
+def test_changed_reacquired_pdf_invalidates_all_dependent_outputs(tmp_path: Path) -> None:
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF-1.4\nfixture\n%%EOF")
+    service, dependencies = _service(tmp_path)
+    service.acquirer = ChangingAcquirer()
+    notion = FailingOnceNotion()
+    service._notion = notion
+    failed = service.ingest(InputSpec(InputKind.LOCAL_PDF, str(source)))
+    assert failed.artifact_dir is not None
+    (failed.artifact_dir / "source.pdf").write_bytes(b"corrupted")
+
+    resumed = service.resume(failed.id)
+
+    assert resumed.state is JobState.COMPLETED
+    assert service.acquirer.calls == 2
+    assert dependencies["zotero"].upsert_calls == 2
+    assert dependencies["converter"].calls == 2
+    assert dependencies["summarizer"].calls == 2
+    assert notion.calls == [None, None]
+
+
+def test_recomputed_conversion_invalidates_quality_summary_and_notion(tmp_path: Path) -> None:
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF-1.4\nfixture\n%%EOF")
+    service, dependencies = _service(tmp_path)
+    notion = FailingOnceNotion()
+    service._notion = notion
+    failed = service.ingest(InputSpec(InputKind.LOCAL_PDF, str(source)))
+    assert failed.artifact_dir is not None
+    (failed.artifact_dir / "document.json").write_text(
+        '{"pages": [], "changed": true}\n', encoding="utf-8",
+    )
+
+    resumed = service.resume(failed.id)
+
+    assert resumed.state is JobState.COMPLETED
+    assert dependencies["acquirer"].calls == 1
+    assert dependencies["zotero"].upsert_calls == 1
+    assert dependencies["converter"].calls == 2
+    assert dependencies["summarizer"].calls == 2
+    assert notion.calls == [None, None]
+
+
 def test_missing_service_configuration_is_user_actionable_needs_input(
     tmp_path: Path,
 ) -> None:
@@ -364,6 +454,53 @@ def test_budget_denial_has_a_distinct_resumable_state(tmp_path: Path) -> None:
     assert job.state is JobState.BUDGET_EXCEEDED
     assert job.error == "Required USD 0.60 exceeds remaining USD 0.50"
     assert stages[-1] == "budget_exceeded"
+
+
+def test_user_correctable_source_and_attachment_errors_need_input(tmp_path: Path) -> None:
+    service, dependencies = _service(tmp_path / "source")
+    service.acquirer = ErrorAcquirer(AcquisitionInputError("source is not a PDF"))
+    source_job = service.ingest(InputSpec(InputKind.PDF_URL, "https://example.test/bad.pdf"))
+
+    zotero_service, zotero_dependencies = _service(tmp_path / "zotero")
+    zotero_service.zotero = ErrorZotero(ZoteroInputError("invalid attachment selection"))
+    attachment_job = zotero_service.ingest(
+        InputSpec(InputKind.ZOTERO_ITEM, "PARENT01", attachment_key="BADPDF01")
+    )
+
+    assert source_job.state is JobState.NEEDS_INPUT
+    assert source_job.error == "source is not a PDF"
+    assert attachment_job.state is JobState.NEEDS_INPUT
+    assert attachment_job.error == "invalid attachment selection"
+    assert dependencies["summarizer"].calls == 0
+    assert zotero_dependencies["summarizer"].calls == 0
+
+
+def test_transient_acquisition_and_zotero_errors_remain_failed(tmp_path: Path) -> None:
+    service, _ = _service(tmp_path / "source")
+    service.acquirer = ErrorAcquirer(AcquisitionError("network unavailable"))
+    source_job = service.ingest(InputSpec(InputKind.PDF_URL, "https://example.test/paper.pdf"))
+
+    zotero_service, _ = _service(tmp_path / "zotero")
+    zotero_service.zotero = UnavailableZotero(ZoteroError("Zotero local API unavailable"))
+    zotero_job = zotero_service.ingest(InputSpec(InputKind.ZOTERO_ITEM, "PARENT01"))
+
+    assert source_job.state is JobState.FAILED
+    assert source_job.error == "network unavailable"
+    assert zotero_job.state is JobState.FAILED
+    assert zotero_job.error == "Zotero local API unavailable"
+
+
+def test_missing_local_source_creates_a_resumable_needs_input_job(tmp_path: Path) -> None:
+    service, _ = _service(tmp_path)
+    service.acquirer = DocumentAcquirer()
+
+    job = service.ingest(
+        InputSpec(InputKind.LOCAL_PDF, str(tmp_path / "missing.pdf"))
+    )
+
+    assert job.state is JobState.NEEDS_INPUT
+    assert job.error is not None
+    assert "does not exist" in job.error
 
 
 def test_resume_accepts_attachment_selection_without_any_early_llm_call(
@@ -404,6 +541,51 @@ def test_resume_without_cost_override_reuses_the_persisted_job_budget(
     assert summarizer.seen_budgets == [0.20, 0.20]
 
 
+def test_research_interest_override_after_late_failure_invalidates_summary_and_notion(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF-1.4\nfixture\n%%EOF")
+    service, dependencies = _service(tmp_path)
+    notion = FailingOnceNotion()
+    service._notion = notion
+    failed = service.ingest(
+        InputSpec(InputKind.LOCAL_PDF, str(source), research_interest="old interest")
+    )
+
+    resumed = service.resume(failed.id, research_interest="new interest")
+
+    assert resumed.state is JobState.COMPLETED
+    assert dependencies["acquirer"].calls == 1
+    assert dependencies["converter"].calls == 1
+    assert dependencies["summarizer"].calls == 2
+    assert dependencies["summarizer"].interests == ["old interest", "new interest"]
+    assert notion.calls == [None, None]
+
+
+def test_attachment_override_after_late_failure_invalidates_every_checkpoint(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "zotero.pdf"
+    source.write_bytes(b"%PDF-1.4\nfixture\n%%EOF")
+    service, dependencies = _service(tmp_path)
+    zotero = AttachmentSelectingZotero(source)
+    notion = FailingOnceNotion()
+    service.zotero = zotero
+    service._notion = notion
+    failed = service.ingest(
+        InputSpec(InputKind.ZOTERO_ITEM, "PARENT01", attachment_key="ATTACH01")
+    )
+
+    resumed = service.resume(failed.id, attachment_key="ATTACH02")
+
+    assert resumed.state is JobState.COMPLETED
+    assert zotero.selections == ["ATTACH01", "ATTACH02"]
+    assert dependencies["converter"].calls == 2
+    assert dependencies["summarizer"].calls == 2
+    assert notion.calls == [None, None]
+
+
 def test_collection_batch_deduplicates_keys_and_only_unprocessed_skips_completed(
     tmp_path: Path,
 ) -> None:
@@ -432,3 +614,26 @@ def test_collection_batch_deduplicates_keys_and_only_unprocessed_skips_completed
     assert dependencies["store"].get_checkpoint(
         first[0].id, JobState.ZOTERO_SYNC,
     )["attachment_key"] == "ATTACH01"
+
+
+def test_only_unprocessed_uses_the_configured_zotero_library_identity(
+    tmp_path: Path,
+) -> None:
+    first_source = tmp_path / "zotero-1.pdf"
+    second_source = tmp_path / "zotero-2.pdf"
+    first_source.write_bytes(b"%PDF-1.4\nfixture one\n%%EOF")
+    second_source.write_bytes(b"%PDF-1.4\nfixture two\n%%EOF")
+    service, _ = _service(tmp_path)
+    service.settings.zotero.user_id = 42
+    zotero = CollectionZotero(
+        {"PARENT01": first_source, "PARENT02": second_source}, library_id="42",
+    )
+    service.zotero = zotero
+    collection = InputSpec(InputKind.ZOTERO_COLLECTION, "COLLECT1")
+
+    first = service.ingest_collection(collection, only_unprocessed=True)
+    second = service.ingest_collection(collection, only_unprocessed=True)
+
+    assert len(first) == 2
+    assert second == []
+    assert zotero.resolve_calls == 2

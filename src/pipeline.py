@@ -9,7 +9,7 @@ from typing import Any, Callable
 
 import httpx
 
-from src.acquisition import AcquisitionResult, DocumentAcquirer
+from src.acquisition import AcquisitionInputError, AcquisitionResult, DocumentAcquirer
 from src.artifacts import ArtifactManager
 from src.config import Settings
 from src.converter import Converter
@@ -39,7 +39,7 @@ from src.research_models import (
     PaperMetadata,
     PaperSummary,
 )
-from src.zotero import ZoteroClient, ZoteroResolution
+from src.zotero import ZoteroClient, ZoteroInputError, ZoteroResolution
 
 
 class NeedsInputError(RuntimeError):
@@ -58,6 +58,10 @@ def _summary_from(payload: dict[str, Any]) -> PaperSummary:
     value = dict(payload)
     value["evidence"] = [EvidenceAnchor(**item) for item in value.get("evidence", [])]
     return PaperSummary(**value)
+
+
+def _file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 class PipelineService:
@@ -119,8 +123,6 @@ class PipelineService:
     ) -> list[JobRecord]:
         if spec.kind is not InputKind.ZOTERO_COLLECTION:
             raise ValueError("ingest_collection requires a Zotero collection input")
-        if not self.zotero.is_available():
-            raise NeedsInputError("Zotero local API is unavailable; start Zotero and retry")
         unique_specs: list[InputSpec] = []
         seen: set[tuple[InputKind, str]] = set()
         for item_spec in self.zotero.expand_collection(spec):
@@ -147,22 +149,30 @@ class PipelineService:
         if job.state is JobState.COMPLETED:
             return job
         if attachment_key is not None or research_interest is not None:
+            next_attachment = (
+                attachment_key
+                if attachment_key is not None
+                else job.input_spec.attachment_key
+            )
+            next_interest = (
+                research_interest
+                if research_interest is not None
+                else job.input_spec.research_interest
+            )
+            invalidate_from = None
+            if next_attachment != job.input_spec.attachment_key:
+                invalidate_from = JobState.ACQUIRING
+            elif next_interest != job.input_spec.research_interest:
+                invalidate_from = JobState.EXTRACTING
             job = self.store.update_input_spec(
                 job_id,
                 InputSpec(
                     job.input_spec.kind,
                     job.input_spec.source,
-                    attachment_key=(
-                        attachment_key
-                        if attachment_key is not None
-                        else job.input_spec.attachment_key
-                    ),
-                    research_interest=(
-                        research_interest
-                        if research_interest is not None
-                        else job.input_spec.research_interest
-                    ),
+                    attachment_key=next_attachment,
+                    research_interest=next_interest,
                 ),
+                invalidate_from=invalidate_from,
             )
         if max_cost_usd is not None:
             job = self.store.update_job_budget(job_id, max_cost_usd)
@@ -179,7 +189,7 @@ class PipelineService:
         return self.store.get_job(job_id)
 
     def _artifact_manager(self, spec: InputSpec) -> ArtifactManager:
-        if spec.kind is InputKind.LOCAL_PDF:
+        if spec.kind is InputKind.LOCAL_PDF and Path(spec.source).is_file():
             digest = hashlib.sha256(Path(spec.source).read_bytes()).hexdigest()
         else:
             canonical = f"{spec.kind.value}:{spec.source}".encode("utf-8")
@@ -239,6 +249,18 @@ class PipelineService:
                 source_pdf = acquisition.source_pdf
                 if acquisition.state is JobState.NEEDS_INPUT or source_pdf is None:
                     raise NeedsInputError("A readable PDF is required to continue")
+                previous_sha256 = (
+                    acquisition_checkpoint.get("pdf_sha256")
+                    if isinstance(acquisition_checkpoint, dict)
+                    else None
+                )
+                if (
+                    previous_sha256 is not None
+                    and previous_sha256 != acquisition.pdf_sha256
+                ):
+                    self.store.invalidate_checkpoints(
+                        job_id, JobState.ZOTERO_SYNC,
+                    )
                 manager.write_metadata(_metadata_payload(metadata))
                 paper_id = self.store.upsert_paper(
                     metadata, acquisition.pdf_sha256, bundle.root,
@@ -275,6 +297,7 @@ class PipelineService:
             )
             resolution = self._restored_zotero(zotero_checkpoint)
             if resolution is None:
+                self.store.invalidate_checkpoints(job_id, JobState.CONVERTING)
                 if job.input_spec.kind is InputKind.ZOTERO_ITEM:
                     resolution = acquired_zotero
                     if resolution is None:
@@ -284,8 +307,6 @@ class PipelineService:
                             job.input_spec.attachment_key,
                         )
                 else:
-                    if not self.zotero.is_available():
-                        raise NeedsInputError("Zotero local API is unavailable; start Zotero and retry")
                     resolution = self.zotero.upsert_non_zotero(metadata, source_pdf)
                 if resolution.state is JobState.NEEDS_INPUT or resolution.source_pdf is None:
                     raise NeedsInputError(resolution.diagnostic or "Select a PDF attachment")
@@ -314,15 +335,20 @@ class PipelineService:
             converting_checkpoint = self.store.get_checkpoint(
                 job_id, JobState.CONVERTING,
             )
-            if not self._valid_conversion_checkpoint(converting_checkpoint, bundle):
+            if not self._valid_conversion_checkpoint(
+                converting_checkpoint, bundle, acquisition.pdf_sha256,
+            ):
+                self.store.invalidate_checkpoints(job_id, JobState.QUALITY_CHECK)
                 bundle = self.converter.convert(source_pdf, bundle.root)
                 self._checkpoint(
-                    job_id, JobState.CONVERTING, {"artifact_dir": str(bundle.root)},
+                    job_id, JobState.CONVERTING,
+                    self._conversion_checkpoint(bundle, acquisition.pdf_sha256),
                 )
 
             self._enter(job_id, JobState.QUALITY_CHECK)
             quality = self.store.get_checkpoint(job_id, JobState.QUALITY_CHECK)
             if not isinstance(quality, dict) or not quality.get("llm_allowed"):
+                self.store.invalidate_checkpoints(job_id, JobState.EXTRACTING)
                 quality = json.loads(
                     (bundle.logs_dir / "quality_result.json").read_text(encoding="utf-8")
                 )
@@ -343,6 +369,7 @@ class PipelineService:
             summary = self._restored_summary(extraction_checkpoint, bundle)
             summary_was_restored = summary is not None
             if summary is None:
+                self.store.invalidate_checkpoints(job_id, JobState.SYNTHESIZING)
                 previous_budget = getattr(
                     getattr(self.summarizer, "settings", None), "paper_budget_usd", None,
                 )
@@ -393,6 +420,7 @@ class PipelineService:
             return self._stop(job_id, JobState.BUDGET_EXCEEDED, error)
         except (
             NeedsInputError,
+            AcquisitionInputError,
             NotionConfigurationError,
             NotionSchemaError,
             OpenRouterConfigurationError,
@@ -400,6 +428,7 @@ class PipelineService:
             PrivacyRequirementsError,
             InputLimitExceededError,
             UnresolvedUsageError,
+            ZoteroInputError,
         ) as error:
             return self._stop(job_id, JobState.NEEDS_INPUT, error)
         except Exception as error:
@@ -410,8 +439,6 @@ class PipelineService:
     ) -> tuple[AcquisitionResult, ZoteroResolution | None]:
         if job.input_spec.kind is not InputKind.ZOTERO_ITEM:
             return self.acquirer.acquire(job.input_spec, manager), None
-        if not self.zotero.is_available():
-            raise NeedsInputError("Zotero local API is unavailable; start Zotero and retry")
         resolution = self.zotero.resolve(job.input_spec)
         if resolution.state is JobState.NEEDS_INPUT or resolution.source_pdf is None:
             raise NeedsInputError(resolution.diagnostic or "Select a PDF attachment")
@@ -479,14 +506,39 @@ class PipelineService:
         )
 
     @staticmethod
-    def _valid_conversion_checkpoint(payload: Any, bundle: ArtifactBundle) -> bool:
-        return (
-            isinstance(payload, dict)
-            and Path(str(payload.get("artifact_dir", ""))) == bundle.root
-            and bundle.paper_md.is_file()
-            and bundle.document_json.is_file()
-            and (bundle.logs_dir / "quality_result.json").is_file()
-        )
+    def _conversion_checkpoint(
+        bundle: ArtifactBundle, source_sha256: str | None,
+    ) -> dict[str, Any]:
+        quality_path = bundle.logs_dir / "quality_result.json"
+        return {
+            "version": 1,
+            "artifact_dir": str(bundle.root),
+            "source_sha256": source_sha256,
+            "document_sha256": _file_sha256(bundle.document_json),
+            "paper_sha256": _file_sha256(bundle.paper_md),
+            "quality_sha256": _file_sha256(quality_path),
+        }
+
+    @staticmethod
+    def _valid_conversion_checkpoint(
+        payload: Any, bundle: ArtifactBundle, source_sha256: str | None,
+    ) -> bool:
+        quality_path = bundle.logs_dir / "quality_result.json"
+        if (
+            not isinstance(payload, dict)
+            or payload.get("version") != 1
+            or Path(str(payload.get("artifact_dir", ""))) != bundle.root
+            or payload.get("source_sha256") != source_sha256
+        ):
+            return False
+        try:
+            return (
+                payload.get("document_sha256") == _file_sha256(bundle.document_json)
+                and payload.get("paper_sha256") == _file_sha256(bundle.paper_md)
+                and payload.get("quality_sha256") == _file_sha256(quality_path)
+            )
+        except OSError:
+            return False
 
     @staticmethod
     def _restored_summary(payload: Any, bundle: ArtifactBundle) -> PaperSummary | None:

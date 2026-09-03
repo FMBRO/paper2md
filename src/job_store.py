@@ -202,16 +202,59 @@ class JobStore:
             raise KeyError(f"Unknown job: {job_id}")
         return self.get_job(job_id)
 
-    def update_input_spec(self, job_id: str, input_spec: InputSpec) -> JobRecord:
+    def update_input_spec(
+        self,
+        job_id: str,
+        input_spec: InputSpec,
+        *,
+        invalidate_from: JobState | None = None,
+    ) -> JobRecord:
         """Persist user-supplied resume details such as an attachment selection."""
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             updated = connection.execute(
                 "UPDATE jobs SET input_json = ?, updated_at = ? WHERE id = ?",
                 (self._input_json(input_spec), self._now(), job_id),
             )
+            if invalidate_from is not None:
+                self._invalidate_checkpoints_in_transaction(
+                    connection, job_id, invalidate_from,
+                )
         if not updated.rowcount:
             raise KeyError(f"Unknown job: {job_id}")
         return self.get_job(job_id)
+
+    @staticmethod
+    def _checkpoint_stages_from(stage: JobState) -> list[str]:
+        checkpoint_order = [
+            JobState.ACQUIRING, JobState.ZOTERO_SYNC, JobState.CONVERTING,
+            JobState.QUALITY_CHECK, JobState.EXTRACTING, JobState.SYNTHESIZING,
+            JobState.NOTION_SYNC,
+        ]
+        if stage not in checkpoint_order:
+            raise ValueError(f"{stage.value} is not a checkpoint stage")
+        return [value.value for value in checkpoint_order[checkpoint_order.index(stage):]]
+
+    @classmethod
+    def _invalidate_checkpoints_in_transaction(
+        cls, connection: sqlite3.Connection, job_id: str, stage: JobState,
+    ) -> None:
+        stages = cls._checkpoint_stages_from(stage)
+        placeholders = ", ".join("?" for _ in stages)
+        connection.execute(
+            f"DELETE FROM job_checkpoints WHERE job_id = ? AND stage IN ({placeholders})",
+            (job_id, *stages),
+        )
+
+    def invalidate_checkpoints(self, job_id: str, stage: JobState) -> None:
+        """Atomically remove a stage checkpoint and every dependent checkpoint."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if connection.execute(
+                "SELECT 1 FROM jobs WHERE id = ?", (job_id,),
+            ).fetchone() is None:
+                raise KeyError(f"Unknown job: {job_id}")
+            self._invalidate_checkpoints_in_transaction(connection, job_id, stage)
 
     def update_job_budget(self, job_id: str, max_cost_usd: float) -> JobRecord:
         if max_cost_usd < 0:
