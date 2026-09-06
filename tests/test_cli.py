@@ -232,6 +232,47 @@ def test_missing_configuration_has_a_sanitized_actionable_diagnostic(
     assert stderr.getvalue() == "error: NOTION_API_KEY is required\n"
 
 
+def test_unencodable_error_is_safely_written_to_windows_stream(tmp_path: Path) -> None:
+    stdout = io.StringIO()
+    raw_stderr = io.BytesIO()
+    stderr = io.TextIOWrapper(raw_stderr, encoding="cp932", errors="strict")
+
+    exit_code = main(
+        ["status", "job-1", "--config", str(_config(tmp_path))],
+        service_factory=lambda settings: (_ for _ in ()).throw(
+            RuntimeError("conversion failed — see output")
+        ),
+        stdout=stdout,
+        stderr=stderr,
+    )
+    stderr.flush()
+
+    assert exit_code == 1
+    rendered = raw_stderr.getvalue().decode("cp932").replace("\r\n", "\n")
+    assert rendered == (
+        "error: conversion failed \\u2014 see output\n"
+    )
+
+
+def test_json_job_output_is_ascii_safe_on_windows_stream(tmp_path: Path) -> None:
+    service = FakeCLIService(_job(JobState.FAILED, error="failed — retry"))
+    raw_stdout = io.BytesIO()
+    stdout = io.TextIOWrapper(raw_stdout, encoding="cp932", errors="strict")
+
+    exit_code = main(
+        ["status", "job-1", "--config", str(_config(tmp_path)), "--json"],
+        service_factory=lambda settings: service,
+        stdout=stdout,
+        stderr=io.StringIO(),
+    )
+    stdout.flush()
+
+    assert exit_code == 1
+    payload = raw_stdout.getvalue().decode("cp932")
+    assert "\\u2014" in payload
+    assert json.loads(payload)["error"] == "failed — retry"
+
+
 def test_config_option_is_also_accepted_before_the_subcommand(tmp_path: Path) -> None:
     service = FakeCLIService()
     stdout, stderr = io.StringIO(), io.StringIO()

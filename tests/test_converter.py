@@ -107,6 +107,43 @@ def test_converter_recovers_sparse_nonempty_text_with_redo_ocr(tmp_path: Path) -
     assert ocr_kwargs["mode"] == "redo"
 
 
+def test_converter_recovers_empty_marker_equation_from_pdf_text_layer(tmp_path: Path) -> None:
+    source = tmp_path / "equation.pdf"
+    pdf = fitz.open()
+    page = pdf.new_page()
+    page.insert_text((72, 72), "A sufficiently long clean paragraph for quality validation.")
+    page.insert_text((180, 180), "E = mc^2")
+    pdf.save(source)
+    pdf.close()
+
+    def fake_marker(_pdf: Path, output_dir: Path) -> Path:
+        output_dir.mkdir(parents=True)
+        markdown = output_dir / "paper.md"
+        markdown.write_text("# Paper\n", encoding="utf-8")
+        (output_dir / "document.json").write_text(json.dumps({"pages": [{
+            "page": 1,
+            "blocks": [
+                {
+                    "type": "Text",
+                    "text": "A sufficiently long clean paragraph for quality validation.",
+                },
+                {
+                    "type": "Equation",
+                    "text": "",
+                    "bbox": [170, 160, 260, 195],
+                },
+            ],
+        }]}), encoding="utf-8")
+        return markdown
+
+    bundle = Converter(marker_runner=fake_marker).convert(source, tmp_path / "artifact")
+
+    document = json.loads(bundle.document_json.read_text(encoding="utf-8"))
+    assert document["equations"][0]["text"] == "E = mc^2"
+    quality = json.loads((bundle.logs_dir / "quality_result.json").read_text(encoding="utf-8"))
+    assert quality["passed"] is True
+
+
 def test_converter_uses_force_ocr_mode_when_explicitly_requested(text_pdf: Path, tmp_path: Path) -> None:
     ocr_kwargs: dict = {}
 

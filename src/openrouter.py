@@ -12,7 +12,7 @@ import time
 import unicodedata
 import uuid
 from collections.abc import Callable
-from typing import Any, Protocol, TypeVar
+from typing import Annotated, Any, Protocol, TypeVar
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -30,10 +30,16 @@ from src.research_models import (
 
 
 ResponseModel = TypeVar("ResponseModel", bound=BaseModel)
+CompactExtractionItem = Annotated[str, Field(min_length=1, max_length=200)]
+EVIDENCE_QUOTE_MAX_CHARS = 4_000
 
-EXTRACTION_PROMPT_SCHEMA_VERSION = "paper2md-extraction-v1"
+EXTRACTION_PROMPT_SCHEMA_VERSION = "paper2md-extraction-v7"
 SYNTHESIS_PROMPT_SCHEMA_VERSION = "paper2md-synthesis-v1"
+STRUCTURED_VALIDATION_VERSION = "paper2md-structured-validation-v9"
 OPENROUTER_GENERATION_ENDPOINT = "https://openrouter.ai/api/v1/generation"
+GENERATION_METADATA_MAX_ATTEMPTS = 8
+GENERATION_METADATA_RETRYABLE_STATUSES = {404, 429, 500, 502, 503, 504, 529}
+RATE_LIMIT_MAX_ATTEMPTS = 12
 
 
 class PrivacyRequirementsError(RuntimeError):
@@ -76,8 +82,8 @@ class EvidenceResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     page: int = Field(ge=1)
-    section: str = Field(min_length=1)
-    quote: str = Field(min_length=1)
+    section: str = Field(min_length=1, max_length=200)
+    quote: str = Field(min_length=1, max_length=EVIDENCE_QUOTE_MAX_CHARS)
 
 
 class PaperSummaryResponse(BaseModel):
@@ -95,7 +101,7 @@ class PaperSummaryResponse(BaseModel):
     relevance_score: int = Field(ge=1, le=5)
     score_rationale: str = Field(min_length=1)
     keywords: list[str]
-    evidence: list[EvidenceResponse] = Field(min_length=1)
+    evidence: list[EvidenceResponse] = Field(min_length=1, max_length=8)
 
     @field_validator(
         "background", "question", "novelty", "methods", "results", "strengths",
@@ -111,11 +117,11 @@ class PaperSummaryResponse(BaseModel):
 class ChunkExtractionResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    summary: str = Field(min_length=1)
-    datasets: list[str]
-    metrics: list[str]
-    keywords: list[str]
-    evidence: list[EvidenceResponse] = Field(min_length=1)
+    summary: str = Field(min_length=1, max_length=2_500)
+    datasets: list[CompactExtractionItem] = Field(max_length=10)
+    metrics: list[CompactExtractionItem] = Field(max_length=20)
+    keywords: list[CompactExtractionItem] = Field(max_length=20)
+    evidence: list[EvidenceResponse] = Field(min_length=1, max_length=8)
 
     @field_validator("summary")
     @classmethod
@@ -222,9 +228,9 @@ class ModelCatalog(Protocol):
 
 
 class OpenRouterModelCatalog:
-    """Load current per-token prices from OpenRouter's official model catalog."""
+    """Load conservative prices from OpenRouter's ZDR-capable endpoints."""
 
-    endpoint = "https://openrouter.ai/api/v1/models"
+    endpoint = "https://openrouter.ai/api/v1/endpoints/zdr"
 
     def __init__(self, client: httpx.Client) -> None:
         self.client = client
@@ -236,11 +242,6 @@ class OpenRouterModelCatalog:
         try:
             response = self.client.get(
                 self.endpoint,
-                params={
-                    "q": model,
-                    "supported_parameters": "structured_outputs",
-                    "zdr": "true",
-                },
                 headers={"Authorization": f"Bearer {api_key}"},
             )
         except httpx.HTTPError as error:
@@ -249,21 +250,33 @@ class OpenRouterModelCatalog:
             raise PricingUnavailableError(f"Pricing unavailable for {model}")
         try:
             payload = response.json()
-            matches = [item for item in payload["data"] if item.get("id") == model]
-            if len(matches) != 1:
-                raise ValueError("model missing or ambiguous")
-            item = matches[0]
-            supported = set(item.get("supported_parameters") or [])
-            if not {"structured_outputs", "response_format"} & supported:
-                raise ValueError("structured output unavailable")
-            prompt = Decimal(str(item["pricing"]["prompt"])) * Decimal(1_000_000)
-            completion = Decimal(str(item["pricing"]["completion"])) * Decimal(1_000_000)
+            output_parameter = output_token_parameter(model)
+            matches = []
+            for item in payload["data"]:
+                supported = set(item.get("supported_parameters") or [])
+                if item.get("model_id") != model:
+                    continue
+                if output_parameter not in supported:
+                    continue
+                if not {"structured_outputs", "response_format"} & supported:
+                    continue
+                matches.append(item)
+            if not matches:
+                raise ValueError("ZDR structured-output endpoint unavailable")
+            prompt = max(
+                Decimal(str(item["pricing"]["prompt"])) for item in matches
+            ) * Decimal(1_000_000)
+            completion = max(
+                Decimal(str(item["pricing"]["completion"])) for item in matches
+            ) * Decimal(1_000_000)
             if prompt < 0 or completion < 0:
                 raise ValueError("negative price")
             version = (
                 response.headers.get("etag")
                 or response.headers.get("last-modified")
-                or f"created:{item['created']}"
+                or "zdr:" + hashlib.sha256(
+                    json.dumps(matches, sort_keys=True, separators=(",", ":")).encode()
+                ).hexdigest()
             )
         except (KeyError, TypeError, ValueError, ArithmeticError) as error:
             raise PricingUnavailableError(f"Pricing unavailable for {model}") from error
@@ -343,11 +356,9 @@ def build_structured_payload(
         )
     if pricing.model != model:
         raise PricingUnavailableError(f"Pricing snapshot does not match {model}")
-    return {
+    payload = {
         "model": model,
         "messages": messages,
-        "max_tokens": max_output_tokens,
-        "temperature": 0,
         "stream": False,
         "response_format": {
             "type": "json_schema",
@@ -367,6 +378,24 @@ def build_structured_payload(
             },
         },
     }
+    token_parameter = output_token_parameter(model)
+    if token_parameter == "max_completion_tokens":
+        payload[token_parameter] = max_output_tokens
+    else:
+        payload["temperature"] = 0
+        payload[token_parameter] = max_output_tokens
+    return payload
+
+
+def output_token_parameter(model: str) -> str:
+    return "max_completion_tokens" if model.startswith("openai/gpt-5") else "max_tokens"
+
+
+def payload_output_token_limit(payload: dict[str, Any]) -> int:
+    for key in ("max_completion_tokens", "max_tokens"):
+        if key in payload:
+            return int(payload[key])
+    raise ValueError("structured payload has no output token limit")
 
 
 class OpenRouterSummarizer:
@@ -418,11 +447,25 @@ class OpenRouterSummarizer:
         logical_request = {
             key: payload[key]
             for key in (
-                "model", "messages", "max_tokens", "temperature", "stream",
+                "model", "messages", "max_tokens", "max_completion_tokens",
+                "temperature", "stream",
                 "response_format",
             )
+            if key in payload
         }
+        logical_request["validation_version"] = STRUCTURED_VALIDATION_VERSION
         return self._request_hash(logical_request)
+
+    def _dispatch_hash(
+        self,
+        payload: dict[str, Any],
+        cache_key: str,
+        dispatch_ordinal: int | None = None,
+    ) -> str:
+        value: dict[str, Any] = {"cache_key": cache_key, "payload": payload}
+        if dispatch_ordinal is not None:
+            value["dispatch_ordinal"] = dispatch_ordinal
+        return self._request_hash(value)
 
     def _cached(
         self,
@@ -492,7 +535,7 @@ class OpenRouterSummarizer:
         preserve_reservation = False
         try:
             authorized_per_attempt = self._call_cost(
-                pricing, max_input_tokens, int(payload["max_tokens"]),
+                pricing, max_input_tokens, payload_output_token_limit(payload),
             )
             first_attempt = self.store.llm_attempt_count(cache_key)
             required = float(authorized_per_attempt * (attempts - first_attempt))
@@ -590,23 +633,18 @@ class OpenRouterSummarizer:
             raise StructuredOutputError(
                 f"Structured output retries already exhausted after {attempts} attempts"
             )
-        for attempt in range(first_attempt, attempts):
+        attempt = first_attempt
+        rate_limit_attempts = 0
+        while attempt < attempts:
             if ownership_lost.is_set():
                 raise RequestInFlightError("Lost ownership of LLM request lease")
-            attempt_payload = dict(payload)
-            if attempt:
-                attempt_payload["messages"] = [
-                    *payload["messages"],
-                    {
-                        "role": "system",
-                        "content": (
-                            f"検証失敗後の再生成 {attempt}/{self.settings.max_validation_retries}。"
-                            "指定されたJSON Schemaだけに従ってください。"
-                        ),
-                    },
-                ]
+            attempt_payload = self._attempt_payload(payload, attempt)
             self._ensure_input_limit(attempt_payload, max_input_tokens, stage)
-            request_hash = self._request_hash(attempt_payload)
+            request_hash = self._dispatch_hash(
+                attempt_payload,
+                cache_key,
+                dispatch_ordinal=self.store.llm_dispatch_count(cache_key),
+            )
             dispatched = self.store.begin_llm_dispatch(
                 job_id,
                 request_hash=request_hash,
@@ -684,16 +722,99 @@ class OpenRouterSummarizer:
                 raise UnresolvedUsageError(
                     "OpenRouter returned 2xx without parseable cost metadata"
                 ) from error
+            error_envelope = raw_response.get("error") if isinstance(raw_response, dict) else None
+            error_code: int | None = None
+            if isinstance(error_envelope, dict):
+                try:
+                    error_code = int(error_envelope.get("code"))
+                except (TypeError, ValueError):
+                    pass
+            if error_code in {404, 429}:
+                generation_id = (
+                    response.headers.get("X-Generation-Id", "").strip()
+                    or str(raw_response.get("id") or "").strip()
+                    or None
+                )
+                self._settle_dispatch(
+                    job_id,
+                    request_hash=request_hash,
+                    cache_key=cache_key,
+                    model=str(attempt_payload["model"]),
+                    provider=None,
+                    generation_id=generation_id,
+                    response={"error": {"code": error_code}},
+                    usage={},
+                    cost_usd=0.0,
+                    cost_resolved=True,
+                    validated=False,
+                    pricing=pricing.as_record(),
+                    reservation_id=reservation_id,
+                    request_owner_token=request_owner_token,
+                    reservation_owner_token=reservation_owner_token,
+                    authorized_amount_usd=(0.0 if error_code == 429 else authorized_per_attempt),
+                    now=time.time(),
+                )
+                last_error = OpenRouterAPIError(
+                    f"OpenRouter returned transient error code {error_code}"
+                )
+                if error_code == 429:
+                    rate_limit_attempts += 1
+                    if rate_limit_attempts >= RATE_LIMIT_MAX_ATTEMPTS:
+                        raise OpenRouterAPIError(
+                            "OpenRouter rate limit persisted after "
+                            f"{RATE_LIMIT_MAX_ATTEMPTS} attempts"
+                        ) from last_error
+                    time.sleep(min(10.0, 1.0 * (2 ** (rate_limit_attempts - 1))))
+                    continue
+                raise last_error
+            rate_limit_attempts = 0
             try:
                 audit = _BillableResponse.model_validate(raw_response)
             except ValidationError as error:
                 audit = _BillableResponse()
                 last_error = error
+            header_generation_id = response.headers.get("X-Generation-Id", "").strip()
+            if header_generation_id:
+                audit.generation_id = header_generation_id
             provider = _provider_from_payload(raw_response)
             if provider is None and audit.generation_id is not None:
-                provider = self._provider_from_generation(
-                    audit.generation_id, api_key=api_key,
-                )
+                try:
+                    provider = self._provider_from_generation(
+                        audit.generation_id, api_key=api_key,
+                    )
+                except UnresolvedUsageError as error:
+                    if (
+                        audit.model is None
+                        or audit.usage is None
+                        or audit.usage.prompt_tokens is None
+                        or audit.usage.completion_tokens is None
+                        or audit.usage.total_tokens is None
+                        or audit.usage.cost is None
+                    ):
+                        raise
+                    usage = audit.usage.model_dump(mode="json")
+                    self._settle_dispatch(
+                        job_id,
+                        request_hash=request_hash,
+                        cache_key=cache_key,
+                        model=audit.model,
+                        provider=None,
+                        generation_id=audit.generation_id,
+                        response=raw_response,
+                        usage=usage,
+                        cost_usd=float(audit.usage.cost),
+                        cost_resolved=True,
+                        validated=False,
+                        pricing=pricing.as_record(),
+                        reservation_id=reservation_id,
+                        request_owner_token=request_owner_token,
+                        reservation_owner_token=reservation_owner_token,
+                        authorized_amount_usd=authorized_per_attempt,
+                        now=time.time(),
+                    )
+                    last_error = error
+                    attempt += 1
+                    continue
             resolved = (
                 audit.generation_id is not None
                 and audit.model is not None
@@ -772,6 +893,7 @@ class OpenRouterSummarizer:
                     now=time.time(),
                 )
                 last_error = error
+                attempt += 1
                 continue
             content = envelope.choices[0].message.content
             try:
@@ -799,6 +921,7 @@ class OpenRouterSummarizer:
                     now=time.time(),
                 )
                 last_error = error
+                attempt += 1
                 continue
             self._settle_dispatch(
                 job_id,
@@ -824,28 +947,35 @@ class OpenRouterSummarizer:
         ) from last_error
 
     def _provider_from_generation(self, generation_id: str, *, api_key: str) -> str:
-        try:
-            response = self.client.get(
-                OPENROUTER_GENERATION_ENDPOINT,
-                params={"id": generation_id},
-                headers={"Authorization": f"Bearer {api_key}"},
-                timeout=self.settings.request_timeout_seconds,
-            )
-        except httpx.HTTPError as error:
-            raise UnresolvedUsageError(
-                "OpenRouter provider metadata remains unresolved"
-            ) from error
-        if response.status_code < 200 or response.status_code >= 300:
-            raise UnresolvedUsageError("OpenRouter provider metadata remains unresolved")
-        try:
-            provider = _provider_from_payload(response.json())
-        except ValueError as error:
-            raise UnresolvedUsageError(
-                "OpenRouter provider metadata remains unresolved"
-            ) from error
-        if provider is None:
-            raise UnresolvedUsageError("OpenRouter provider metadata remains unresolved")
-        return provider
+        last_error: Exception | None = None
+        for attempt in range(GENERATION_METADATA_MAX_ATTEMPTS):
+            try:
+                response = self.client.get(
+                    OPENROUTER_GENERATION_ENDPOINT,
+                    params={"id": generation_id},
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    timeout=self.settings.request_timeout_seconds,
+                )
+            except httpx.HTTPError as error:
+                last_error = error
+            else:
+                if 200 <= response.status_code < 300:
+                    try:
+                        provider = _provider_from_payload(response.json())
+                    except ValueError as error:
+                        last_error = error
+                    else:
+                        if provider is not None:
+                            return provider
+                elif response.status_code not in GENERATION_METADATA_RETRYABLE_STATUSES:
+                    raise UnresolvedUsageError(
+                        "OpenRouter provider metadata remains unresolved"
+                    )
+            if attempt + 1 < GENERATION_METADATA_MAX_ATTEMPTS:
+                time.sleep(min(10.0, 0.5 * (2 ** attempt)))
+        raise UnresolvedUsageError(
+            "OpenRouter provider metadata remains unresolved"
+        ) from last_error
 
     def _settle_dispatch(self, job_id: str, **kwargs: Any) -> bool:
         try:
@@ -867,7 +997,6 @@ class OpenRouterSummarizer:
             "evidence_spans": [
                 {
                     "page": item.page,
-                    "section_id": item.section_id,
                     "kind": item.kind,
                     "source_position": item.source_position,
                 }
@@ -882,7 +1011,21 @@ class OpenRouterSummarizer:
                 {
                     "role": "system",
                     "content": (
-                        "論文の断片から事実だけを日本語で抽出してください。根拠は入力のページと節に限定してください。"
+                        "summaryは必ず日本語で書き、固有名詞の列挙だけで終えず、"
+                        "日本語の内容説明を十分に含め、英語のみのsummaryは禁止します。"
+                        "根拠は原文を一字も変えず4000字以内で引用。evidence.quoteは"
+                        "chunk.textから連続する完全一致部分だけをコピーし、"
+                        "HTML/Markdownも変更しないでください。数式を避け、"
+                        "単一の原文スパンから原則200文字以内の短い引用を選んでください。"
+                        "evidence.sectionにはchunk.sectionを一字も変えずコピーしてください。"
+                        "chunk.sectionは位置ラベルであり、chunk.text内に同じ文字列が"
+                        "存在しない限りquoteとして使わないでください。"
+                        "evidenceはchunk.textから選んだ最良の1件だけを返してください。"
+                        + (
+                            "ただしchunk.kindがequationなら、数式全体ではなく20〜80文字の"
+                            "連続部分を原文から一字も変えずコピーしてください。"
+                            if chunk.kind == "equation" else ""
+                        )
                     ),
                 },
                 {
@@ -913,6 +1056,9 @@ class OpenRouterSummarizer:
                     "content": (
                         "検証済みの抽出結果だけを使い、全項目を日本語で統合してください。"
                         "推測を避け、relevance_scoreは1から5で評価してください。"
+                        "ただしevidence.quoteは検証済み抽出の引用を原言語のまま"
+                        "一字も変更せずコピーし、翻訳しないでください。"
+                        "evidenceは重要な根拠を最大8件に絞り、短い引用を選んでください。"
                     ),
                 },
                 {
@@ -947,6 +1093,11 @@ class OpenRouterSummarizer:
                     "role": "system",
                     "content": (
                         "検証済み抽出結果を、根拠を失わず重複を除いて日本語で圧縮してください。"
+                        "summaryは2500字以内、evidenceは最大8件にしてください。"
+                        "evidenceのpage・section・quoteの3項目は入力中の"
+                        "同じevidenceオブジェクトから一字も変更せずコピーし、"
+                        "原文を一字も変更せず、新規作成は禁止します。"
+                        "quoteは4000字以内の短い引用を選んでください。"
                     ),
                 },
                 {
@@ -977,6 +1128,40 @@ class OpenRouterSummarizer:
                 f"above configured ceiling {max_input_tokens}"
             )
 
+    def _attempt_payload(
+        self, payload: dict[str, Any], attempt: int,
+    ) -> dict[str, Any]:
+        attempt_payload = dict(payload)
+        if attempt:
+            attempt_payload["messages"] = [
+                *payload["messages"],
+                {
+                    "role": "system",
+                    "content": (
+                        f"検証失敗後の再生成 {attempt}/{self.settings.max_validation_retries}。"
+                        "指定されたJSON Schemaだけに従ってください。"
+                    ),
+                },
+            ]
+        return attempt_payload
+
+    def _validation_attempts_fit(
+        self, payload: dict[str, Any], max_input_tokens: int,
+    ) -> bool:
+        return all(
+            estimate_serialized_tokens(self._attempt_payload(payload, attempt))
+            <= max_input_tokens
+            for attempt in range(self.settings.max_validation_retries + 1)
+        )
+
+    def _ensure_validation_attempts_fit(
+        self, payload: dict[str, Any], max_input_tokens: int, stage: str,
+    ) -> None:
+        for attempt in range(self.settings.max_validation_retries + 1):
+            self._ensure_input_limit(
+                self._attempt_payload(payload, attempt), max_input_tokens, stage,
+            )
+
     def _reduction_groups(
         self,
         extractions: list[ChunkExtractionResponse],
@@ -989,7 +1174,9 @@ class OpenRouterSummarizer:
         for extraction in extractions:
             candidate = [*pending, extraction]
             payload = self._reduction_payload(candidate, research_interest, pricing)
-            if estimate_serialized_tokens(payload) <= self.settings.extraction_max_input_tokens:
+            if self._validation_attempts_fit(
+                payload, self.settings.extraction_max_input_tokens,
+            ):
                 pending = candidate
                 pending_payload = payload
                 continue
@@ -1000,7 +1187,7 @@ class OpenRouterSummarizer:
             groups.append((pending, pending_payload))
             pending = [extraction]
             pending_payload = self._reduction_payload(pending, research_interest, pricing)
-            self._ensure_input_limit(
+            self._ensure_validation_attempts_fit(
                 pending_payload, self.settings.extraction_max_input_tokens, "reduction",
             )
         if pending and pending_payload is not None:
@@ -1030,26 +1217,116 @@ class OpenRouterSummarizer:
         chunks: list[DocumentChunk],
     ) -> Callable[[BaseModel], None]:
         def normalize(value: str) -> str:
-            return " ".join(unicodedata.normalize("NFKC", value).casefold().split())
+            for delimiter in (r"\(", r"\)", r"\[", r"\]", "$$", "$"):
+                value = value.replace(delimiter, " ")
+            value = unicodedata.normalize("NFKC", value).casefold()
+            value = re.sub(r"(?<=\w)[\-‐‑‒–—](?=\w)", "", value)
+            return " ".join(value.split())
+
+        def exact_excerpt(source: str, quote: str) -> str | None:
+            """Return the shortest exact source sentence window matching quote.
+
+            Normalization is used only to locate OCR/markup variants.  The value
+            persisted as evidence is always copied byte-for-byte from the source.
+            """
+            normalized_quote = normalize(quote)
+            if not normalized_quote or normalized_quote not in normalize(source):
+                return None
+            if quote in source:
+                return quote
+            spans = [
+                match.span()
+                for match in re.finditer(
+                    r".+?(?:[.!?](?=\s+|$)|$)", source, flags=re.DOTALL,
+                )
+                if match.group(0).strip()
+            ]
+            candidates: set[str] = set()
+            for start_index, (start, _) in enumerate(spans):
+                for _, end in spans[start_index:]:
+                    candidate = source[start:end].strip()
+                    if len(candidate) > EVIDENCE_QUOTE_MAX_CHARS:
+                        break
+                    if normalized_quote in normalize(candidate):
+                        candidates.add(candidate)
+                        break
+            if not candidates and len(source) <= EVIDENCE_QUOTE_MAX_CHARS:
+                candidates.add(source)
+            if not candidates:
+                return None
+            shortest = min(map(len, candidates))
+            minimal = {candidate for candidate in candidates if len(candidate) == shortest}
+            return next(iter(minimal)) if len(minimal) == 1 else None
 
         spans: dict[tuple[int, str], list[str]] = {}
+        raw_spans: dict[tuple[int, str], list[str]] = {}
         for chunk in chunks:
             for evidence in chunk.evidence:
                 spans.setdefault((evidence.page, chunk.section), []).append(
                     normalize(evidence.source_text)
                 )
+                raw_spans.setdefault((evidence.page, chunk.section), []).append(
+                    evidence.source_text
+                )
 
         def validate(response: BaseModel) -> None:
             evidence_items = getattr(response, "evidence", [])
             for anchor in evidence_items:
-                matching_spans = spans.get((anchor.page, anchor.section))
-                if not matching_spans:
-                    raise ValueError("evidence page and section do not identify a source span")
                 quote = normalize(anchor.quote)
                 if not quote:
                     raise ValueError("evidence quote is empty after normalization")
-                if not any(quote in source for source in matching_spans):
-                    raise ValueError("evidence quote is absent from its source span")
+                matching_spans = spans.get((anchor.page, anchor.section), [])
+                matching_raw_spans = raw_spans.get((anchor.page, anchor.section), [])
+
+                def contains_quote(source_spans: list[str]) -> bool:
+                    return any(quote in source for source in source_spans) or (
+                        quote in " ".join(source_spans)
+                    )
+
+                if any(anchor.quote in source for source in matching_raw_spans) or (
+                    anchor.quote in "\n\n".join(matching_raw_spans)
+                ):
+                    continue
+                if not matching_spans:
+                    raise ValueError(
+                        "evidence page and section do not identify a source span"
+                    )
+                normalized_matches = {
+                    replacement
+                    for source in matching_raw_spans
+                    if (replacement := exact_excerpt(source, anchor.quote)) is not None
+                }
+                if len(normalized_matches) == 1:
+                    anchor.quote = next(iter(normalized_matches))
+                    continue
+                markup_matches = [
+                    source
+                    for source in matching_raw_spans
+                    if quote in normalize(re.sub(r"<[^>]+>", "", source))
+                    and len(source) <= EVIDENCE_QUOTE_MAX_CHARS
+                ]
+                if len(markup_matches) == 1:
+                    anchor.quote = markup_matches[0]
+                    continue
+                claimed_page_matches = [
+                    source
+                    for source in raw_spans.get((anchor.page, anchor.section), [])
+                    if len(normalize(source)) >= 40
+                    and normalize(source) in quote
+                    and len(source) <= EVIDENCE_QUOTE_MAX_CHARS
+                ]
+                if len(claimed_page_matches) == 1:
+                    anchor.quote = claimed_page_matches[0]
+                    continue
+                matching_pages = [
+                    page
+                    for (page, section), source_spans in spans.items()
+                    if section == anchor.section and contains_quote(source_spans)
+                ]
+                if len(matching_pages) == 1:
+                    anchor.page = matching_pages[0]
+                    continue
+                raise ValueError("evidence quote is absent from its source span")
 
         return validate
 
@@ -1067,9 +1344,10 @@ class OpenRouterSummarizer:
         chunks = build_document_chunks(
             document,
             max_chars=self.settings.chunk_max_chars,
-            fits=lambda chunk: estimate_serialized_tokens(
-                self._map_payload(chunk, research_interest, extraction_pricing)
-            ) <= self.settings.extraction_max_input_tokens,
+            fits=lambda chunk: self._validation_attempts_fit(
+                self._map_payload(chunk, research_interest, extraction_pricing),
+                self.settings.extraction_max_input_tokens,
+            ),
             fit_error_label="extraction request",
         )
         if not chunks:
@@ -1079,7 +1357,7 @@ class OpenRouterSummarizer:
             for chunk in chunks
         ]
         for payload in map_payloads:
-            self._ensure_input_limit(
+            self._ensure_validation_attempts_fit(
                 payload, self.settings.extraction_max_input_tokens, "extraction",
             )
         map_cache_keys = [self._cache_key(payload) for payload in map_payloads]
@@ -1156,7 +1434,9 @@ class OpenRouterSummarizer:
             for level in range(self.settings.max_reduction_levels + 1):
                 if synthesis_ownership_lost.is_set():
                     raise RequestInFlightError("Lost synthesis budget reservation")
-                if estimate_serialized_tokens(synthesis_payload) <= self.settings.synthesis_max_input_tokens:
+                if self._validation_attempts_fit(
+                    synthesis_payload, self.settings.synthesis_max_input_tokens,
+                ):
                     break
                 if level == self.settings.max_reduction_levels:
                     raise InputLimitExceededError(
@@ -1429,8 +1709,18 @@ def build_document_chunks(
         kind, block, content_key = item
         section_id = block.get("section_id")
         pending_section = pending[0][1].get("section_id") if pending else section_id
+        item_page = int(block.get("page") or block.get("source_position", {}).get("page") or 1)
+        pending_page = (
+            int(
+                pending[0][1].get("page")
+                or pending[0][1].get("source_position", {}).get("page")
+                or 1
+            )
+            if pending else item_page
+        )
         if pending and (
             section_id != pending_section
+            or item_page != pending_page
             or kind != "paragraph"
             or not chunk_fits([*pending, item])
         ):

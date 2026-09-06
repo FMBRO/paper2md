@@ -1,7 +1,43 @@
 from pathlib import Path
+import tomllib
 
 from src.config import Settings, load_settings
 import pytest
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_windows_runtime_pins_torch_to_the_cuda_13_index() -> None:
+    project = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+
+    assert any(item.startswith("torch") for item in project["project"]["dependencies"])
+    torch_sources = project["tool"]["uv"]["sources"]["torch"]
+    assert any(source["index"] == "pytorch-cu130" for source in torch_sources)
+    cuda_index = next(
+        index for index in project["tool"]["uv"]["index"]
+        if index["name"] == "pytorch-cu130"
+    )
+    assert cuda_index == {
+        "name": "pytorch-cu130",
+        "url": "https://download.pytorch.org/whl/cu130",
+        "explicit": True,
+    }
+
+
+def test_production_config_uses_an_approved_strict_structured_extraction_model() -> None:
+    """Keep production extraction on one of the explicitly approved model IDs."""
+    settings = load_settings(PROJECT_ROOT / "configs" / "config.yaml")
+
+    assert settings.openrouter.extraction_model in {
+        "google/gemini-3.8-flash",
+        "qwen/qwen3.8-flash",
+        "openai/gpt-5.6-luna",
+    }
+    assert settings.openrouter.synthesis_model == "openai/gpt-5.6-sol"
+    assert settings.openrouter.synthesis_max_output_tokens == 4_000
+    assert settings.openrouter.max_validation_retries == 4
+    assert settings.openrouter.paper_budget_usd == 3.00
 
 
 def test_load_settings_adds_research_pipeline_defaults_without_breaking_legacy_yaml(tmp_path: Path) -> None:

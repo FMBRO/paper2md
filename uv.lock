@@ -4,7 +4,8 @@ requires-python = "==3.12.*"
 resolution-markers = [
     "sys_platform == 'darwin'",
     "platform_machine == 'aarch64' and sys_platform == 'linux'",
-    "(platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux')",
+    "sys_platform == 'win32'",
+    "(platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32')",
 ]
 
 [[package]]
@@ -609,7 +610,8 @@ dependencies = [
     { name = "regex" },
     { name = "scikit-learn" },
     { name = "surya-ocr" },
-    { name = "torch" },
+    { name = "torch", version = "2.13.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'win32'" },
+    { name = "torch", version = "2.14.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'win32'" },
     { name = "tqdm" },
     { name = "transformers" },
 ]
@@ -930,6 +932,8 @@ dependencies = [
     { name = "pydantic" },
     { name = "pymupdf" },
     { name = "pyyaml" },
+    { name = "torch", version = "2.13.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'win32'" },
+    { name = "torch", version = "2.14.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'win32'" },
 ]
 
 [package.dev-dependencies]
@@ -948,6 +952,8 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.10" },
     { name = "pymupdf", specifier = ">=1.24" },
     { name = "pyyaml", specifier = ">=6.0" },
+    { name = "torch", marker = "sys_platform != 'win32'", specifier = ">=2.11" },
+    { name = "torch", marker = "sys_platform == 'win32'", specifier = ">=2.11", index = "https://download.pytorch.org/whl/cu130" },
 ]
 
 [package.metadata.requires-dev]
@@ -1486,7 +1492,8 @@ dependencies = [
     { name = "pydantic-settings" },
     { name = "pypdfium2" },
     { name = "python-dotenv" },
-    { name = "torch" },
+    { name = "torch", version = "2.13.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'win32'" },
+    { name = "torch", version = "2.14.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'win32'" },
     { name = "transformers" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/b3/b4/b0f3afd024b4e6fcb4db6fdd17ee963d081e960c907aebd0556ff948abb6/surya_ocr-0.17.1.tar.gz", hash = "sha256:349d78d854c1ed5f816e583545ed6451aa0bc6992e283a805034799aacee8c24", size = 161854, upload-time = "2026-01-30T21:52:59.361Z" }
@@ -1554,6 +1561,11 @@ wheels = [
 name = "torch"
 version = "2.13.0"
 source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "sys_platform == 'darwin'",
+    "platform_machine == 'aarch64' and sys_platform == 'linux'",
+    "(platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux' and sys_platform != 'win32')",
+]
 dependencies = [
     { name = "cuda-bindings", marker = "sys_platform == 'linux'" },
     { name = "cuda-toolkit", extra = ["cublas", "cudart", "cufft", "cufile", "cupti", "curand", "cusolver", "cusparse", "nvjitlink", "nvrtc", "nvtx"], marker = "sys_platform == 'linux'" },
@@ -1574,7 +1586,26 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/c4/3a/ed0f4d4d1dcde03bced7aac9a28e800abcdc0cbd06b6775044c9fbd877b7/torch-2.13.0-cp312-cp312-macosx_14_0_arm64.whl", hash = "sha256:2fe228aba290d14b9f31b049be550dbd469c3fd3013d7a19705b30454da97027", size = 111213045, upload-time = "2026-07-08T16:05:22.997Z" },
     { url = "https://files.pythonhosted.org/packages/df/a9/f6a2a4d763ff1df02e9a64c477029db614295bc9367f4131223791ccc243/torch-2.13.0-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:572df8be8ffb4599c88cbd6a0726f1f854f4da65d2e3c09f0e2c2283333cd6d4", size = 427210998, upload-time = "2026-07-08T16:04:37.708Z" },
     { url = "https://files.pythonhosted.org/packages/f3/82/fea946351658e6534db52d2cc12bc53087cbf87f9440c5f180f367c1950b/torch-2.13.0-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:796633c4cdf0fe2cdced72d8f88f22e73dbcfce83132763162f6d4bff13b820b", size = 526605292, upload-time = "2026-07-08T16:04:22.81Z" },
-    { url = "https://files.pythonhosted.org/packages/21/d6/e8f3c6f7e01f626f77259de9860d2a78bc84c40539e28e79b7e98b0bb659/torch-2.13.0-cp312-cp312-win_amd64.whl", hash = "sha256:024c6cc0c1b085f2f91f20a3dc27b0471d021c31ce84b81be3afdc39f791fd9d", size = 122057313, upload-time = "2026-07-08T16:03:53.43Z" },
+]
+
+[[package]]
+name = "torch"
+version = "2.14.0+cu130"
+source = { registry = "https://download.pytorch.org/whl/cu130" }
+resolution-markers = [
+    "sys_platform == 'win32'",
+]
+dependencies = [
+    { name = "filelock" },
+    { name = "fsspec" },
+    { name = "jinja2" },
+    { name = "networkx" },
+    { name = "setuptools" },
+    { name = "sympy" },
+    { name = "typing-extensions" },
+]
+wheels = [
+    { url = "https://download-r2.pytorch.org/whl/cu130/torch-2.14.0%2Bcu130-cp312-cp312-win_amd64.whl", hash = "sha256:6a20371bf5af2af933a6149e5ec13f7ea7ad506276137dae9386f98d236c02ff", upload-time = "2026-09-02T18:52:06Z" },
 ]
 
 [[package]]

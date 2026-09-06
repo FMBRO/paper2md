@@ -35,7 +35,7 @@ def test_normalize_marker_document_preserves_typed_blocks_and_positions() -> Non
     assert document["source"] == "marker"
     assert [page["number"] for page in document["pages"]] == [1, 2]
     assert document["sections"] == [{
-        "id": "section-001", "title": "Introduction", "level": 2,
+        "id": "section-001", "title": "Introduction", "level": 1,
         "page": 1, "ordinal": 0,
         "source_position": {"page": 1},
     }]
@@ -65,6 +65,32 @@ def test_marker_normalization_defaults_an_invalid_heading_level() -> None:
     ]}]})
 
     assert document["sections"][0]["level"] == 1
+
+
+def test_marker_normalization_uses_numbered_section_depth() -> None:
+    document = normalize_marker_document({"pages": [{"page": 1, "blocks": [
+        {"type": "SectionHeader", "text": "Paper title", "level": 1},
+        {"type": "SectionHeader", "text": "1 Introduction", "level": 4},
+        {"type": "SectionHeader", "text": "2 Method", "level": 1},
+        {"type": "SectionHeader", "text": "2.1 Model", "level": 4},
+    ]}]})
+
+    assert [section["level"] for section in document["sections"]] == [1, 2, 2, 3]
+
+
+def test_marker_normalization_clamps_observed_heading_level_jumps() -> None:
+    """Marker's Title→Abstract H4 jump must not block an otherwise intact PDF."""
+    document = normalize_marker_document({"pages": [{"page": 1, "blocks": [
+        {"type": "SectionHeader", "text": "Paper title", "level": 1},
+        {"type": "SectionHeader", "text": "Abstract", "level": 4},
+        {"type": "SectionHeader", "text": "Introduction", "level": 2},
+        {"type": "SectionHeader", "text": "Experiment", "level": 4},
+    ]}]})
+
+    assert [section["title"] for section in document["sections"]] == [
+        "Paper title", "Abstract", "Introduction", "Experiment",
+    ]
+    assert [section["level"] for section in document["sections"]] == [1, 2, 2, 3]
 
 
 def test_markdown_fallback_keeps_form_feed_page_positions() -> None:
@@ -104,5 +130,5 @@ def test_real_marker_1_10_2_json_contract_is_recursive_multi_page_and_ordered() 
     markdown = document_normalizer.materialize_marker_markdown(marker_document)
     assert markdown.count("<!-- page:") == 2
     assert markdown.index("Left column first.") < markdown.index("Right column second.")
-    assert "### Results" in markdown
+    assert "## Results" in markdown
     assert "$$\nE = mc^2\n$$" in markdown

@@ -372,3 +372,44 @@ def test_paper_processing_lease_renewal_is_owner_and_expiry_fenced(
     assert not store.renew_paper_processing(
         paper_id, "owner-a", now=117.0, lease_seconds=10.0,
     )
+
+
+def test_ambiguous_dispatch_can_be_conservatively_charged_before_retry(
+    tmp_path: Path,
+) -> None:
+    from src.job_store import JobStore
+    from src.research_models import InputKind, InputSpec
+
+    store = JobStore(tmp_path / "paper2md.sqlite3")
+    job = store.create_job(InputSpec(InputKind.ARXIV, "2401.00001"))
+    assert store.claim_llm_request(
+        "logical", "request-owner", now=100.0, lease_seconds=10.0,
+    )
+    assert store.reserve_llm_budget(
+        job.id, "reservation", owner_token="budget-owner",
+        amount_usd=0.0528, budget_usd=3.0, now=100.0, lease_seconds=10.0,
+    )
+    assert store.begin_llm_dispatch(
+        job.id,
+        request_hash="attempt",
+        cache_key="logical",
+        model="example/model",
+        reservation_id="reservation",
+        request_owner_token="request-owner",
+        reservation_owner_token="budget-owner",
+        authorized_amount_usd=0.0528,
+        now=101.0,
+    )
+
+    charged = store.settle_ambiguous_llm_call_conservatively(1)
+
+    assert charged == pytest.approx(0.0528)
+    assert store.total_cost(job.id) == pytest.approx(0.0528)
+    assert store.has_unresolved_llm_call("logical") is False
+    assert store.llm_budget_reservation("reservation") == 0.0
+    with sqlite3.connect(store.path) as connection:
+        row = connection.execute(
+            "SELECT cost_usd, cost_resolved, validated, dispatch_state "
+            "FROM llm_calls WHERE id = 1"
+        ).fetchone()
+    assert row == (pytest.approx(0.0528), 1, 0, "settled")

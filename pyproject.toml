@@ -13,6 +13,7 @@ dependencies = [
     "pydantic>=2.10",
     "pymupdf>=1.24",
     "pyyaml>=6.0",
+    "torch>=2.11",
 ]
 
 [dependency-groups]
@@ -29,3 +30,13 @@ addopts = "-ra --strict-markers"
 
 [tool.uv]
 package = false
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu130", marker = "sys_platform == 'win32'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true

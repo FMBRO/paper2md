@@ -1073,6 +1073,21 @@ class JobStore:
 
     def llm_attempt_count(self, cache_key: str) -> int:
         with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT response_json FROM llm_calls WHERE cache_key = ?",
+                (cache_key,),
+            ).fetchall()
+        return sum(
+            not (
+                isinstance(response := json.loads(row["response_json"]), dict)
+                and isinstance(response.get("error"), dict)
+                and response["error"].get("code") == 429
+            )
+            for row in rows
+        )
+
+    def llm_dispatch_count(self, cache_key: str) -> int:
+        with self._connect() as connection:
             row = connection.execute(
                 "SELECT COUNT(*) AS count FROM llm_calls WHERE cache_key = ?",
                 (cache_key,),
@@ -1086,6 +1101,59 @@ class JobStore:
                 (cache_key,),
             ).fetchone()
         return row is not None
+
+    def settle_ambiguous_llm_call_conservatively(self, call_id: int) -> float:
+        """Close one untraceable dispatch at its authorized maximum charge.
+
+        This is an explicit operator recovery path for a transport failure that
+        returned neither a response nor a generation id.  It never assumes the
+        call was free: the whole pre-authorized amount is charged locally before
+        a retry is permitted.
+        """
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            call = connection.execute(
+                "SELECT * FROM llm_calls WHERE id = ?", (call_id,),
+            ).fetchone()
+            if call is None:
+                raise KeyError(f"Unknown LLM call: {call_id}")
+            if bool(call["cost_resolved"]):
+                return float(call["cost_usd"])
+            if call["dispatch_state"] not in {"dispatched", "unresolved"}:
+                raise ValueError("LLM call is not an unresolved dispatch")
+            reservations = connection.execute(
+                "SELECT * FROM llm_budget_reservations "
+                "WHERE job_id = ? AND unresolved = 1",
+                (call["job_id"],),
+            ).fetchall()
+            if len(reservations) != 1:
+                raise ValueError(
+                    "Ambiguous dispatch must have exactly one unresolved reservation"
+                )
+            authorized = float(call["authorized_amount_usd"])
+            if float(reservations[0]["amount_usd"]) + 1e-12 < authorized:
+                raise ValueError("Unresolved reservation is smaller than authorized charge")
+            previous = float(call["cost_usd"])
+            connection.execute(
+                "UPDATE llm_calls SET cost_usd = ?, cost_resolved = 1, "
+                "validated = 0, dispatch_state = 'settled' WHERE id = ?",
+                (authorized, call_id),
+            )
+            connection.execute(
+                "UPDATE jobs SET total_cost_usd = total_cost_usd + ?, updated_at = ? "
+                "WHERE id = ?",
+                (authorized - previous, self._now(), call["job_id"]),
+            )
+            connection.execute(
+                "UPDATE llm_budget_reservations SET amount_usd = 0, unresolved = 0 "
+                "WHERE id = ?",
+                (reservations[0]["id"],),
+            )
+            connection.execute(
+                "DELETE FROM llm_request_claims WHERE cache_key = ?",
+                (call["cache_key"],),
+            )
+        return authorized
 
     def claim_llm_request(
         self, cache_key: str, owner_token: str, *, now: float, lease_seconds: float,

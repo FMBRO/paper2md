@@ -131,6 +131,28 @@ def _heading_level(block: dict[str, Any]) -> int:
     return min(6, max(1, level))
 
 
+def _numbered_heading_level(text: str) -> int | None:
+    match = re.match(r"^\s*(\d+(?:\.\d+)*)\.?\s+\S", text)
+    if match is None:
+        return None
+    return min(6, match.group(1).count(".") + 2)
+
+
+def _clamp_section_levels(sections: list[dict[str, Any]]) -> None:
+    """Make a Marker hierarchy traversable without changing heading text."""
+    previous = 0
+    for section in sections:
+        level = section.get("level")
+        if not isinstance(level, int) or not 1 <= level <= 6:
+            level = 1
+        if previous == 0:
+            level = 1
+        elif level > previous + 1:
+            level = previous + 1
+        section["level"] = level
+        previous = level
+
+
 def _marker_page_id(block: dict[str, Any]) -> str | None:
     explicit = block.get("page_id")
     if explicit is not None:
@@ -223,10 +245,13 @@ def normalize_marker_document(marker_document: dict[str, Any]) -> dict[str, Any]
                 if not text:
                     continue
                 current_section = f"section-{len(document['sections']) + 1:03d}"
+                level = _heading_level(block)
+                if document["sections"]:
+                    level = _numbered_heading_level(text) or level
                 document["sections"].append({
                     "id": current_section,
                     "title": text,
-                    "level": _heading_level(block),
+                    "level": level,
                     **common,
                 })
             elif kind in {"table", "tableblock", "tableofcontents", "form"}:
@@ -268,6 +293,7 @@ def normalize_marker_document(marker_document: dict[str, Any]) -> dict[str, Any]
                     "section_id": current_section,
                     **common,
                 })
+    _clamp_section_levels(document["sections"])
     return document
 
 

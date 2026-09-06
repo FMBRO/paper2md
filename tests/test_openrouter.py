@@ -87,6 +87,28 @@ def test_section_chunks_combine_small_paragraphs_without_crossing_sections() -> 
     ]
 
 
+def test_section_chunks_do_not_combine_evidence_across_page_boundaries() -> None:
+    from src.openrouter import build_document_chunks
+
+    document = {
+        "sections": [{"id": "methods", "title": "Methods", "page": 3}],
+        "paragraphs": [
+            {"text": "We use the multipole dif-", "page": 3, "section_id": "methods"},
+            {"text": "fusion model for rendering.", "page": 4, "section_id": "methods"},
+        ],
+        "tables": [],
+        "equations": [],
+        "captions": [],
+    }
+
+    chunks = build_document_chunks(document, max_chars=100)
+
+    assert [(chunk.start_page, chunk.end_page, chunk.text) for chunk in chunks] == [
+        (3, 3, "We use the multipole dif-"),
+        (4, 4, "fusion model for rendering."),
+    ]
+
+
 def test_chunk_builder_uses_renderer_ordinal_across_mixed_block_types() -> None:
     from src.openrouter import build_document_chunks
 
@@ -194,6 +216,314 @@ def test_structured_payload_requires_schema_zdr_and_no_data_collection() -> None
     assert payload["response_format"]["json_schema"]["schema"]["additionalProperties"] is False
 
 
+def test_openai_gpt5_payload_uses_only_supported_sampling_parameters() -> None:
+    from src.config import OpenRouterSettings
+    from src.openrouter import PaperSummaryResponse, PricingSnapshot, build_structured_payload
+
+    payload = build_structured_payload(
+        settings=OpenRouterSettings(),
+        model="openai/gpt-5.6-sol",
+        pricing=PricingSnapshot(
+            model="openai/gpt-5.6-sol",
+            input_per_million=Decimal("1.00"),
+            output_per_million=Decimal("4.00"),
+            version="catalog-v1",
+        ),
+        messages=[{"role": "user", "content": "summarize"}],
+        response_model=PaperSummaryResponse,
+        max_output_tokens=2_000,
+    )
+
+    assert payload["max_completion_tokens"] == 2_000
+    assert "max_tokens" not in payload
+    assert "temperature" not in payload
+
+
+def test_luna_extraction_payload_uses_strict_schema_and_completion_tokens() -> None:
+    from src.config import OpenRouterSettings
+    from src.openrouter import ChunkExtractionResponse, PricingSnapshot, build_structured_payload
+
+    payload = build_structured_payload(
+        settings=OpenRouterSettings(),
+        model="openai/gpt-5.6-luna",
+        pricing=PricingSnapshot(
+            model="openai/gpt-5.6-luna",
+            input_per_million=Decimal("0.20"),
+            output_per_million=Decimal("1.20"),
+            version="catalog-v1",
+        ),
+        messages=[{"role": "user", "content": "extract"}],
+        response_model=ChunkExtractionResponse,
+        max_output_tokens=4_000,
+    )
+
+    assert payload["model"] == "openai/gpt-5.6-luna"
+    assert payload["max_completion_tokens"] == 4_000
+    assert "max_tokens" not in payload
+    assert payload["response_format"]["type"] == "json_schema"
+    assert payload["response_format"]["json_schema"]["strict"] is True
+
+
+def test_model_catalog_prices_only_zdr_structured_output_endpoints(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.openrouter import OpenRouterModelCatalog
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "secret")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/v1/endpoints/zdr"
+        return httpx.Response(200, json={"data": [
+            {
+                "model_id": "openai/gpt-5.6-sol",
+                "provider_name": "Azure",
+                "supported_parameters": [
+                    "max_completion_tokens", "response_format", "structured_outputs",
+                ],
+                "pricing": {"prompt": "0.000005", "completion": "0.000030"},
+            },
+            {
+                "model_id": "openai/gpt-5.6-sol",
+                "provider_name": "Azure",
+                "supported_parameters": [
+                    "max_completion_tokens", "response_format", "structured_outputs",
+                ],
+                "pricing": {"prompt": "0.0000055", "completion": "0.000033"},
+            },
+            {
+                "model_id": "openai/gpt-5.6-sol",
+                "provider_name": "Other",
+                "supported_parameters": ["max_tokens"],
+                "pricing": {"prompt": "0.000001", "completion": "0.000005"},
+            },
+        ]}, headers={"etag": "zdr-v1"})
+
+    pricing = OpenRouterModelCatalog(
+        httpx.Client(transport=httpx.MockTransport(handler)),
+    ).pricing_for("openai/gpt-5.6-sol")
+
+    assert pricing.input_per_million == Decimal("5.5")
+    assert pricing.output_per_million == Decimal("33")
+    assert pricing.version == "zdr-v1"
+
+
+def test_synthesis_prompt_requires_verbatim_untranslated_evidence() -> None:
+    from src.config import OpenRouterSettings
+    from src.openrouter import ChunkExtractionResponse, OpenRouterSummarizer, PricingSnapshot
+
+    summarizer = object.__new__(OpenRouterSummarizer)
+    summarizer.settings = OpenRouterSettings()
+    payload = summarizer._synthesis_payload(
+        [ChunkExtractionResponse.model_validate(_extraction())],
+        "",
+        PricingSnapshot(
+            model=summarizer.settings.synthesis_model,
+            input_per_million=Decimal("5.5"),
+            output_per_million=Decimal("33"),
+            version="zdr-v1",
+        ),
+    )
+
+    instruction = payload["messages"][0]["content"]
+    assert "原言語" in instruction
+    assert "一字も変更せず" in instruction
+    assert "翻訳" in instruction
+    assert "最大8件" in instruction
+    assert "短い引用" in instruction
+
+
+def test_reduction_prompt_states_structured_size_and_evidence_limits() -> None:
+    from src.config import OpenRouterSettings
+    from src.openrouter import ChunkExtractionResponse, OpenRouterSummarizer, PricingSnapshot
+
+    summarizer = object.__new__(OpenRouterSummarizer)
+    summarizer.settings = OpenRouterSettings()
+    payload = summarizer._reduction_payload(
+        [ChunkExtractionResponse.model_validate(_extraction())],
+        "",
+        PricingSnapshot(
+            model=summarizer.settings.extraction_model,
+            input_per_million=Decimal("0.30"),
+            output_per_million=Decimal("2.50"),
+            version="catalog-v1",
+        ),
+    )
+
+    instruction = payload["messages"][0]["content"]
+    assert "summaryは2500字以内" in instruction
+    assert "evidenceは最大8件" in instruction
+    assert "原文を一字も変更せず" in instruction
+    assert "page・section・quoteの3項目" in instruction
+    assert "同じevidenceオブジェクトから一字も変更せずコピー" in instruction
+    assert "新規作成は禁止" in instruction
+
+
+def test_map_prompt_requires_verbatim_evidence_with_4000_character_limit() -> None:
+    from src.config import OpenRouterSettings
+    from src.openrouter import (
+        ChunkEvidence,
+        DocumentChunk,
+        OpenRouterSummarizer,
+        PricingSnapshot,
+    )
+
+    summarizer = object.__new__(OpenRouterSummarizer)
+    summarizer.settings = OpenRouterSettings()
+    chunk = DocumentChunk(
+        text="Source sentence.",
+        kind="paragraph",
+        section="Introduction",
+        start_page=1,
+        end_page=1,
+        evidence=(ChunkEvidence("paragraph", 1, "intro", "Source sentence."),),
+    )
+    payload = summarizer._map_payload(
+        chunk,
+        "",
+        PricingSnapshot(
+            model=summarizer.settings.extraction_model,
+            input_per_million=Decimal("0.30"),
+            output_per_million=Decimal("2.50"),
+            version="catalog-v1",
+        ),
+    )
+
+    instruction = payload["messages"][0]["content"]
+    assert "原文を一字も変えず" in instruction
+    assert "4000字以内" in instruction
+    assert "chunk.textから連続する完全一致部分" in instruction
+    assert "HTML/Markdown" in instruction
+    assert "短い引用" in instruction
+    assert "単一の原文スパン" in instruction
+    assert "原則200文字以内" in instruction
+    assert "数式を避け" in instruction
+    assert "summaryは必ず日本語" in instruction
+    assert "英語のみのsummaryは禁止" in instruction
+    assert "固有名詞の列挙だけで終えず" in instruction
+    assert "日本語の内容説明を十分に" in instruction
+    assert "evidence.sectionにはchunk.sectionを一字も変えずコピー" in instruction
+    assert "chunk.sectionは位置ラベル" in instruction
+    assert "quoteとして使わない" in instruction
+    assert "最良の1件だけ" in instruction
+    assert "section_id" not in payload["messages"][1]["content"]
+
+
+def test_equation_map_prompt_requires_a_short_verbatim_fragment() -> None:
+    from src.config import OpenRouterSettings
+    from src.openrouter import (
+        ChunkEvidence,
+        DocumentChunk,
+        OpenRouterSummarizer,
+        PricingSnapshot,
+    )
+
+    summarizer = object.__new__(OpenRouterSummarizer)
+    summarizer.settings = OpenRouterSettings()
+    formula = r"M(\xi|\phi) = \iint \mu(\mathbf{u}, \phi) d\mathbf{u}"
+    chunk = DocumentChunk(
+        text=formula,
+        kind="equation",
+        section="Error Covariance",
+        start_page=5,
+        end_page=5,
+        evidence=(ChunkEvidence("equation", 5, "covariance", formula),),
+    )
+
+    payload = summarizer._map_payload(
+        chunk,
+        "",
+        PricingSnapshot(
+            model=summarizer.settings.extraction_model,
+            input_per_million=Decimal("0.30"),
+            output_per_million=Decimal("2.50"),
+            version="catalog-v1",
+        ),
+    )
+
+    instruction = payload["messages"][0]["content"]
+    assert "chunk.kindがequation" in instruction
+    assert "20〜80文字" in instruction
+    assert "数式全体ではなく" in instruction
+    assert "連続部分を原文から一字も変えずコピー" in instruction
+
+
+def test_chunk_extraction_schema_bounds_response_size() -> None:
+    from src.config import OpenRouterSettings
+    from src.openrouter import ChunkExtractionResponse, PricingSnapshot, build_structured_payload
+
+    payload = build_structured_payload(
+        settings=OpenRouterSettings(),
+        model="google/gemini-2.5-flash",
+        pricing=PricingSnapshot(
+            model="google/gemini-2.5-flash",
+            input_per_million=Decimal("0.30"),
+            output_per_million=Decimal("2.50"),
+            version="catalog-v1",
+        ),
+        messages=[{"role": "user", "content": "extract"}],
+        response_model=ChunkExtractionResponse,
+        max_output_tokens=1_000,
+    )
+
+    schema = payload["response_format"]["json_schema"]["schema"]
+    assert schema["properties"]["summary"]["maxLength"] == 2_500
+    assert schema["properties"]["datasets"]["maxItems"] == 10
+    assert schema["properties"]["datasets"]["items"]["maxLength"] == 200
+    assert schema["properties"]["metrics"]["maxItems"] == 20
+    assert schema["properties"]["keywords"]["maxItems"] == 20
+    assert schema["properties"]["evidence"]["maxItems"] == 8
+    evidence = schema["$defs"]["EvidenceResponse"]["properties"]
+    assert evidence["section"]["maxLength"] == 200
+    assert evidence["quote"]["maxLength"] == 4_000
+
+
+def test_cache_key_includes_structured_validation_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.openrouter as openrouter
+
+    summarizer = object.__new__(openrouter.OpenRouterSummarizer)
+    payload = {
+        "model": "example/model",
+        "messages": [{"role": "user", "content": "extract"}],
+        "max_tokens": 100,
+        "temperature": 0,
+        "stream": False,
+        "response_format": {"type": "json_schema"},
+    }
+    original = summarizer._cache_key(payload)
+    original_dispatch = summarizer._dispatch_hash(payload, original)
+
+    monkeypatch.setattr(openrouter, "STRUCTURED_VALIDATION_VERSION", "next")
+
+    updated = summarizer._cache_key(payload)
+    assert updated != original
+    assert summarizer._dispatch_hash(payload, updated) != original_dispatch
+
+
+def test_chunk_extraction_accepts_detailed_bounded_summary_and_evidence() -> None:
+    from src.openrouter import ChunkExtractionResponse
+
+    response = {
+        "summary": "要" * 1_932,
+        "datasets": [],
+        "metrics": [],
+        "keywords": ["hyperspectral imaging"],
+        "evidence": [
+            {
+                "page": 1,
+                "section": "Introduction",
+                "quote": "e" * 3_500,
+            }
+        ],
+    }
+
+    validated = ChunkExtractionResponse.model_validate(response)
+
+    assert len(validated.summary) == 1_932
+    assert len(validated.evidence[0].quote) == 3_500
+
+
 @pytest.mark.parametrize(
     "settings_kwargs",
     [
@@ -253,6 +583,18 @@ def test_final_summary_schema_requires_evidence() -> None:
 
     payload = _summary()
     payload["evidence"] = []
+
+    with pytest.raises(ValidationError, match="evidence"):
+        PaperSummaryResponse.model_validate(payload)
+
+
+def test_final_summary_schema_limits_evidence_to_eight_items() -> None:
+    from pydantic import ValidationError
+
+    from src.openrouter import PaperSummaryResponse
+
+    payload = _summary()
+    payload["evidence"] = payload["evidence"] * 9
 
     with pytest.raises(ValidationError, match="evidence"):
         PaperSummaryResponse.model_validate(payload)
@@ -537,6 +879,292 @@ def test_standard_openrouter_response_resolves_provider_from_generation_metadata
             "SELECT provider FROM llm_calls ORDER BY id"
         )]
     assert providers == ["Google", "Google"]
+
+
+def test_generation_lookup_prefers_openrouter_response_header_over_upstream_body_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.artifacts import ArtifactManager
+    from src.job_store import JobStore
+    from src.openrouter import OpenRouterSummarizer
+    from src.research_models import InputKind, InputSpec
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "secret")
+    looked_up: list[str] = []
+    post_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal post_calls
+        if request.method == "GET":
+            looked_up.append(request.url.params["id"])
+            return httpx.Response(200, json={"data": {"provider_name": "Azure"}})
+        post_calls += 1
+        payload = json.loads(request.content)
+        content = _extraction() if post_calls == 1 else _summary()
+        response = _completion(
+            content, model=payload["model"], provider="", cost=0.01,
+        )
+        response["id"] = f"chatcmpl-upstream-{post_calls}"
+        return httpx.Response(
+            200,
+            headers={"X-Generation-Id": f"gen-openrouter-{post_calls}"},
+            json=response,
+        )
+
+    store = JobStore(tmp_path / "state.sqlite3")
+    job = store.create_job(InputSpec(InputKind.ARXIV, "2401.00001"))
+    result = OpenRouterSummarizer(
+        store,
+        settings=_settings(),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        catalog=_pricing(),
+    ).summarize(
+        _document(), job_id=job.id,
+        artifacts=ArtifactManager(tmp_path / "out", "paper"),
+    )
+
+    assert result.relevance_score == 4
+    assert looked_up == ["gen-openrouter-1", "gen-openrouter-2"]
+    with sqlite3.connect(store.path) as connection:
+        generation_ids = [row[0] for row in connection.execute(
+            "SELECT generation_id FROM llm_calls ORDER BY id"
+        )]
+    assert generation_ids == ["gen-openrouter-1", "gen-openrouter-2"]
+
+
+def test_generation_provider_lookup_retries_eventual_consistency(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.job_store import JobStore
+    from src.openrouter import OpenRouterSummarizer
+
+    attempts = 0
+    delays: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            return httpx.Response(404, json={"error": "generation not indexed yet"})
+        return httpx.Response(200, json={"data": {"provider_name": "Azure"}})
+
+    monkeypatch.setattr("src.openrouter.time.sleep", delays.append)
+    summarizer = OpenRouterSummarizer(
+        JobStore(tmp_path / "state.sqlite3"),
+        settings=_settings(),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        catalog=_pricing(),
+    )
+
+    provider = summarizer._provider_from_generation("generation-1", api_key="secret")
+
+    assert provider == "Azure"
+    assert attempts == 3
+    assert delays == [0.5, 1.0]
+
+
+def test_unavailable_provider_metadata_settles_known_cost_before_rejecting_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.artifacts import ArtifactManager
+    from src.job_store import JobStore
+    from src.openrouter import OpenRouterSummarizer, StructuredOutputError
+    from src.research_models import InputKind, InputSpec
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "secret")
+    monkeypatch.setattr("src.openrouter.time.sleep", lambda _delay: None)
+    post_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal post_calls
+        if request.method == "GET":
+            return httpx.Response(404, json={"error": "generation unavailable"})
+        post_calls += 1
+        payload = json.loads(request.content)
+        response = _completion(
+            _extraction(), model=payload["model"], provider="", cost=0.01,
+        )
+        return httpx.Response(200, json=response)
+
+    store = JobStore(tmp_path / "state.sqlite3")
+    job = store.create_job(InputSpec(InputKind.ARXIV, "2401.00001"))
+    summarizer = OpenRouterSummarizer(
+        store,
+        settings=_settings(max_validation_retries=0),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        catalog=_pricing(),
+    )
+
+    with pytest.raises(StructuredOutputError):
+        summarizer.summarize(
+            _document(), job_id=job.id,
+            artifacts=ArtifactManager(tmp_path / "out", "paper"),
+        )
+
+    assert post_calls == 1
+    with sqlite3.connect(store.path) as connection:
+        row = connection.execute(
+            "SELECT generation_id, provider, cost_usd, cost_resolved, validated, "
+            "dispatch_state FROM llm_calls"
+        ).fetchone()
+    assert row == ("generation-id", None, 0.01, 1, 0, "settled")
+
+
+def test_http_200_rate_limit_envelope_is_settled_without_cost_and_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.artifacts import ArtifactManager
+    from src.job_store import JobStore
+    from src.openrouter import OpenRouterSummarizer
+    from src.research_models import InputKind, InputSpec
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "secret")
+    monkeypatch.setattr("src.openrouter.time.sleep", lambda _delay: None)
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(
+                200,
+                headers={"X-Generation-Id": "gen-rate-limited"},
+                json={
+                    "id": "gen-rate-limited",
+                    "error": {"code": 429, "message": "temporarily rate-limited"},
+                },
+            )
+        payload = json.loads(request.content)
+        content = _extraction() if calls == 2 else _summary()
+        return httpx.Response(
+            200,
+            json=_completion(
+                content, model=payload["model"], provider="Azure", cost=0.01,
+            ),
+        )
+
+    store = JobStore(tmp_path / "state.sqlite3")
+    job = store.create_job(InputSpec(InputKind.ARXIV, "2401.00001"))
+    result = OpenRouterSummarizer(
+        store,
+        settings=_settings(max_validation_retries=2),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        catalog=_pricing(),
+    ).summarize(
+        _document(), job_id=job.id,
+        artifacts=ArtifactManager(tmp_path / "out", "paper"),
+    )
+
+    assert result.relevance_score == 4
+    assert store.total_cost(job.id) == pytest.approx(0.02)
+    with sqlite3.connect(store.path) as connection:
+        first = connection.execute(
+            "SELECT generation_id, cost_usd, cost_resolved, validated, dispatch_state "
+            "FROM llm_calls ORDER BY id LIMIT 1"
+        ).fetchone()
+    assert first == ("gen-rate-limited", 0.0, 1, 0, "settled")
+
+
+def test_http_200_string_rate_limit_code_is_settled_without_provider_lookup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.artifacts import ArtifactManager
+    from src.job_store import JobStore
+    from src.openrouter import OpenRouterSummarizer
+    from src.research_models import InputKind, InputSpec
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "secret")
+    monkeypatch.setattr("src.openrouter.time.sleep", lambda _delay: None)
+    calls = 0
+    generation_lookups = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls, generation_lookups
+        if request.method == "GET":
+            generation_lookups += 1
+            return httpx.Response(404, json={"error": "generation unavailable"})
+        calls += 1
+        if calls == 1:
+            return httpx.Response(
+                200,
+                headers={"X-Generation-Id": "gen-string-rate-limit"},
+                json={
+                    "id": "gen-string-rate-limit",
+                    "error": {"code": "429", "message": "temporarily rate-limited"},
+                },
+            )
+        payload = json.loads(request.content)
+        content = _extraction() if calls == 2 else _summary()
+        return httpx.Response(
+            200,
+            json=_completion(
+                content, model=payload["model"], provider="Azure", cost=0.01,
+            ),
+        )
+
+    store = JobStore(tmp_path / "state.sqlite3")
+    job = store.create_job(InputSpec(InputKind.ARXIV, "2401.00001"))
+    result = OpenRouterSummarizer(
+        store,
+        settings=_settings(max_validation_retries=2),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        catalog=_pricing(),
+    ).summarize(
+        _document(), job_id=job.id,
+        artifacts=ArtifactManager(tmp_path / "out", "paper"),
+    )
+
+    assert result.relevance_score == 4
+    assert generation_lookups == 0
+    with sqlite3.connect(store.path) as connection:
+        first = connection.execute(
+            "SELECT generation_id, cost_usd, cost_resolved, validated, dispatch_state "
+            "FROM llm_calls ORDER BY id LIMIT 1"
+        ).fetchone()
+    assert first == ("gen-string-rate-limit", 0.0, 1, 0, "settled")
+
+
+def test_rate_limits_do_not_consume_structured_validation_attempts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.artifacts import ArtifactManager
+    from src.job_store import JobStore
+    from src.openrouter import OpenRouterSummarizer
+    from src.research_models import InputKind, InputSpec
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "secret")
+    monkeypatch.setattr("src.openrouter.time.sleep", lambda _delay: None)
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls <= 5:
+            return httpx.Response(200, json={"error": {"code": 429}})
+        payload = json.loads(request.content)
+        content = _extraction() if calls == 6 else _summary()
+        return httpx.Response(
+            200,
+            json=_completion(
+                content, model=payload["model"], provider="Azure", cost=0.01,
+            ),
+        )
+
+    store = JobStore(tmp_path / "state.sqlite3")
+    job = store.create_job(InputSpec(InputKind.ARXIV, "2401.00001"))
+    result = OpenRouterSummarizer(
+        store,
+        settings=_settings(max_validation_retries=0),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        catalog=_pricing(),
+    ).summarize(
+        _document(), job_id=job.id,
+        artifacts=ArtifactManager(tmp_path / "out", "paper"),
+    )
+
+    assert result.relevance_score == 4
+    assert calls == 7
+    assert store.total_cost(job.id) == pytest.approx(0.02)
 
 
 def test_summarizer_allows_configured_role_model_ids_without_cross_model_fallback(
@@ -1033,10 +1661,10 @@ def test_map_chunks_pack_against_complete_serialized_schema_budget(
 
     document = _document()
     document["paragraphs"][0]["text"] = " ".join(
-        "This paper evaluates a compact method." for _ in range(40)
+        "This paper evaluates a compact method." for _ in range(200)
     )
     settings = _settings(
-        extraction_max_input_tokens=1_800,
+        extraction_max_input_tokens=2_600,
         synthesis_max_input_tokens=20_000,
         chunk_max_chars=12_000,
         max_validation_retries=0,
@@ -1059,7 +1687,68 @@ def test_map_chunks_pack_against_complete_serialized_schema_budget(
         if payload["model"] == "google/gemini-3.8-flash"
     ]
     assert len(map_payloads) > 1
-    assert all(estimate_serialized_tokens(payload) <= 1_800 for payload in map_payloads)
+    assert all(estimate_serialized_tokens(payload) <= 2_600 for payload in map_payloads)
+
+
+def test_map_chunks_reserve_input_space_for_validation_retry_instruction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.artifacts import ArtifactManager
+    from src.job_store import JobStore
+    from src.openrouter import OpenRouterSummarizer, estimate_serialized_tokens
+    from src.research_models import InputKind, InputSpec
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "secret")
+    payloads: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        payloads.append(payload)
+        if payload["model"] == "openai/gpt-5.6-sol":
+            content = _summary()
+        elif len(payload["messages"]) == 2:
+            content = _extraction()
+            content["evidence"][0]["quote"] = "absent from the source"
+        else:
+            content = _extraction()
+        return httpx.Response(
+            200, json=_completion(content, model=payload["model"], provider="p", cost=0.001),
+        )
+
+    document = _document()
+    document["paragraphs"][0]["text"] = " ".join(
+        "This paper evaluates a compact method." for _ in range(40)
+    )
+    settings = _settings(
+        # v7's stricter verbatim-evidence instructions add request overhead;
+        # keep the fixture just above the smallest retry-capable payload.
+        extraction_max_input_tokens=2_800,
+        synthesis_max_input_tokens=20_000,
+        chunk_max_chars=12_000,
+        max_validation_retries=1,
+    )
+    store = JobStore(tmp_path / "state.sqlite3")
+    job = store.create_job(InputSpec(InputKind.ARXIV, "2401.00001"))
+
+    OpenRouterSummarizer(
+        store,
+        settings=settings,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        catalog=_pricing(),
+    ).summarize(
+        document, job_id=job.id,
+        artifacts=ArtifactManager(tmp_path / "out", "paper"),
+    )
+
+    map_payloads = [
+        payload for payload in payloads
+        if payload["model"] == "google/gemini-3.8-flash"
+    ]
+    assert any(len(payload["messages"]) == 3 for payload in map_payloads)
+    assert all(
+        estimate_serialized_tokens(payload) <= settings.extraction_max_input_tokens
+        for payload in map_payloads
+    )
 
 
 def test_atomic_table_fails_closed_when_schema_overhead_exceeds_input_budget(
@@ -1372,6 +2061,259 @@ def test_summarizer_repairs_fabricated_evidence_quote(
 
     assert calls == 3
     assert result.evidence[0].quote == "evaluates a compact method"
+
+
+def test_evidence_validator_accepts_quote_spanning_adjacent_source_blocks() -> None:
+    from src.openrouter import (
+        ChunkEvidence,
+        ChunkExtractionResponse,
+        DocumentChunk,
+        OpenRouterSummarizer,
+    )
+
+    chunk = DocumentChunk(
+        text="NUS\n\nRMSE 14.8785 8.9766 6.1825 5.2426",
+        kind="section",
+        section="4.2 Evaluation on HSI Recovery",
+        start_page=11,
+        end_page=11,
+        evidence=(
+            ChunkEvidence("paragraph", 11, "results", "NUS"),
+            ChunkEvidence(
+                "paragraph",
+                11,
+                "results",
+                "RMSE 14.8785 8.9766 6.1825 5.2426",
+            ),
+        ),
+    )
+    response = ChunkExtractionResponse.model_validate({
+        "summary": "定量評価結果。",
+        "datasets": ["NUS"],
+        "metrics": ["RMSE"],
+        "keywords": ["HSI recovery"],
+        "evidence": [{
+            "page": 11,
+            "section": "4.2 Evaluation on HSI Recovery",
+            "quote": "NUS RMSE 14.8785 8.9766 6.1825 5.2426",
+        }],
+    })
+
+    OpenRouterSummarizer._evidence_validator([chunk])(response)
+
+
+def test_evidence_validator_corrects_page_when_quote_has_unique_section_match() -> None:
+    from src.openrouter import (
+        ChunkEvidence,
+        ChunkExtractionResponse,
+        DocumentChunk,
+        OpenRouterSummarizer,
+    )
+
+    chunk = DocumentChunk(
+        text="References",
+        kind="section",
+        section="References",
+        start_page=15,
+        end_page=16,
+        evidence=(
+            ChunkEvidence("paragraph", 15, "refs", "17. Previous reference"),
+            ChunkEvidence("paragraph", 16, "refs", "18. Unique reference text"),
+        ),
+    )
+    response = ChunkExtractionResponse.model_validate({
+        "summary": "参考文献の抽出。",
+        "datasets": [],
+        "metrics": [],
+        "keywords": ["reference"],
+        "evidence": [{
+            "page": 15,
+            "section": "References",
+            "quote": "18. Unique reference text",
+        }],
+    })
+
+    OpenRouterSummarizer._evidence_validator([chunk])(response)
+
+    assert response.evidence[0].page == 16
+
+
+def test_evidence_validator_ignores_latex_display_delimiters() -> None:
+    from src.openrouter import (
+        ChunkEvidence,
+        ChunkExtractionResponse,
+        DocumentChunk,
+        OpenRouterSummarizer,
+    )
+
+    formula = r"\mathcal{Y}_t = \operatorname{stack}(\mathbf{Y}_{1,t})"
+    chunk = DocumentChunk(
+        text=formula,
+        kind="section",
+        section="3.3 Optimal CSS Selection",
+        start_page=8,
+        end_page=8,
+        evidence=(ChunkEvidence("equation", 8, "css", formula + r". \tag{12}"),),
+    )
+    response = ChunkExtractionResponse.model_validate({
+        "summary": "スタック演算を定義する。",
+        "datasets": [],
+        "metrics": [],
+        "keywords": ["stack"],
+        "evidence": [{
+            "page": 8,
+            "section": "3.3 Optimal CSS Selection",
+            "quote": rf"\({formula}\)",
+        }],
+    })
+
+    OpenRouterSummarizer._evidence_validator([chunk])(response)
+
+
+def test_evidence_validator_restores_unique_source_markup_before_accepting_quote() -> None:
+    from src.openrouter import (
+        ChunkEvidence,
+        ChunkExtractionResponse,
+        DocumentChunk,
+        OpenRouterSummarizer,
+    )
+
+    source = "estimated by a previous paper<sup>1</sup>."
+    chunk = DocumentChunk(
+        text=source,
+        kind="paragraph",
+        section="Methods",
+        start_page=3,
+        end_page=3,
+        evidence=(ChunkEvidence("paragraph", 3, "methods", source),),
+    )
+    response = ChunkExtractionResponse.model_validate({
+        "summary": "既報の手法を用いる。",
+        "datasets": [],
+        "metrics": [],
+        "keywords": ["estimation"],
+        "evidence": [{
+            "page": 3,
+            "section": "Methods",
+            "quote": "estimated by a previous paper1.",
+        }],
+    })
+
+    OpenRouterSummarizer._evidence_validator([chunk])(response)
+
+    assert response.evidence[0].quote == source
+
+
+def test_evidence_validator_clips_overextended_quote_to_unique_claimed_page_source() -> None:
+    from src.openrouter import (
+        ChunkEvidence,
+        ChunkExtractionResponse,
+        DocumentChunk,
+        OpenRouterSummarizer,
+    )
+
+    page_two = "Acquisition evolved over several decades."
+    page_three = "Newer systems acquire images line by line."
+    chunk = DocumentChunk(
+        text=f"{page_two}\n\n{page_three}",
+        kind="mixed",
+        section="Related Work",
+        start_page=2,
+        end_page=3,
+        evidence=(
+            ChunkEvidence("paragraph", 2, "related", page_two),
+            ChunkEvidence("paragraph", 3, "related", page_three),
+        ),
+    )
+    response = ChunkExtractionResponse.model_validate({
+        "summary": "分光計測の発展を説明する。",
+        "datasets": [],
+        "metrics": [],
+        "keywords": ["spectrometer"],
+        "evidence": [{
+            "page": 2,
+            "section": "Related Work",
+            "quote": f"{page_two} {page_three}",
+        }],
+    })
+
+    OpenRouterSummarizer._evidence_validator([chunk])(response)
+
+    assert response.evidence[0].quote == page_two
+
+
+def test_evidence_validator_tolerates_ocr_hyphen_joining() -> None:
+    from src.openrouter import (
+        ChunkEvidence,
+        ChunkExtractionResponse,
+        DocumentChunk,
+        OpenRouterSummarizer,
+    )
+
+    source = "We compare with three state-ofthe-art recovery methods."
+    chunk = DocumentChunk(
+        text=source,
+        kind="section",
+        section="Results",
+        start_page=10,
+        end_page=10,
+        evidence=(ChunkEvidence("paragraph", 10, "results", source),),
+    )
+    response = ChunkExtractionResponse.model_validate({
+        "summary": "既存法と比較する。",
+        "datasets": [],
+        "metrics": [],
+        "keywords": ["comparison"],
+        "evidence": [{
+            "page": 10,
+            "section": "Results",
+            "quote": "We compare with three state-of-the-art recovery methods.",
+        }],
+    })
+
+    OpenRouterSummarizer._evidence_validator([chunk])(response)
+
+    assert response.evidence[0].quote == source
+
+
+def test_evidence_validator_restores_source_case_and_context_exactly() -> None:
+    from src.openrouter import (
+        ChunkEvidence,
+        ChunkExtractionResponse,
+        DocumentChunk,
+        OpenRouterSummarizer,
+    )
+
+    source = (
+        "First, measurements are calibrated. "
+        "Third, the spatial variations are caused by two pigments. "
+        "Fourth, the quantities are independent."
+    )
+    chunk = DocumentChunk(
+        text=source,
+        kind="paragraph",
+        section="Skin Color Model",
+        start_page=2,
+        end_page=2,
+        evidence=(ChunkEvidence("paragraph", 2, "skin", source),),
+    )
+    response = ChunkExtractionResponse.model_validate({
+        "summary": "二つの色素を仮定する。",
+        "datasets": [],
+        "metrics": [],
+        "keywords": ["pigments"],
+        "evidence": [{
+            "page": 2,
+            "section": "Skin Color Model",
+            "quote": "The spatial variations are caused by two pigments.",
+        }],
+    })
+
+    OpenRouterSummarizer._evidence_validator([chunk])(response)
+
+    assert response.evidence[0].quote == (
+        "Third, the spatial variations are caused by two pigments."
+    )
 
 
 def test_summarizer_repairs_whitespace_only_evidence_quote(

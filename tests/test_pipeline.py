@@ -330,6 +330,21 @@ def test_successful_local_pipeline_persists_every_checkpoint_and_notion_id(
     ]
 
 
+def test_conversion_checkpoint_generation_invalidates_pre_quality_fix_artifacts(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"%PDF-1.4\nfixture\n%%EOF")
+    service, dependencies = _service(tmp_path)
+
+    completed = service.ingest(InputSpec(InputKind.LOCAL_PDF, str(source)))
+
+    store = dependencies["store"]
+    assert isinstance(store, JobStore)
+    checkpoint = store.get_checkpoint(completed.id, JobState.CONVERTING)
+    assert checkpoint["version"] == 6
+
+
 def test_pipeline_records_explicit_prompt_schema_versions_in_notion_and_manifest(
     tmp_path: Path,
 ) -> None:

@@ -18,6 +18,15 @@ from src.research_models import JobRecord, JobState
 ServiceFactory = Callable[[Settings], PipelineService]
 
 
+def _write_error(stderr: TextIO, message: str) -> None:
+    """Write a diagnostic without crashing on a legacy Windows code page."""
+    text = f"error: {message}\n"
+    encoding = getattr(stderr, "encoding", None)
+    if encoding:
+        text = text.encode(encoding, errors="backslashreplace").decode(encoding)
+    stderr.write(text)
+
+
 def _add_common_options(parser: argparse.ArgumentParser, *, include_json: bool = True) -> None:
     parser.add_argument(
         "--config", type=Path, default=argparse.SUPPRESS,
@@ -76,7 +85,7 @@ def _job_payload(job: JobRecord) -> dict[str, object]:
 
 def _write_job(job: JobRecord, *, as_json: bool, stdout: TextIO) -> None:
     if as_json:
-        stdout.write(json.dumps(_job_payload(job), ensure_ascii=False, sort_keys=True) + "\n")
+        stdout.write(json.dumps(_job_payload(job), ensure_ascii=True, sort_keys=True) + "\n")
         return
     line = (
         f"job {job.id}: {job.state.value} | cost_usd={job.total_cost_usd:.6f}"
@@ -128,7 +137,7 @@ def main(
                 if args.json:
                     stdout.write(json.dumps(
                         {"type": "batch", "jobs": [_job_payload(job) for job in jobs]},
-                        ensure_ascii=False, sort_keys=True,
+                        ensure_ascii=True, sort_keys=True,
                     ) + "\n")
                 else:
                     for job in jobs:
@@ -163,10 +172,10 @@ def main(
         ValueError,
     ) as error:
         message = error.args[0] if isinstance(error, KeyError) and error.args else str(error)
-        stderr.write(f"error: {message}\n")
+        _write_error(stderr, message)
         return 2
     except Exception as error:
-        stderr.write(f"error: {error}\n")
+        _write_error(stderr, str(error))
         return 1
 
 

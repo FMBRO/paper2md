@@ -43,15 +43,20 @@ zotero:
   user_id: 0
 
 openrouter:
-  extraction_model: google/gemini-3.8-flash
+  extraction_model: openai/gpt-5.6-luna
   synthesis_model: openai/gpt-5.6-sol
+  extraction_max_input_tokens: 24000
+  extraction_max_output_tokens: 4000
+  synthesis_max_output_tokens: 4000
+  max_validation_retries: 4
+  request_timeout_seconds: 180
   require_parameters: true
   zdr: true
   data_collection: false
-  paper_budget_usd: 0.50
+  paper_budget_usd: 3.00
 
 notion:
-  data_source_id:
+  data_source_id: "cc23fe60-7198-48aa-882e-3cd5e5f6e037"
   api_version: "2026-03-11"
   # These names must already exist with the documented Notion types. The
   # Processing Status status/select must contain Completed; every Topics

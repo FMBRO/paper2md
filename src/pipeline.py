@@ -48,6 +48,9 @@ from src.research_models import (
 from src.zotero import ZoteroClient, ZoteroInputError, ZoteroResolution
 
 
+CONVERSION_CHECKPOINT_VERSION = 6
+
+
 class PaperProcessingLeaseLostError(RuntimeError):
     """Raised before a stale paper worker can publish more state."""
 
@@ -866,7 +869,7 @@ class PipelineService:
     ) -> dict[str, Any]:
         quality_path = bundle.logs_dir / "quality_result.json"
         return {
-            "version": 1,
+            "version": CONVERSION_CHECKPOINT_VERSION,
             "artifact_dir": str(bundle.root),
             "source_sha256": source_sha256,
             "document_sha256": _file_sha256(bundle.document_json),
@@ -881,7 +884,7 @@ class PipelineService:
         quality_path = bundle.logs_dir / "quality_result.json"
         if (
             not isinstance(payload, dict)
-            or payload.get("version") != 1
+            or payload.get("version") != CONVERSION_CHECKPOINT_VERSION
             or Path(str(payload.get("artifact_dir", ""))) != bundle.root
             or payload.get("source_sha256") != source_sha256
         ):

@@ -7,6 +7,19 @@ from typing import Any
 
 _GARBLED = re.compile(r"\ufffd|[\u0000-\u0008\u000b\u000c\u000e-\u001f]")
 _TABLE_SEPARATOR = re.compile(r"^\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?$")
+_FIGURE_CAPTION = re.compile(
+    r"^\s*(?:fig(?:ure)?\.?)\s*(\d+)(?:\s*\([a-z]\))?\s*[.:]",
+    re.IGNORECASE,
+)
+_MARKER_FIGURE_CAPTION = re.compile(
+    r"^\s*fig\.\s*(\d+)(?:\s*\([a-z]\))?\s+(?!shows?\b)",
+    re.IGNORECASE,
+)
+
+
+def _figure_caption_label(text: str) -> str | None:
+    match = _FIGURE_CAPTION.match(text) or _MARKER_FIGURE_CAPTION.match(text)
+    return match.group(1) if match is not None else None
 
 
 def _issue(code: str, message: str) -> dict[str, str]:
@@ -52,6 +65,38 @@ def _normalized_text(document: dict[str, Any]) -> list[tuple[int | None, str]]:
     return values
 
 
+def _figure_caption_mismatch(
+    figures: list[dict[str, Any]], captions: list[dict[str, Any]],
+) -> bool:
+    labels_by_page: dict[int, set[str]] = {}
+    caption_records = [
+        *captions,
+        *(
+            {"page": figure.get("page"), "text": figure.get("caption")}
+            for figure in figures if figure.get("caption")
+        ),
+    ]
+    for caption in caption_records:
+        text = str(caption.get("text", ""))
+        label = _figure_caption_label(text)
+        page = caption.get("page")
+        if label is not None and isinstance(page, int):
+            labels_by_page.setdefault(page, set()).add(label)
+
+    if not labels_by_page:
+        return any(
+            bool(figure.get("path") or figure.get("alt_text") or figure.get("caption"))
+            for figure in figures
+        )
+    if not figures:
+        return False
+
+    unique_labels = {
+        label for labels in labels_by_page.values() for label in labels
+    }
+    return len(figures) < len(unique_labels)
+
+
 def evaluate_document_quality(
     document: dict[str, Any],
     *,
@@ -86,7 +131,7 @@ def evaluate_document_quality(
         issues.append(_issue("empty_equation", "At least one preserved equation has no content."))
     figures = [item for item in document.get("figures", []) if isinstance(item, dict)]
     captions = [item for item in document.get("captions", []) if isinstance(item, dict)]
-    if len(figures) != len(captions) or any(not figure.get("caption") for figure in figures):
+    if _figure_caption_mismatch(figures, captions):
         issues.append(_issue("figure_caption_mismatch", "Figures and captions do not match one-to-one."))
 
     passed = not issues

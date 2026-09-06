@@ -6,6 +6,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import fitz
+
 from src.artifacts import ArtifactManager
 from src.document_normalizer import (
     load_marker_document,
@@ -25,6 +27,34 @@ from src.run_ocr import run_ocrmypdf
 def _load_marker_document(marker_dir: Path) -> dict[str, Any] | None:
     """Find a Marker JSON document without treating unrelated JSON as one."""
     return load_marker_document(marker_dir)
+
+
+def _recover_empty_equations_from_pdf(
+    document: dict[str, Any], pdf_path: Path,
+) -> None:
+    """Fill empty positioned equations from the PDF text/OCR layer when possible."""
+    empty = [
+        equation for equation in document.get("equations", [])
+        if isinstance(equation, dict) and not str(equation.get("text", "")).strip()
+    ]
+    if not empty:
+        return
+    with fitz.open(pdf_path) as pdf:
+        for equation in empty:
+            position = equation.get("source_position")
+            bbox = position.get("bbox") if isinstance(position, dict) else None
+            page_number = equation.get("page")
+            if (
+                not isinstance(page_number, int)
+                or not 1 <= page_number <= pdf.page_count
+                or not isinstance(bbox, list)
+                or len(bbox) != 4
+                or not all(isinstance(value, (int, float)) for value in bbox)
+            ):
+                continue
+            text = pdf[page_number - 1].get_text("text", clip=fitz.Rect(bbox)).strip()
+            if text:
+                equation["text"] = text
 
 
 class Converter:
@@ -105,6 +135,7 @@ class Converter:
             )
         else:
             document = normalize_marker_document(marker_document)
+        _recover_empty_equations_from_pdf(document, target_pdf)
         manager.write_document(document)
         quality = evaluate_document_quality(document, page_text=page_text)
         manager.write_json(bundle.logs_dir / "quality_result.json", quality)
